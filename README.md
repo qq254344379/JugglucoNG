@@ -2,9 +2,9 @@
 
 # JugglucoNG
 ## 0.2.0-Alpha
-Initial build with Material 3 UI
-Sibionics 2 Auto Reset, more buttons
-Only tested with Sibionics 2
+Initial build with Material 3 UI.
+Sibionics 2 Auto Reset, more buttons.
+Only tested with Sibionics 2.
 
 ## 0.1.20
 1. Sibionics 2 reset error fixes
