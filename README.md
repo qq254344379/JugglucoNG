@@ -1,6 +1,5 @@
-![Logo-icon](Common/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp)
-
 ![Screenshot](juggluco_screenshot.png)
+![Logo-icon](Common/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp)
 
 # JugglucoNG
 ## 0.2.0-Alpha
