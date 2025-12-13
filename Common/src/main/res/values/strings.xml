@@ -451,4 +451,18 @@ Pressing OK will generate a connection on this phone and display a QR code that 
 <string name="enternums">Enter amounts on</string>
 <string name="connectionl">connection</string>
 <string name="disconnectsensor">Bug</string>
+<string name="internet">Internet</string>
+<string name="homenet">Home net</string>
+<string name="ICE">ICE</string>
+<string name="username">Username</string>
+
+<string name="icelabel">ICE Label</string>
+<string name="zero">0</string>
+<string name="one">1</string>
+
+
+<string name="QRmirror">Mirror via QR</string>
+<string name="turnservers">Turn Servers</string>
+<string name="turnserver">Turn Server</string>
+
 </resources>
