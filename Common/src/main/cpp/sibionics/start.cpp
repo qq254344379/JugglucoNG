@@ -691,7 +691,9 @@ void SiContext::reset(SensorGlucoseData *sens) {
 
   // Reset allocator headers (clears freepos and slot positions)
   binState.reset();
-
+    unlink(sens->binstatefile.c_str());
+    unlink(sens->statefile.c_str());
+    unlink(pathconcat(sens->getsensordir(), "state3.json").c_str());
   auto *info = sens->getinfo();
 
   // Clear old calibration
