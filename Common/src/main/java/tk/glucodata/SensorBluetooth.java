@@ -370,7 +370,12 @@ public class SensorBluetooth {
                 ;
             }
             ;
-            return ((mBluetoothLeScanner = SensorBluetooth.mBluetoothAdapter.getBluetoothLeScanner()) != null);
+            try {
+                return ((mBluetoothLeScanner = SensorBluetooth.mBluetoothAdapter.getBluetoothLeScanner()) != null);
+            } catch (Throwable e) {
+                Log.stack(LOG_ID, "Scanner21.init", e);
+                return false;
+            }
         }
 
         private int scanTries = 0;

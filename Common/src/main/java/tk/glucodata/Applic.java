@@ -374,7 +374,7 @@ public class Applic extends Application {
         return noperms;
     }
 
-    static boolean mayscan() {
+    public static boolean mayscan() {
         if (Build.VERSION.SDK_INT >= 23) {
             return Applic.hasPermissions(app, scanpermissions).length == 0;
         }

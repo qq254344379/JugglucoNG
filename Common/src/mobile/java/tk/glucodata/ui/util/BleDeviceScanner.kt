@@ -12,17 +12,34 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import tk.glucodata.Applic
+import tk.glucodata.Log
 
 object BleDeviceScanner {
     private const val SCAN_DURATION = 10000L // 10 seconds
+    private const val LOG_ID = "BleDeviceScanner"
 
     @SuppressLint("MissingPermission")
     fun scanForSibionics(): Flow<String> = callbackFlow {
+        // Enforce permission check before interacting with Bluetooth adapter
+        if (!Applic.mayscan()) {
+            Log.e(LOG_ID, "No bluetooth scan permissions, aborting scan")
+            close()
+            return@callbackFlow
+        }
+
         val bluetoothManager = Applic.app.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = bluetoothManager.adapter
-        val scanner = adapter.bluetoothLeScanner
+        
+        // Double check adapter exists and is enabled
+        if (adapter == null || !adapter.isEnabled) {
+            Log.e(LOG_ID, "Bluetooth adapter null or disabled")
+            close()
+            return@callbackFlow
+        }
 
-        if (scanner == null || !adapter.isEnabled) {
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            Log.e(LOG_ID, "BluetoothLeScanner is null")
             close()
             return@callbackFlow
         }
@@ -57,20 +74,44 @@ object BleDeviceScanner {
             }
 
             override fun onScanFailed(errorCode: Int) {
+                Log.e(LOG_ID, "Scan failed with error code: $errorCode")
                 close()
             }
         }
 
-        scanner.startScan(null, settings, callback)
+        try {
+            Log.i(LOG_ID, "Starting BLE scan for Sibionics...")
+            scanner.startScan(null, settings, callback)
+        } catch (e: SecurityException) {
+            Log.e(LOG_ID, "SecurityException during startScan: " + e.message)
+            close()
+            return@callbackFlow
+        } catch (e: Exception) {
+            Log.e(LOG_ID, "Exception during startScan: " + e.message)
+            close()
+            return@callbackFlow
+        }
 
         val handler = Handler(Looper.getMainLooper())
         handler.postDelayed({
-            scanner.stopScan(callback)
+            try {
+                if (Applic.mayscan() && adapter.isEnabled) {
+                    scanner.stopScan(callback)
+                }
+            } catch (e: Exception) {
+                Log.e(LOG_ID, "Error stopping scan: " + e.message)
+            }
             close()
         }, SCAN_DURATION)
 
         awaitClose {
-            scanner.stopScan(callback)
+            try {
+                if (Applic.mayscan() && adapter.isEnabled) {
+                    scanner.stopScan(callback)
+                }
+            } catch (e: Exception) {
+                Log.e(LOG_ID, "Error stopping scan in awaitClose: " + e.message)
+            }
             handler.removeCallbacksAndMessages(null)
         }
     }
