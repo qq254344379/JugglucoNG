@@ -2589,10 +2589,6 @@ public class Notify {
             remoteViews.setTextViewTextSize(R.id.notification_glucose, android.util.TypedValue.COMPLEX_UNIT_SP,
                     24 * fontSize);
 
-            if (android.os.Build.VERSION.SDK_INT >= 31) {
-                remoteViews.setString(R.id.notification_glucose, "setFontVariationSettings", "'wght' " + fontWeight);
-            }
-
             finalText = ssb;
         }
 
@@ -2630,10 +2626,6 @@ public class Notify {
         // Apply size and weight to expanded startup notification
         remoteViewsExpanded.setTextViewTextSize(R.id.notification_glucose, android.util.TypedValue.COMPLEX_UNIT_SP,
                 28 * fontSize);
-        if (android.os.Build.VERSION.SDK_INT >= 31) {
-            remoteViewsExpanded.setString(R.id.notification_glucose, "setFontVariationSettings",
-                    "'wght' " + fontWeight);
-        }
 
         remoteViewsExpanded.setImageViewBitmap(R.id.notification_arrow, arrowBitmap);
 
