@@ -274,18 +274,42 @@ class SensorViewModel : ViewModel() {
         }
     }
 
+    private fun forceDeleteSensorDirectory(serial: String) {
+        if (serial.isEmpty()) {
+            android.util.Log.w("SensorViewModel", "forceDeleteSensorDirectory called with empty serial")
+            return
+        }
+        try {
+            val sensorsDir = java.io.File(tk.glucodata.Applic.app.filesDir, "sensors")
+            val sensorDir = java.io.File(sensorsDir, serial)
+            if (sensorDir.exists()) {
+                val success = sensorDir.deleteRecursively()
+                android.util.Log.i("SensorViewModel", "Force deleting sensor dir $serial: $success")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("SensorViewModel", "Failed to force delete sensor dir $serial", e)
+        }
+    }
+
     // "Disconnect" in UI now maps to "Terminate" (finishSensor) as requested.
     fun terminateSensor(serial: String, wipeData: Boolean = false) {
         val gatts = SensorBluetooth.mygatts()
         val gatt = gatts.find { it.SerialNumber == serial }
+
         if (gatt != null) {
             if (wipeData) {
                 Natives.siWipeDataOnly(gatt.dataptr)
             }
             gatt.finishSensor()
             SensorBluetooth.sensorEnded(serial)
-            refreshSensors()
         }
+
+        // Force delete AFTER stopping everything and native wipe, to ensure no recreating happens
+        if (wipeData) {
+            forceDeleteSensorDirectory(serial)
+        }
+
+        refreshSensors()
     }
 
     fun forgetSensor(serial: String) {
@@ -365,8 +389,9 @@ class SensorViewModel : ViewModel() {
         val gatt = gatts.find { it.SerialNumber == serial }
         if (gatt != null) {
             Natives.siWipeDataOnly(gatt.dataptr)
-            refreshSensors()
         }
+        forceDeleteSensorDirectory(serial)
+        refreshSensors()
     }
 
     fun disconnectSensor(serial: String) {
