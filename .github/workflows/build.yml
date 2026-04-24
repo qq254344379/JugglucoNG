@@ -2,11 +2,23 @@ name: Build JugglucoNG APK
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Build variant'
+        required: true
+        default: 'mobileLibre3SiDexNogoogleRelease'
+        type: choice
+        options:
+          - mobileLibre3SiDexNogoogleRelease
+          - mobileLibre3SiDexGoogleRelease
+          - mobileLibre3NosiDexNogoogleRelease
+          - mobileLibre3NosiDexGoogleRelease
+          - mobileLibreOldSiDexNogoogleRelease
+          - mobileLibreOldNosiDexNogoogleRelease
   push:
     branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE*'
+    paths:
+      - '.github/workflows/build.yml'
 
 jobs:
   build:
@@ -29,8 +41,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Accept Android SDK licenses
-        run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
 
       - name: Install NDK & CMake
         run: |
@@ -49,9 +60,15 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: List build variants
+        run: |
+          ./gradlew :Common:variants --no-daemon 2>&1 || true
+
       - name: Build APK
         run: |
-          ./gradlew :Common:assembleMobileLibre3SiDexNogoogleRelease --no-daemon
+          VARIANT="${{ github.event.inputs.variant || 'mobileLibre3SiDexNogoogleRelease' }}"
+          echo "Building variant: $VARIANT"
+          ./gradlew :Common:assemble${VARIANT} --no-daemon --stacktrace
 
       - name: Find APK
         id: apk
@@ -69,7 +86,6 @@ jobs:
           retention-days: 30
 
       - name: Upload APK to Release
-        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
