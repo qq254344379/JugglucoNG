@@ -28,6 +28,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Accept Android SDK licenses
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
       - name: Install NDK & CMake
         run: |
           sdkmanager --install "ndk;29.0.14206865"
@@ -45,9 +49,9 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build APK (mobileLibre3SiDexNogoogleRelease)
+      - name: Build APK
         run: |
-          ./gradlew :Common:assembleMobileLibre3SiDexNogoogleRelease
+          ./gradlew :Common:assembleMobileLibre3SiDexNogoogleRelease --no-daemon
 
       - name: Find APK
         id: apk
