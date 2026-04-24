@@ -333,7 +333,7 @@
  <string name="floatjuggluco">置顶</string>
 <string name="uploader">上传到NS</string>
  <string name="sibionics">硅基扫码</string>
- <string name="interval">Interval</string>
+ <string name="interval">间隔</string>
  <string name="off">关</string>
  <string name="streamingenabled">" 传输已开启"</string>
  <string name="streamingnotenabled">" 传输未开启"</string>
@@ -358,7 +358,7 @@
     <string name="debug_logs_title">调试日志</string>
     <string name="clear">清除</string>
     <string name="trace_log">Trace.log</string>
-    <string name="logcat">Logcat</string>
+    <string name="logcat">日志</string>
     <string name="log_enabled_waiting">日志已启用。等待条目...</string>
     <string name="log_unchecked">日志未选中。启用以开始。</string>
     <string name="error_reading_file">"读取文件错误： "</string>
@@ -402,8 +402,8 @@
     <string name="stream">流</string>
     
     <string name="exchanges">发送/接收</string>
-    <string name="duration_days">days</string>
-    <string name="sensor_state">Status</string>
+    <string name="duration_days">天</string>
+    <string name="sensor_state">状态</string>
 
     <!-- Newly Extracted Strings -->
     <string name="import_history">导入历史记录</string>
@@ -532,11 +532,11 @@
     <string name="status_disconnected">已断开</string>
     <string name="select_sensor_type">选择传感器类型</string>
     <string name="choose_theme">选择主题</string>
-    <string name="sibionics_sensor">Sibionics</string>
+    <string name="sibionics_sensor">西比亚</string>
     <string name="sibionics_sensor_desc">扫描二维码</string>
-    <string name="libre_sensor">Libre 2/3</string>
+    <string name="libre_sensor">雅培 Libre 2/3</string>
     <string name="libre_sensor_desc">通过 NFC</string>
-    <string name="dexcom_sensor">Dexcom</string>
+    <string name="dexcom_sensor">德康</string>
     <string name="dexcom_sensor_desc">G6/G7/One</string>
     <string name="scan_transmitter_title">扫描发射器</string>
     <string name="scan_transmitter_desc">选择附近设备或扫描二维码。</string>
@@ -589,14 +589,14 @@
     <string name="time_range_summary">%1$s - %2$s</string>
     <string name="volume_vibration_profile">音量/振动配置</string>
     <string name="ICE">ICE</string>
-    <string name="aaps_broadcast">Glucodata</string>
-    <string name="about_text">GPL-3.0 • Fork of Juggluco</string>
+    <string name="aaps_broadcast">血糖数据广播</string>
+    <string name="about_text">GPL-3.0 • Juggluco 分支</string>
     <string name="accuchek_scan_instruction">扫描 Accu-Chek SmartGuide 传感器上的数据矩阵</string>
     <string name="accuchek_sensor">Accu-Chek 智能指南</string>
     <string name="accuchek_sensor_desc">扫描数据矩阵+蓝牙</string>
     <string name="accuchek_setup_title">Accu-Chek 设置</string>
-    <string name="add_sensor">Add Sensor</string>
-    <string name="advanced_title">Advanced</string>
+    <string name="add_sensor">添加传感器</string>
+    <string name="advanced_title">高级</string>
     <string name="afrezza">Afrezza</string>
     <string name="aidex_connected">已连接！</string>
     <string name="aidex_connecting_to">正在连接到 %1$s...</string>
@@ -605,55 +605,55 @@
     <string name="aidex_sensor">AiDex / LinX</string>
     <string name="aidex_sensor_desc">通过蓝牙配置 AiDex 或 LinX CGM</string>
     <string name="aidex_setup_title">AiDex / LinX 设置</string>
-    <string name="alert_amount">Amount Alert</string>
-    <string name="alert_forecast_high">Forecast High</string>
-    <string name="alert_forecast_low">Forecast Low</string>
-    <string name="alert_high">High</string>
-    <string name="alert_loss">Signal Loss</string>
+    <string name="alert_amount">数值警报</string>
+    <string name="alert_forecast_high">预测偏高</string>
+    <string name="alert_forecast_low">预测偏低</string>
+    <string name="alert_high">偏高</string>
+    <string name="alert_loss">信号丢失</string>
     <string name="alert_low">Low</string>
-    <string name="alert_missed_reading">Missed Reading</string>
-    <string name="alert_mode">Alert Mode</string>
-    <string name="alert_persistent_high">Persistent High</string>
-    <string name="alert_sensor_expiry">Sensor Expiry</string>
-    <string name="missed_reading_channel_description">Alerts when no glucose reading arrives for the configured duration</string>
-    <string name="sensor_expiry_channel_description">Alerts when the current sensor is nearing expiry</string>
-    <string name="alert_value_available">Value Available</string>
-    <string name="alert_very_high">Very High</string>
-    <string name="alert_very_low">Very Low</string>
-    <string name="allvalues">All values</string>
-    <string name="aspart">Insulin Aspart/NovoRapid/NovoLog</string>
-    <string name="auto">Auto</string>
-    <string name="auto_raw">Auto+Raw</string>
+    <string name="alert_missed_reading">漏读警报</string>
+    <string name="alert_mode">警报模式</string>
+    <string name="alert_persistent_high">持续偏高</string>
+    <string name="alert_sensor_expiry">传感器到期</string>
+    <string name="missed_reading_channel_description">当在设定时间内未收到血糖读数时发出警报</string>
+    <string name="sensor_expiry_channel_description">当当前传感器即将到期时发出警报</string>
+    <string name="alert_value_available">数值可用</string>
+    <string name="alert_very_high">极高</string>
+    <string name="alert_very_low">极低</string>
+    <string name="allvalues">所有数值</string>
+    <string name="aspart">门冬胰岛素/NovoRapid/NovoLog</string>
+    <string name="auto">自动</string>
+    <string name="auto_raw">自动+原始</string>
     <string name="auto_reset_days">%1$d days</string>
-    <string name="auto_reset_title">Auto reset</string>
-    <string name="autoqr">Auto QR</string>
+    <string name="auto_reset_title">自动重置</string>
+    <string name="autoqr">自动二维码</string>
     <string name="autoqrmessage">Send data from this phone to another phone on your home network.
 Pressing OK will generate a connection on this phone and display a QR code that can be scanned by another Android device. Scanning the QR code with left menu→Photo on the other phone will generate a connection, by which it will receive all data from this phone.</string>
     <string name="avg">平均</string>
-    <string name="bloodafter">"Only add glucose readings from after: "</string>
-    <string name="bloodvar">Blood glucose:</string>
+    <string name="bloodafter">仅添加此时间之后的血糖读数：</string>
+    <string name="bloodvar">血糖：</string>
     <string name="calibrate_a">视觉模式</string>
-    <string name="calibrated">Calibrated</string>
-    <string name="calibratepast">Apply to past</string>
-    <string name="calibration">Calibration</string>
-    <string name="calibration_algorithm">Calibration Algorithm</string>
-    <string name="calibrations">Calibrations</string>
+    <string name="calibrated">已校准</string>
+    <string name="calibratepast">应用到过去</string>
+    <string name="calibration">校准</string>
+    <string name="calibration_algorithm">校准算法</string>
+    <string name="calibrations">校准</string>
     <string name="caresens_air_scan_instruction">扫描 CareSens Air 包装上的传感器代码</string>
     <string name="caresens_air_sensor">康森空气</string>
     <string name="caresens_air_sensor_desc">扫码+蓝牙</string>
     <string name="caresens_air_setup_title">CareSens 空气设置</string>
-    <string name="chsibionics">Sibionics Chinese</string>
-    <string name="clean_data_confirm">Clear App Data?</string>
-    <string name="clean_history_confirm">Clear History?</string>
-    <string name="clear_history_desc_long">Remove all glucose readings. Cannot be undone.</string>
-    <string name="complications">Complications</string>
+    <string name="chsibionics">西比亚（中国版）</string>
+    <string name="clean_data_confirm">清除应用数据？</string>
+    <string name="clean_history_confirm">清除历史记录？</string>
+    <string name="clear_history_desc_long">移除所有血糖读数，此操作不可撤销。</string>
+    <string name="complications">复杂功能</string>
     <string name="confidence">信心</string>
-    <string name="connected">Connected!</string>
+    <string name="connected">已连接！</string>
     <string name="connecting_to_sensor">正在连接传感器...</string>
     <string name="connecting_to_sensor_wait">我们正在建立连接，请稍候。</string>
     <string name="daily_trends">每日趋势</string>
-    <string name="dashboard">Dashboard</string>
-    <string name="days_to_export">Days to export</string>
+    <string name="dashboard">仪表盘</string>
+    <string name="days_to_export">导出天数</string>
     <string name="quick_range">快速范围</string>
     <string name="add_patient_info">添加患者信息</string>
     <string name="hide_patient_info">隐藏患者信息</string>
@@ -662,53 +662,53 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="patient_id_label">患者编号</string>
     <string name="patient_dob_label">出生日期</string>
     <string name="patient_clinician_label">医疗团队</string>
-    <string name="debug_logs">Debug Logs</string>
-    <string name="delete_calibration">Delete calibration?</string>
-    <string name="dexfuture">Predict (Dexcom)</string>
-    <string name="disabled_status">Disabled</string>
-    <string name="disconnect">Disconnect</string>
+    <string name="debug_logs">调试日志</string>
+    <string name="delete_calibration">删除校准？</string>
+    <string name="dexfuture">预测（德康）</string>
+    <string name="disabled_status">已禁用</string>
+    <string name="disconnect">断开连接</string>
     <string name="disconnect_sensor_aidex_desc">这将断开传感器的连接。配对密钥和历史记录都会被保留 - 您可以稍后重新连接。</string>
-    <string name="disconnect_sensor_desc">This will permanently stop the sensor session.</string>
-    <string name="disconnect_sensor_title">Disconnect Sensor?</string>
-    <string name="enabled_status">Enabled</string>
-    <string name="enternums">Enter amounts on</string>
-    <string name="eusibionics">Sibionics EU</string>
-    <string name="everSensebroadcast">EverSense Broadcast</string>
+    <string name="disconnect_sensor_desc">这将永久停止传感器会话。</string>
+    <string name="disconnect_sensor_title">断开传感器？</string>
+    <string name="enabled_status">已启用</string>
+    <string name="enternums">输入数值于</string>
+    <string name="eusibionics">西比亚（欧洲版）</string>
+    <string name="everSensebroadcast">EverSense 广播</string>
     <string name="exchangedata">交换数据</string>
-    <string name="exclude">Exclude</string>
-    <string name="expired">Expired</string>
-    <string name="factory_reset_alert">Remove EVERYTHING. Cannot be undone!</string>
-    <string name="factory_reset_confirm">Factory Reset?</string>
+    <string name="exclude">排除</string>
+    <string name="expired">已过期</string>
+    <string name="factory_reset_alert">将移除所有数据，此操作不可撤销！</string>
+    <string name="factory_reset_confirm">恢复出厂设置？</string>
     <string name="fiasp">Fiasp</string>
-    <string name="filesize">File size</string>
-    <string name="finddevices">"Find devices"</string>
+    <string name="filesize">文件大小</string>
+    <string name="finddevices">查找设备</string>
     <string name="finish_setup">完成</string>
-    <string name="forget_sensor_desc">This will remove the sensor from the list. It may reappear if scanned again.</string>
-    <string name="forget_sensor_title">Forget Sensor?</string>
+    <string name="forget_sensor_desc">这将从列表中移除传感器，如果再次扫描可能会重新出现。</string>
+    <string name="forget_sensor_title">忽略传感器？</string>
     <string name="glucodata_subtitle">Glucodata</string>
-    <string name="glulisine">Insulin Glulisine/Apidra</string>
-    <string name="googlescan">Google scan</string>
+    <string name="glulisine">谷赖胰岛素/Apidra</string>
+    <string name="googlescan">Google 扫描</string>
     <string name="gvi">总收入指数</string>
     <string name="gvi_excellent">优异的稳定性</string>
     <string name="gvi_good">稳定性好</string>
     <string name="gvi_moderate">适度的变化</string>
     <string name="gvi_poor">高变异性</string>
     <string name="hematonix">Hematonix</string>
-    <string name="hide">Hide</string>
-    <string name="high_label">High</string>
+    <string name="hide">隐藏</string>
+    <string name="high_label">偏高</string>
     <string name="high_range">高</string>
-    <string name="homenet">Home net</string>
+    <string name="homenet">家庭网络</string>
     <string name="hour12">12h</string>
-    <string name="humaninsulin">Human Insulin/Humulin R/Novolin R</string>
-    <string name="icelabel">ICE Label</string>
+    <string name="humaninsulin">人胰岛素/Humulin R/Novolin R</string>
+    <string name="icelabel">紧急联系人标签</string>
     <string name="in_range">在范围内</string>
     <string name="insights">见解</string>
-    <string name="isconnected">Connected</string>
-    <string name="isdisconnected">Disconnected</string>
-    <string name="keep_auto_calibration">Keep auto-calibration data</string>
-    <string name="keep_data">Keep sensor info</string>
-    <string name="last">"Last: "</string>
-    <string name="last_ble_status">Last BLE status</string>
+    <string name="isconnected">已连接</string>
+    <string name="isdisconnected">已断开</string>
+    <string name="keep_auto_calibration">保留自动校准数据</string>
+    <string name="keep_data">保留传感器信息</string>
+    <string name="last">上次：</string>
+    <string name="last_ble_status">上次蓝牙状态</string>
     <string name="libre_setup_done">完成</string>
     <string name="libre_setup_libreview_note_title">Libre 3 + LibreView</string>
     <string name="libre_setup_advanced_options_desc">在配对前调整 Libre 3 的实验性扫描行为。</string>
@@ -728,7 +728,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="libre_setup_step_libreview">LibreView 帐户</string>
     <string name="libre_setup_step_libreview_desc">上传到 LibreView 是可选的，但 Libre 3 传感器需要账户 ID 才能工作</string>
     <string name="libre_setup_step_scan">扫描传感器</string>
-    <string name="libresetalllabels">First specify for each label what should be done with it.</string>
+    <string name="libresetalllabels">请先为每个标签指定操作。</string>
     <string name="libreview_account_id">账户ID</string>
     <string name="libreview_active">发送到 LibreView</string>
     <string name="libreview_active_desc">启用 LibreView 上传</string>
@@ -745,39 +745,39 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="libreview_send_numbers">发送胰岛素/碳水化合物</string>
     <string name="libreview_settings_title">LibreView 设置</string>
     <string name="libreview_status">状态</string>
-    <string name="lispro">Insulin Lispro/Humalog</string>
+    <string name="lispro">赖脯胰岛素/Humalog</string>
     <string name="loading_data">正在加载...</string>
-    <string name="logging">Logging</string>
-    <string name="lossofsignal">Loss of signal</string>
+    <string name="logging">日志记录</string>
+    <string name="lossofsignal">信号丢失</string>
     <string name="low_label">Low</string>
     <string name="low_range">低</string>
     <string name="max">最大</string>
     <string name="max_glucose">最大</string>
     <string name="median">中位数</string>
-    <string name="meterlist">"Glucose Meters"</string>
+    <string name="meterlist">血糖仪</string>
     <string name="mgdL">mg/dL</string>
     <string name="min">最小</string>
     <string name="min_glucose">最小</string>
     <string name="mmolL">mmol/L</string>
-    <string name="newdata">"New data"</string>
-    <string name="nightscout_config">Nightscout Config</string>
-    <string name="no_data_available">No data available</string>
-    <string name="no_sensor_description">Connect a continuous glucose monitor to start tracking your glucose levels.</string>
-    <string name="no_sensor_title">No Sensor Connected</string>
-    <string name="nolibrelink">Use the EverSense Broadcast instead. See help.</string>
-    <string name="nonewdata">"No new data"</string>
+    <string name="newdata">新数据</string>
+    <string name="nightscout_config">Nightscout 配置</string>
+    <string name="no_data_available">无可用数据</string>
+    <string name="no_sensor_description">连接持续血糖监测仪以开始跟踪血糖水平。</string>
+    <string name="no_sensor_title">未连接传感器</string>
+    <string name="nolibrelink">请改用 EverSense 广播，参见帮助。</string>
+    <string name="nonewdata">无新数据</string>
     <string name="not">Not</string>
-    <string name="notalldata">WARNING: “Receive from” not set, but some data types are not sent.</string>
+    <string name="notalldata">警告：未设置「接收来自」，但某些数据类型未发送。</string>
     <string name="nothing"></string>
-    <string name="notifications">Alerts and notifications</string>
+    <string name="notifications">警报和通知</string>
     <string name="one">1</string>
     <string name="overlaypermissionmessage">adb shell pm grant tk.glucodata android.permission.SYSTEM_ALERT_WINDOW</string>
-    <string name="photo">Photo</string>
-    <string name="prehighglucose">" Soon HIGH glucose!"</string>
-    <string name="prehighglucosealarm">Alarm when soon above</string>
-    <string name="prelowglucose">" Soon LOW glucose!"</string>
-    <string name="prelowglucosealarm">Alarm when soon below</string>
-    <string name="profile">"Profile "</string>
+    <string name="photo">拍照</string>
+    <string name="prehighglucose"> 血糖即将偏高！</string>
+    <string name="prehighglucosealarm">即将偏高时警报</string>
+    <string name="prelowglucose"> 血糖即将偏低！</string>
+    <string name="prelowglucosealarm">即将偏低时警报</string>
+    <string name="profile">配置文件 </string>
     <string name="psg">巴黎圣日耳曼</string>
     <string name="psg_elevated">基线升高</string>
     <string name="psg_low">低基线</string>
@@ -790,60 +790,60 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="range_90d">90D</string>
     <string name="range_all">ALL</string>
     <string name="raw">Raw</string>
-    <string name="raw_auto">Raw+Auto</string>
-    <string name="reconnect">Reconnect</string>
-    <string name="reconnect_sensor_desc">This will reset the connection and attempt to reconnect.</string>
-    <string name="reconnect_sensor_title">Reconnect Sensor?</string>
+    <string name="raw_auto">原始+自动</string>
+    <string name="reconnect">重新连接</string>
+    <string name="reconnect_sensor_desc">这将重置连接并尝试重新连接。</string>
+    <string name="reconnect_sensor_title">重新连接传感器？</string>
     <string name="remove_sensor_desc">这将永久删除传感器、擦除配对密钥并停止会话。传感器必须重新配对才能再次使用。</string>
-    <string name="reset_sensor">Reset sensor</string>
-    <string name="reset_sensor_desc">This will reset the Sibionics 2 sensor. Continue?</string>
-    <string name="reset_sensor_title">Reset sensor?</string>
-    <string name="resetmessage">Clears transmitter memory. Should be pressed before using a new sensor in an already used transmitter.</string>
-    <string name="resettitle">Reset</string>
+    <string name="reset_sensor">重置传感器</string>
+    <string name="reset_sensor_desc">这将重置西比亚 2 传感器，是否继续？</string>
+    <string name="reset_sensor_title">重置传感器？</string>
+    <string name="resetmessage">清除发射器内存。在使用新传感器前应按下此按钮。</string>
+    <string name="resettitle">重置</string>
     <string name="scan_accuchek">扫描 Accu-Chek</string>
     <string name="scan_caresens_air">扫描 CareSens 空气</string>
-    <string name="schedules">Schedules</string>
-    <string name="sensor_address">Address</string>
-    <string name="sensor_ends_officially">Ends Officially</string>
-    <string name="sensor_expected_end">Expected End</string>
-    <string name="sensor_started">Started</string>
-    <string name="sensornotstreamed">Nothing yet</string>
-    <string name="sensors_title">Sensors</string>
+    <string name="schedules">时间表</string>
+    <string name="sensor_address">地址</string>
+    <string name="sensor_ends_officially">官方到期</string>
+    <string name="sensor_expected_end">预计结束</string>
+    <string name="sensor_started">已启动</string>
+    <string name="sensornotstreamed">尚无数据</string>
+    <string name="sensors_title">传感器</string>
     <string name="sensorstreamed"></string>
-    <string name="sibionics2">Sibionics 2 Split</string>
-    <string name="specifyblood">"First select the label for blood glucose"</string>
+    <string name="sibionics2">西比亚 2 分体</string>
+    <string name="specifyblood">请先选择血糖标签</string>
     <string name="stability">稳定性</string>
     <string name="start_tracking">开始追踪您的血糖以查看统计数据</string>
     <string name="statistics_subtitle">您的血糖分析</string>
     <string name="statistics_title">统计数据</string>
-    <string name="theme_dark">Dark</string>
-    <string name="theme_light">Light</string>
-    <string name="theme_system">System Default</string>
-    <string name="theme_title">Theme</string>
-    <string name="threshold">Threshold</string>
-    <string name="trend_falling">The trend is falling by %1$s percent.</string>
-    <string name="trend_rising">The trend is rising by %1$s percent.</string>
-    <string name="trend_unchanged">The trend remains unchanged.</string>
-    <string name="turnserver">Turn Server</string>
-    <string name="turnservers">Turn Servers</string>
-    <string name="unified_reset_desc">This will restart the sensor and reset the auto-calibration algorithm.</string>
+    <string name="theme_dark">深色</string>
+    <string name="theme_light">浅色</string>
+    <string name="theme_system">跟随系统</string>
+    <string name="theme_title">主题</string>
+    <string name="threshold">阈值</string>
+    <string name="trend_falling">趋势下降 %1$s 百分比。</string>
+    <string name="trend_rising">趋势上升 %1$s 百分比。</string>
+    <string name="trend_unchanged">趋势保持不变。</string>
+    <string name="turnserver">Turn 服务器</string>
+    <string name="turnservers">Turn 服务器</string>
+    <string name="unified_reset_desc">这将重启传感器并重置自动校准算法。</string>
     <string name="unit_mg">mg/dL</string>
     <string name="unit_mmol">mmol/L</string>
-    <string name="untouchablequestion">Make floating glucose untouchable?</string>
-    <string name="upload">Upload</string>
+    <string name="untouchablequestion">将浮动血糖设为不可触摸？</string>
+    <string name="upload">上传</string>
     <string name="urli">URLi/Lyumjev/insulin lispro-aabc</string>
-    <string name="useclose">Close button</string>
-    <string name="usedweight">WARNING: weight (%.1f) not 0</string>
-    <string name="username">Username</string>
-    <string name="valuenotification">Value notification</string>
+    <string name="useclose">关闭按钮</string>
+    <string name="usedweight">警告：权重 (%.1f) 不为 0</string>
+    <string name="username">用户名</string>
+    <string name="valuenotification">数值通知</string>
     <string name="very_high">非常高</string>
     <string name="very_low">非常低</string>
-    <string name="veryhighglucose">" Very HIGH glucose!"</string>
-    <string name="veryhighglucosealarm">Very high glucose alarm</string>
-    <string name="verylowglucose">" Very LOW glucose!"</string>
-    <string name="verylowglucosealarm">Very low glucose alarm</string>
-    <string name="wipe_data">Wipe sensor data</string>
-    <string name="writedown">Write down!</string>
+    <string name="veryhighglucose"> 血糖极高！</string>
+    <string name="veryhighglucosealarm">血糖极高警报</string>
+    <string name="verylowglucose"> 血糖极低！</string>
+    <string name="verylowglucosealarm">血糖极低警报</string>
+    <string name="wipe_data">清除传感器数据</string>
+    <string name="writedown">记下来！</string>
     <string name="xdrip_compatible_desc">Local broadcast</string>
     <string name="xdrip_compatible_title">xDrip-compatible</string>
     <string name="zero">0</string>
@@ -877,7 +877,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="vertical_offset_dp">垂直偏移：%1$d dp</string>
 
     <!-- Auto-added statistics explainer strings -->
-    <string name="a1c_gmi_label">A1C (GMI)</string>
+    <string name="a1c_gmi_label">糖化血红蛋白 (GMI)</string>
     <string name="cv_description">变异系数：标准差除以平均血糖。较低的值表明葡萄糖更​​稳定。</string>
     <string name="std_dev_short">标准差</string>
     <string name="std_dev_description">标准差：读数与平均血糖的典型距离。</string>
@@ -1195,7 +1195,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="report_hourly_agp_table">每小时 AGP 配置文件表</string>
     <string name="report_hour">小时</string>
     <string name="report_samples">样品</string>
-    <string name="report_iqr">IQR (P25-P75)</string>
+    <string name="report_iqr">四分位距 (P25-P75)</string>
     <string name="report_no_hourly_agp">此范围内没有可用的每小时 AGP 垃圾箱。</string>
     <string name="report_daily_outcomes_table">每日结果表</string>
     <string name="report_showing_latest_days">显示最近 %1$d 天，共 %2$d 天。</string>
@@ -1217,14 +1217,14 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="sibionics_ble_probe_empty">暂未发现 FF30 Sibionics 设备。</string>
     <string name="sibionics_ble_selected">已选择：%1$s</string>
     <string name="sibionics_use_fake_qr_from_ble">使用该 BLE 名称生成伪二维码信息</string>
-    <string name="wear_transport">Wear transport</string>
-    <string name="wear_transport_desc">Configure Wear OS data transport and sync state.</string>
-    <string name="wear_transport_runtime_available">Wear transport runtime is available.</string>
-    <string name="wear_transport_runtime_unavailable">Wear transport runtime is unavailable for this app session.</string>
-    <string name="wear_transport_gms_unavailable">Google Play Services unavailable; Wear transport is disabled.</string>
-    <string name="wear_transport_reinit_desc">Force a fresh watch discovery and network sync cycle.</string>
+    <string name="wear_transport">Wear 传输</string>
+    <string name="wear_transport_desc">配置 Wear OS 数据传输和同步状态。</string>
+    <string name="wear_transport_runtime_available">Wear 传输运行时可用。</string>
+    <string name="wear_transport_runtime_unavailable">当前应用会话中 Wear 传输运行时不可用。</string>
+    <string name="wear_transport_gms_unavailable">Google Play 服务不可用；Wear 传输已禁用。</string>
+    <string name="wear_transport_reinit_desc">强制重新发现手表和网络同步周期。</string>
     <string name="web_server_desc">兼容 Nightscout 的 Web 服务器</string>
-    <string name="invalid_interval">Invalid interval value</string>
+    <string name="invalid_interval">无效的间隔值</string>
     <string name="status_waiting_for_connection">等待连接</string>
     <string name="status_ready_in_minutes">传感器将在 %1$d 分钟后就绪。</string>
     <string name="navigate_back">返回</string>
@@ -1239,7 +1239,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="nightscout_status_retry_in">将在 %1$d 分钟后重试</string>
     <string name="nightscout_status_response_ok">上次响应：HTTP %1$d</string>
     <string name="nightscout_status_response_error">上次响应：HTTP %1$d</string>
-    <string name="nightscout_status_response_invalid_url">Last response: invalid Nightscout URL</string>
+    <string name="nightscout_status_response_invalid_url">上次响应：无效的 Nightscout URL</string>
     <string name="nightscout_status_response_404">上次响应：HTTP 404，检测到端点不匹配</string>
     <string name="nightscout_status_response_413">上次响应：HTTP 413，负载过大</string>
     <string name="nightscout_status_last_attempt">上次尝试：%1$s</string>
@@ -1270,4 +1270,125 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="insight_overnight_drift_desc">夜间葡萄糖中位数高于白天。请检查晚间胰岛素或碳水摄入时间。</string>
     <string name="insight_unstable_days">频繁不稳定日</string>
     <string name="insight_unstable_days_desc">在此时间窗口中，有 %1$d 天的达标时间低于 50%%。</string>
+
+    <string name="shortoff">关</string>
+
+    <string name="colors_style_setting_description">表盘颜色</string>
+
+    <string name="glucosenumbercomplicationlabel">血糖值</string>
+
+    <string name="glucosearrowcomplicationlabel">血糖箭头</string>
+
+    <string name="glucosearrowvaluecomplicationlabel">数值+箭头</string>
+
+    <string name="glucosevalueiconcomplicationlabel">血糖值（小）</string>
+
+    <string name="glucosearrowiconcomplicationlabel">血糖箭头（小）</string>
+
+    <string name="glucoseshortcomplicationlabel">数值+箭头（小）</string>
+
+    <string name="text">文本</string>
+
+    <string name="arrow">箭头</string>
+
+    <string name="photomessage">扫描德康 G7/ONE+ 或西比亚 GS1 传感器的数据矩阵或镜像二维码。</string>
+
+    <string name="initializing">初始化中</string>
+
+    <string name="startjuggluco">手机上是否运行了 Juggluco？
+
+WIFI 和蓝牙是否已开启？</string>
+
+    <string name="alarmclock">⏰</string>
+
+    <string name="datapresent">已有数据：</string>
+
+    <string name="overwrite">覆盖？</string>
+
+    <string name="verylowglucoseshort"> 极低！</string>
+
+    <string name="veryhighglucoseshort"> 极高！</string>
+
+    <string name="scantranstitle">扫描发射器数据矩阵</string>
+
+    <string name="scantransmessage">西比亚 2 传感器数据矩阵扫描成功。
+现在扫描发射器数据矩阵。</string>
+
+    <string name="mirrorscansucces">已成功添加连接到左侧中间菜单→镜像。</string>
+
+    <string name="switchtowatch">切换</string>
+
+    <string name="disconnectsensor">故障</string>
+
+    <string name="QRmirror">通过二维码镜像</string>
+
+    <string name="scanner_label">扫描器</string>
+
+    <string name="label">标签</string>
+
+    <string name="no_sensors_found">未找到传感器</string>
+
+    <string name="add_sensor_title">添加传感器</string>
+
+    <string name="restart_autocal_title">重启自动校准？</string>
+
+    <string name="restart_autocal_desc">清除所有应用内自动校准数据，重启算法并重新连接？</string>
+
+    <string name="restart">重启</string>
+
+    <string name="broadcast_only">仅广播</string>
+
+    <string name="reset_autocal_button">重启自动校准</string>
+
+    <string name="in_use">%1$s 使用中</string>
+
+    <string name="remaining">剩余 %1$s</string>
+
+    <string name="days_short">%1$d天</string>
+
+    <string name="hours_short">%1$d小时</string>
+
+    <string name="reset_all_title">全部重置？</string>
+
+    <string name="reset_all_desc">清除所有旧数据、校准并重置传感器？</string>
+
+    <string name="reset_all">全部重置</string>
+
+    <string name="auto_reset_never">从不</string>
+
+    <string name="scan_sensor_qr">扫描传感器二维码</string>
+
+    <string name="scan_sensor_qr_desc">扫描传感器包装上的数据矩阵</string>
+
+    <string name="scan_transmitter">扫描发射器</string>
+
+    <string name="connecting">连接中...</string>
+
+    <string name="setup_complete">设置完成</string>
+
+    <string name="delete_sensor">删除传感器</string>
+
+    <string name="delete_sensor_desc">这将移除传感器及其所有数据，此操作不可撤销。</string>
+
+    <string name="delete_confirm">删除</string>
+
+    <string name="general_settings">通用设置</string>
+
+    <string name="refreshing">刷新中...</string>
+
+    <string name="status_waiting_for_data">已连接，等待数据...</string>
+
+    <string name="status_raw_values_received">已连接，已接收原始值</string>
+
+    <string name="manual_calibration">手动校准</string>
+
+    <string name="calibration_apply_past_subtitle">关闭时，校准从第一个校准点附近开始并向后延伸。</string>
+
+    <string name="calibration_overwrite_values_title">写入校准值</string>
+
+    <string name="calibration_overwrite_values_subtitle">写入数据库，用于统计、报告和导出。</string>
+
+    <string name="calibration_visual_continuity_subtitle">视觉模式：从当前显示的值继续校准。</string>
+
+    <string name="scan_with_follower">在跟随设备上扫描此二维码</string>
 </resources>
