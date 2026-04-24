@@ -6,19 +6,23 @@ on:
       variant:
         description: 'Build variant'
         required: true
-        default: 'mobileLibre3SiDexNogoogleRelease'
+        default: 'mobileLibre3SiDexGoogleRelease'
         type: choice
         options:
-          - mobileLibre3SiDexNogoogleRelease
           - mobileLibre3SiDexGoogleRelease
-          - mobileLibre3NosiDexNogoogleRelease
+          - mobileLibre3SiDexNogoogleRelease
           - mobileLibre3NosiDexGoogleRelease
-          - mobileLibreOldSiDexNogoogleRelease
           - mobileLibreOldNosiDexNogoogleRelease
   push:
     branches: [ main ]
     paths:
-      - '.github/workflows/build.yml'
+      - 'Common/**'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradle/**'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -60,15 +64,11 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: List build variants
-        run: |
-          ./gradlew :Common:variants --no-daemon 2>&1 || true
-
       - name: Build APK
         run: |
-          VARIANT="${{ github.event.inputs.variant || 'mobileLibre3SiDexNogoogleRelease' }}"
+          VARIANT="${{ github.event.inputs.variant || 'mobileLibre3SiDexGoogleRelease' }}"
           echo "Building variant: $VARIANT"
-          ./gradlew :Common:assemble${VARIANT} --no-daemon --stacktrace
+          ./gradlew :Common:assemble${VARIANT} --no-daemon
 
       - name: Find APK
         id: apk
