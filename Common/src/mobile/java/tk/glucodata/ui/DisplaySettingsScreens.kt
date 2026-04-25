@@ -103,8 +103,8 @@ fun NotificationSettingsScreen(
             .apply()
     }
 
-    LegacySettingsScaffold(navController = navController, title = "Notification Settings") {
-        SectionLabel("Font", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
+    LegacySettingsScaffold(navController = navController, title = "通知设置") {
+        SectionLabel("字体", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
 
         FlowRow(
             modifier = Modifier.padding(horizontal = 24.dp),
@@ -169,31 +169,31 @@ fun NotificationSettingsScreen(
             modifier = Modifier.padding(horizontal = 24.dp)
         ) {
             SettingsSwitchItem(
-                title = "Show Trend Arrow",
+                title = "显示趋势箭头",
                 checked = showArrow,
                 onCheckedChange = { showArrow = it; save() },
                 icon = null,
                 position = CardPosition.TOP
             )
             SettingsSwitchItem(
-                title = "Show Chart (Expanded)",
-                subtitle = "Chart when notification is expanded",
+                title = "显示图表（展开）",
+                subtitle = "通知展开时显示图表",
                 checked = notificationChartEnabled,
                 onCheckedChange = { viewModel.toggleNotificationChart(it) },
                 icon = null,
                 position = CardPosition.MIDDLE
             )
             SettingsSwitchItem(
-                title = "Show Chart (Collapsed)",
-                subtitle = "Compact chart in collapsed view",
+                title = "显示图表（折叠）",
+                subtitle = "折叠视图中的紧凑图表",
                 checked = collapsedChart,
                 onCheckedChange = { collapsedChart = it; save() },
                 icon = null,
                 position = CardPosition.MIDDLE
             )
             SettingsSwitchItem(
-                title = "Show Target Range",
-                subtitle = "Highlight target glucose range on chart",
+                title = "显示目标范围",
+                subtitle = "在图表上高亮目标血糖范围",
                 checked = showTargetRange,
                 onCheckedChange = { showTargetRange = it; save() },
                 icon = null,
@@ -243,7 +243,7 @@ fun FloatingGlucoseSettingsScreen(
     LegacySettingsScaffold(navController = navController, title = stringResource(R.string.floatglucose)) {
         MasterSwitchCard(
             title = stringResource(R.string.enable_overlay),
-            subtitle = if (hasPermission) "Display over other apps" else "Overlay permission required",
+            subtitle = if (hasPermission) "在其他应用上层显示" else "需要悬浮窗权限",
             checked = isEnabled,
             onCheckedChange = { enabled ->
                 if (enabled && !hasPermission) {
@@ -317,8 +317,8 @@ fun FloatingGlucoseSettingsScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
         SettingsSwitchItem(
-            title = "Use subtle outline",
-            subtitle = if (useSubtleOutline) "Thin edge highlight" else "Soft shadow around overlay",
+            title = "使用细微轮廓",
+            subtitle = if (useSubtleOutline) "细边缘高亮" else "叠加层周围柔和阴影",
             checked = useSubtleOutline,
             onCheckedChange = { repository.setUseSubtleOutline(it) },
             position = CardPosition.SINGLE,
@@ -484,10 +484,10 @@ fun AodSettingsScreen(navController: NavController) {
         serviceEnabled = isAodAccessibilityEnabled(context)
     }
 
-    LegacySettingsScaffold(navController = navController, title = "AOD Settings") {
+    LegacySettingsScaffold(navController = navController, title = "AOD 设置") {
         MasterSwitchCard(
-            title = "Enable Overlay service",
-            subtitle = if (serviceEnabled) "Accessibility service enabled" else "Open Accessibility settings",
+            title = "启用叠加服务",
+            subtitle = if (serviceEnabled) "无障碍服务已启用" else "打开无障碍设置",
             checked = serviceEnabled,
             onCheckedChange = {
                 context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -549,7 +549,7 @@ fun AodSettingsScreen(navController: NavController) {
         }
 
         Spacer(Modifier.height(16.dp))
-        SectionLabel("Layout", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
+        SectionLabel("布局", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
         Text(
             stringResource(R.string.active_positions_randomized),
             style = MaterialTheme.typography.bodyMedium,
@@ -602,18 +602,18 @@ fun AodSettingsScreen(navController: NavController) {
         }
 
         Spacer(Modifier.height(24.dp))
-        SectionLabel("Appearance", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
+        SectionLabel("外观", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
         Spacer(Modifier.height(8.dp))
         Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.padding(horizontal = 24.dp)) {
             SettingsSwitchItem(
-                title = "Show Chart",
+                title = "显示图表",
                 checked = showChart,
                 onCheckedChange = { showChart = it; save() },
                 icon = null,
                 position = CardPosition.TOP
             )
             SettingsSwitchItem(
-                title = "Show Trend Arrow",
+                title = "显示趋势箭头",
                 checked = showArrow,
                 onCheckedChange = { showArrow = it; save() },
                 icon = null,
@@ -630,20 +630,20 @@ fun AodSettingsScreen(navController: NavController) {
         }
 
         LegacySliderControl(
-            label = "Opacity: ${(opacity * 100).toInt()}%",
+            label = "不透明度：${(opacity * 100).toInt()}%",
             value = opacity,
             onValueChange = { opacity = it; save() },
             range = 0.1f..1.0f
         )
         LegacySliderControl(
-            label = "Text Size: ${(textScale * 100).toInt()}%",
+            label = "文字大小：${(textScale * 100).toInt()}%",
             value = textScale,
             onValueChange = { textScale = it; save() },
             range = 0.5f..6.0f
         )
         if (showChart) {
             LegacySliderControl(
-                label = "Chart Size: ${(chartScale * 100).toInt()}%",
+                label = "图表大小：${(chartScale * 100).toInt()}%",
                 value = chartScale,
                 onValueChange = { chartScale = it; save() },
                 range = 0.5f..2.0f
@@ -651,7 +651,7 @@ fun AodSettingsScreen(navController: NavController) {
         }
         if (showArrow) {
             LegacySliderControl(
-                label = "Arrow Size: ${(arrowScale * 100).toInt()}%",
+                label = "箭头大小：${(arrowScale * 100).toInt()}%",
                 value = arrowScale,
                 onValueChange = { arrowScale = it; save() },
                 range = 0.5f..2.0f
