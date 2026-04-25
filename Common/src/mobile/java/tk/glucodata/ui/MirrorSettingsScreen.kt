@@ -291,8 +291,8 @@ fun MirrorSettingsScreen(navController: NavController) {
             }
             item(key = "qr_share") {
                 SettingsItem(
-                    title = "Share My QR",
-                    subtitle = "Let another device scan to connect",
+                    title = "分享我的二维码",
+                    subtitle = "让其他设备扫码连接",
                     icon = Icons.Outlined.QrCode,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.TOP,
@@ -309,7 +309,7 @@ fun MirrorSettingsScreen(navController: NavController) {
             }
             item(key = "qr_scan") {
                 SettingsItem(
-                    title = "Scan QR Code",
+                    title = "扫描二维码",
                     subtitle = "Scan another device's QR to connect",
                     icon = Icons.Outlined.QrCodeScanner,
                     iconTint = MaterialTheme.colorScheme.tertiary,
@@ -324,8 +324,8 @@ fun MirrorSettingsScreen(navController: NavController) {
             }
             item(key = "broadcast") {
                 SettingsSwitchItem(
-                    title = "Broadcast on Network",
-                    subtitle = "Let nearby devices discover this device",
+                    title = "网络广播",
+                    subtitle = "让附近设备发现此设备",
                     icon = Icons.Filled.CellTower,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     checked = isBroadcasting,
@@ -386,7 +386,7 @@ fun MirrorSettingsScreen(navController: NavController) {
             item(key = "turn") {
                 SettingsItem(
                     title = stringResource(R.string.turnserver),
-                    subtitle = "TURN relay for remote connections",
+                    subtitle = "用于远程连接的 TURN 中继",
                     icon = Icons.Filled.Cloud,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     showArrow = true,
@@ -754,7 +754,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
                     ConnectionType.LOCAL -> {
                         SettingsSwitchItem(
                             title = "Auto-detect IP",
-                            subtitle = "Use local network discovery for this connection",
+                            subtitle = "此连接使用局域网发现",
                             checked = autoDetect,
                             onCheckedChange = { autoDetect = it },
                             icon = Icons.Filled.Wifi,
@@ -844,13 +844,13 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
             SectionLabel("Role", modifier = Modifier.padding(horizontal = 24.dp))
             Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.padding(horizontal = 24.dp)) {
                 SettingsSwitchItem(
-                    title = "Receive Data", subtitle = "This device receives glucose data",
+                    title = "接收数据", subtitle = "此设备接收血糖数据",
                     checked = isReceiving, onCheckedChange = { isReceiving = it },
                     icon = Icons.Filled.Download, iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.TOP
                 )
                 SettingsSwitchItem(
-                    title = "Send Data", subtitle = "This device sends glucose data",
+                    title = "发送数据", subtitle = "此设备发送血糖数据",
                     checked = isSending, onCheckedChange = { isSending = it },
                     icon = Icons.Filled.Upload, iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.BOTTOM
