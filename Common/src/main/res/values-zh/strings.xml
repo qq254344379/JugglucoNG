@@ -532,7 +532,7 @@
     <string name="status_disconnected">已断开</string>
     <string name="select_sensor_type">选择传感器类型</string>
     <string name="choose_theme">选择主题</string>
-    <string name="sibionics_sensor">西比亚</string>
+    <string name="sibionics_sensor">硅基</string>
     <string name="sibionics_sensor_desc">扫描二维码</string>
     <string name="libre_sensor">雅培 Libre 2/3</string>
     <string name="libre_sensor_desc">通过 NFC</string>
@@ -642,7 +642,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="caresens_air_sensor">康森空气</string>
     <string name="caresens_air_sensor_desc">扫码+蓝牙</string>
     <string name="caresens_air_setup_title">CareSens 空气设置</string>
-    <string name="chsibionics">西比亚（中国版）</string>
+    <string name="chsibionics">硅基（中国版）</string>
     <string name="clean_data_confirm">清除应用数据？</string>
     <string name="clean_history_confirm">清除历史记录？</string>
     <string name="clear_history_desc_long">移除所有血糖读数，此操作不可撤销。</string>
@@ -672,7 +672,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="disconnect_sensor_title">断开传感器？</string>
     <string name="enabled_status">已启用</string>
     <string name="enternums">输入数值于</string>
-    <string name="eusibionics">西比亚（欧洲版）</string>
+    <string name="eusibionics">硅基（欧洲版）</string>
     <string name="everSensebroadcast">EverSense 广播</string>
     <string name="exchangedata">交换数据</string>
     <string name="exclude">排除</string>
@@ -796,7 +796,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="reconnect_sensor_title">重新连接传感器？</string>
     <string name="remove_sensor_desc">这将永久删除传感器、擦除配对密钥并停止会话。传感器必须重新配对才能再次使用。</string>
     <string name="reset_sensor">重置传感器</string>
-    <string name="reset_sensor_desc">这将重置西比亚 2 传感器，是否继续？</string>
+    <string name="reset_sensor_desc">这将重置硅基 2 传感器，是否继续？</string>
     <string name="reset_sensor_title">重置传感器？</string>
     <string name="resetmessage">清除发射器内存。在使用新传感器前应按下此按钮。</string>
     <string name="resettitle">重置</string>
@@ -810,7 +810,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="sensornotstreamed">尚无数据</string>
     <string name="sensors_title">传感器</string>
     <string name="sensorstreamed"></string>
-    <string name="sibionics2">西比亚 2 分体</string>
+    <string name="sibionics2">硅基 2 分体</string>
     <string name="specifyblood">请先选择血糖标签</string>
     <string name="stability">稳定性</string>
     <string name="start_tracking">开始追踪您的血糖以查看统计数据</string>
@@ -1291,7 +1291,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
 
     <string name="arrow">箭头</string>
 
-    <string name="photomessage">扫描德康 G7/ONE+ 或西比亚 GS1 传感器的数据矩阵或镜像二维码。</string>
+    <string name="photomessage">扫描德康 G7/ONE+ 或硅基 GS1 传感器的数据矩阵或镜像二维码。</string>
 
     <string name="initializing">初始化中</string>
 
@@ -1311,7 +1311,7 @@ WIFI 和蓝牙是否已开启？</string>
 
     <string name="scantranstitle">扫描发射器数据矩阵</string>
 
-    <string name="scantransmessage">西比亚 2 传感器数据矩阵扫描成功。
+    <string name="scantransmessage">硅基 2 传感器数据矩阵扫描成功。
 现在扫描发射器数据矩阵。</string>
 
     <string name="mirrorscansucces">已成功添加连接到左侧中间菜单→镜像。</string>
