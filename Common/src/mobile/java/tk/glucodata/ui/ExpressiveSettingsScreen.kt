@@ -265,8 +265,8 @@ fun ExpressiveSettingsScreen(
                 )
 
                 SettingsItem(
-                    title = "Notification Settings",
-                    subtitle = "Customize notification shade",
+                    title = "通知设置",
+                    subtitle = "自定义通知栏",
                     icon = Icons.Default.ClearAll,
                     iconTint = notifColor,
                     position = CardPosition.MIDDLE,
@@ -274,15 +274,15 @@ fun ExpressiveSettingsScreen(
                 )
                 SettingsItem(
                     title = stringResource(R.string.floatglucose),
-                    subtitle = "Display overlay on other apps",
+                    subtitle = "在其他应用上显示叠加层",
                     icon = Icons.Default.PictureInPicture,
                     iconTint = notifColor,
                     position = CardPosition.MIDDLE,
                     onClick = { navController.navigate("settings/floating-display") }
                 )
                 SettingsItem(
-                    title = "Lock screen (AOD)",
-                    subtitle = "Customize always-on display",
+                    title = "锁屏 (AOD)",
+                    subtitle = "自定义息屏显示",
                     icon = Icons.Default.Visibility,
                     iconTint = notifColor,
                     position = CardPosition.BOTTOM,
@@ -497,8 +497,8 @@ fun ExpressiveSettingsScreen(
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 // Restart App (Low Severity)
                 DangerItem(
-                    title = "Restart App",
-                    subtitle = "Force restart the application",
+                    title = "重启应用",
+                    subtitle = "强制重启应用程序",
                     icon = Icons.Filled.Refresh,
                     position = CardPosition.TOP,
                     severity = DangerSeverity.LOW,
@@ -935,7 +935,7 @@ fun NotificationSettingsSheet(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.padding(horizontal = 24.dp)) {
                 SettingsSwitchItem(
-                    title = "Show Trend Arrow",
+                    title = "显示趋势箭头",
                     checked = showArrow,
                     onCheckedChange = { showArrow = it; save() },
                     icon = null,
@@ -955,8 +955,8 @@ fun NotificationSettingsSheet(
 
                 }
                 SettingsSwitchItem(
-                    title = "Show Chart (Expanded)",
-                    subtitle = "Chart when notification is expanded",
+                    title = "显示图表（展开）",
+                    subtitle = "通知展开时显示图表",
                     checked = notificationChartEnabled,
                     onCheckedChange = { viewModel.toggleNotificationChart(it) },
                     icon = null,
@@ -964,8 +964,8 @@ fun NotificationSettingsSheet(
                 )
 
                 SettingsSwitchItem(
-                    title = "Show Chart (Collapsed)",
-                    subtitle = "Compact chart in collapsed view",
+                    title = "显示图表（折叠）",
+                    subtitle = "折叠视图中的紧凑图表",
                     checked = collapsedChart,
                     onCheckedChange = { collapsedChart = it; save() },
                     icon = null,
@@ -973,8 +973,8 @@ fun NotificationSettingsSheet(
                 )
 
                 SettingsSwitchItem(
-                    title = "Show Target Range",
-                    subtitle = "Highlight target glucose range on chart",
+                    title = "显示目标范围",
+                    subtitle = "在图表上高亮目标血糖范围",
                     checked = showTargetRange,
                     onCheckedChange = { showTargetRange = it; save() },
                     icon = null,
@@ -1052,15 +1052,15 @@ fun AODSettingsSheet(onDismiss: () -> Unit, sheetState: SheetState, context: and
                 .verticalScroll(rememberScrollState())
         ) {
             Text(
-                "AOD Settings",
+                "AOD 设置",
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
             )
 
             // Enable Button
             SettingsItem(
-                title = "Enable Overlay service",
-                subtitle = "Opens Accessibility Settings",
+                title = "启用叠加服务",
+                subtitle = "打开无障碍设置",
                 icon = Icons.Default.SettingsAccessibility,
                 position = CardPosition.SINGLE,
                 onClick = {
@@ -1171,14 +1171,14 @@ fun AODSettingsSheet(onDismiss: () -> Unit, sheetState: SheetState, context: and
 
             // Toggles Group
             SettingsSwitchItem(
-                title = "Show Chart",
+                title = "显示图表",
                 checked = showChart,
                 onCheckedChange = { showChart = it; save() },
                 icon = null,
                 position = CardPosition.TOP
             )
             SettingsSwitchItem(
-                title = "Show Trend Arrow",
+                title = "显示趋势箭头",
                 checked = showArrow,
                 onCheckedChange = { showArrow = it; save() },
                 icon = null,
