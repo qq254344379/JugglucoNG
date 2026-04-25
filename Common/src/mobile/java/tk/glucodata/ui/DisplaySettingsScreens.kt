@@ -151,14 +151,14 @@ fun NotificationSettingsScreen(
 
         Spacer(Modifier.height(4.dp))
         LegacySliderControl(
-            label = "Font Size: ${(fontSize * 100).toInt()}%",
+            label = "文字大小: ${(fontSize * 100).toInt()}%",
             value = fontSize,
             onValueChange = { fontSize = it; save() },
             range = 0.6f..1.5f
         )
         Spacer(Modifier.height(4.dp))
         LegacySliderControl(
-            label = "Status Bar Icon Size: ${(statusIconScale * 100).toInt()}%",
+            label = "状态栏图标大小: ${(statusIconScale * 100).toInt()}%",
             value = statusIconScale,
             onValueChange = { statusIconScale = it; save() },
             range = 0f..1.25f
@@ -204,7 +204,7 @@ fun NotificationSettingsScreen(
         if (showArrow) {
             Spacer(Modifier.height(4.dp))
             LegacySliderControl(
-                label = "Arrow Size: ${(arrowSize * 100).toInt()}%",
+                label = "箭头大小: ${(arrowSize * 100).toInt()}%",
                 value = arrowSize,
                 onValueChange = { arrowSize = it; save() },
                 range = 0.5f..1.5f
