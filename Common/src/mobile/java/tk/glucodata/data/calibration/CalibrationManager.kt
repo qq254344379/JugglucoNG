@@ -39,28 +39,28 @@ object CalibrationManager {
     ) {
         SANE_WEIGHTED_OLS(
             storageValue = "sane_weighted_ols",
-            title = "Sane Weighted OLS",
-            description = "Recency-weighted linear fit with slope guardrails"
+            title = "Sane 加权最小二乘法",
+            description = "基于时间权重的线性拟合，带斜率保护"
         ),
         XDRIP_MEDIAN_SLOPE(
             storageValue = "xdrip_median_slope",
-            title = "xDrip Median Slope",
-            description = "Median pair-slope fit (Theil-Sen style), robust to outliers"
+            title = "xDrip 中位数斜率",
+            description = "中位数斜率拟合（Theil-Sen 风格），抗异常值"
         ),
         TIME_WEIGHTED_ROBUST_REGRESSION(
             storageValue = "time_weighted_robust_regression",
-            title = "Time-Weighted Robust Regression",
-            description = "Huber-style weighted regression with temporal decay"
+            title = "时间加权鲁棒回归",
+            description = "Huber 风格加权回归，带时间衰减"
         ),
         ELASTIC_TIME_WEIGHTED_INTERPOLATION(
             storageValue = "elastic_time_weighted_interpolation",
-            title = "Elastic Time-Weighted Point Interpolation",
-            description = "Local anchor interpolation blended with global trend"
+            title = "弹性时间加权插值",
+            description = "局部锚点插值融合全局趋势"
         ),
         ADAPTIVE_ENSEMBLE(
             storageValue = "adaptive_ensemble",
-            title = "Adaptive Ensemble (Recommended)",
-            description = "Blends robust, elastic and median-slope predictions"
+            title = "自适应集成（推荐）",
+            description = "融合鲁棒、弹性和中位数斜率预测"
         );
 
         companion object {
