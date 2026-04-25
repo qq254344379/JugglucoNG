@@ -2490,7 +2490,7 @@ fun SettingsScreen(navController: androidx.navigation.NavController, themeMode: 
 
         //--- DATA MANAGEMENT SECTION ---
         Text(
-            text = "Data Management",
+            text = "数据管理",
             style = MaterialTheme.typography.titleLarge,
             modifier = Modifier.padding(horizontal = 16.dp)
         )
@@ -3949,7 +3949,7 @@ fun SensorCard(sensor: tk.glucodata.ui.viewmodel.SensorInfo, viewModel: tk.gluco
                         Spacer(modifier = Modifier.width(16.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                "Advanced auto-calibration",
+                                "高级自动校准",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold
                             )
@@ -4756,7 +4756,7 @@ fun SensorCard(sensor: tk.glucodata.ui.viewmodel.SensorInfo, viewModel: tk.gluco
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text(
-                                        text = if (calExpanded) "Show less" else "Show all $calCount",
+                                        text = if (calExpanded) "收起" else "显示全部 $calCount",
                                         style = MaterialTheme.typography.labelMedium,
                                         color = MaterialTheme.colorScheme.primary
                                     )
