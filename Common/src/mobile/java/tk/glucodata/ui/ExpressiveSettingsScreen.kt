@@ -434,7 +434,7 @@ fun ExpressiveSettingsScreen(
                 }
                 SettingsItem(
                     title = stringResource(R.string.watches),
-                    subtitle = "WearOS, Watchdrip, GadgetBridge, Kerfstok",
+                    subtitle = "WearOS、Watchdrip、GadgetBridge、Kerfstok",
                     showArrow = true,
                     icon = Icons.Default.Devices,
                     iconTint = exchangeColor,
@@ -613,8 +613,8 @@ fun ExpressiveSettingsScreen(
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 // Restart App (Low Severity)
                 DangerItem(
-                    title = "Restart App",
-                    subtitle = "Force restart the application",
+                    title = "重启应用",
+                    subtitle = "强制重启应用程序",
                     icon = Icons.Filled.Refresh,
                     position = CardPosition.TOP,
                     severity = DangerSeverity.LOW,
@@ -1563,8 +1563,8 @@ fun NotificationSettingsSheet(
 //            Spacer(Modifier.height(16.dp))
 //            SectionLabel("Elements", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
 //            SettingsSwitchItem(
-//                title = "Show Status Text",
-//                subtitle = "Sensor connection status",
+//                title = "显示状态文本",
+//                subtitle = "传感器连接状态",
 //                checked = showStatus,
 //                onCheckedChange = { showStatus = it; save() },
 //                icon = null,
@@ -1575,7 +1575,7 @@ fun NotificationSettingsSheet(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.padding(horizontal = 24.dp)) {
                 SettingsSwitchItem(
-                    title = "Show Trend Arrow",
+                    title = "显示趋势箭头",
                     checked = showArrow,
                     onCheckedChange = { showArrow = it; save() },
                     icon = null,
@@ -1595,8 +1595,8 @@ fun NotificationSettingsSheet(
 
                 }
                 SettingsSwitchItem(
-                    title = "Show Chart (Expanded)",
-                    subtitle = "Chart when notification is expanded",
+                    title = "显示图表（展开）",
+                    subtitle = "展开通知时显示图表",
                     checked = notificationChartEnabled,
                     onCheckedChange = { viewModel.toggleNotificationChart(it) },
                     icon = null,
@@ -1604,8 +1604,8 @@ fun NotificationSettingsSheet(
                 )
 
                 SettingsSwitchItem(
-                    title = "Show Chart (Collapsed)",
-                    subtitle = "Compact chart in collapsed view",
+                    title = "显示图表（收起）",
+                    subtitle = "收起视图中显示紧凑图表",
                     checked = collapsedChart,
                     onCheckedChange = { collapsedChart = it; save() },
                     icon = null,
@@ -1613,16 +1613,16 @@ fun NotificationSettingsSheet(
                 )
 
                 SettingsSwitchItem(
-                    title = "Show Target Range",
-                    subtitle = "Highlight target glucose range on chart",
+                    title = "显示目标范围",
+                    subtitle = "在图表上高亮目标血糖范围",
                     checked = showTargetRange,
                     onCheckedChange = { showTargetRange = it; save() },
                     icon = null,
                     position = CardPosition.BOTTOM
                 )
                 //            SettingsSwitchItem(
-//                title = "Hide Status Bar Icon",
-//                subtitle = "Use transparent icon (minimize clutter)",
+//                title = "隐藏状态栏图标",
+//                subtitle = "使用透明图标（减少杂乱）",
 //                checked = hideStatusIcon,
 //                onCheckedChange = { hideStatusIcon = it; save() },
 //                icon = null,
@@ -1699,8 +1699,8 @@ fun AODSettingsSheet(onDismiss: () -> Unit, sheetState: SheetState, context: and
 
             // Enable Button
             SettingsItem(
-                title = "Enable Overlay service",
-                subtitle = "Opens Accessibility Settings",
+                title = "启用悬浮窗服务",
+                subtitle = "打开无障碍设置",
                 icon = Icons.Default.SettingsAccessibility,
                 position = CardPosition.SINGLE,
                 onClick = {
@@ -1811,14 +1811,14 @@ fun AODSettingsSheet(onDismiss: () -> Unit, sheetState: SheetState, context: and
 
             // Toggles Group
             SettingsSwitchItem(
-                title = "Show Chart",
+                title = "显示图表",
                 checked = showChart,
                 onCheckedChange = { showChart = it; save() },
                 icon = null,
                 position = CardPosition.TOP
             )
             SettingsSwitchItem(
-                title = "Show Trend Arrow",
+                title = "显示趋势箭头",
                 checked = showArrow,
                 onCheckedChange = { showArrow = it; save() },
                 icon = null,
