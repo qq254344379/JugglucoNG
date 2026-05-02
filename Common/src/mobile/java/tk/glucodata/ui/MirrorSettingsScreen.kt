@@ -76,7 +76,7 @@ fun injectMirrorJson(jsonstr: String, context: Context): Boolean {
     try {
         val jsonClean = if (jsonstr.endsWith(" MirrorJuggluco")) jsonstr.dropLast(15) else jsonstr
         val json = JSONObject(jsonClean)
-        val iceLabel = json.optString("ICElabel").takeIf { it.isNotEmpty() }
+        val iceLabel = json.optString("ICE标签").takeIf { it.isNotEmpty() }
         val namesArray = json.optJSONArray("names")
         val names = if (namesArray != null) {
             Array(namesArray.length()) { i -> namesArray.getString(i) }
@@ -112,9 +112,9 @@ private fun changeHostErrorMessage(context: Context, code: Int): String = when (
     -2 -> context.getString(R.string.parseip)
     -3 -> context.getString(R.string.toomanyhosts)
     -4 -> context.getString(R.string.senthosts)
-    -5 -> "Hostname too long"
+    -5 -> "主机名过长"
     -6 -> "Database busy, try again"
-    -16 -> "ICE label should be at least 16 characters"
+    -16 -> "ICE 标签至少需要 16 个字符"
     else -> context.getString(R.string.mirror_error_with_code, code)
 }
 
@@ -287,12 +287,12 @@ fun MirrorSettingsScreen(navController: NavController) {
         ) {
             // ── QR Row ───────────────────────────────────────────────
             item(key = "qr_section") {
-                SectionLabel("Quick Pair", topPadding = 8.dp)
+                SectionLabel("快速配对", topPadding = 8.dp)
             }
             item(key = "qr_share") {
                 SettingsItem(
-                    title = "Share My QR",
-                    subtitle = "Let another device scan to connect",
+                    title = "分享我的二维码",
+                    subtitle = "让其他设备扫码连接",
                     icon = Icons.Outlined.QrCode,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.TOP,
@@ -309,8 +309,8 @@ fun MirrorSettingsScreen(navController: NavController) {
             }
             item(key = "qr_scan") {
                 SettingsItem(
-                    title = "Scan QR Code",
-                    subtitle = "Scan another device's QR to connect",
+                    title = "扫描二维码",
+                    subtitle = "扫描其他设备的二维码进行连接",
                     icon = Icons.Outlined.QrCodeScanner,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.BOTTOM,
@@ -320,12 +320,12 @@ fun MirrorSettingsScreen(navController: NavController) {
 
             // ── Local Network ────────────────────────────────────────
             item(key = "network_section") {
-                SectionLabel("Local Network")
+                SectionLabel("局域网")
             }
             item(key = "broadcast") {
                 SettingsSwitchItem(
-                    title = "Broadcast on Network",
-                    subtitle = "Let nearby devices discover this device",
+                    title = "网络广播",
+                    subtitle = "让附近设备发现此设备",
                     icon = Icons.Filled.CellTower,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     checked = isBroadcasting,
@@ -381,12 +381,12 @@ fun MirrorSettingsScreen(navController: NavController) {
 
             // ── Relay ────────────────────────────────────────────────
             item(key = "relay_section") {
-                SectionLabel("Relay")
+                SectionLabel("中继")
             }
             item(key = "turn") {
                 SettingsItem(
                     title = stringResource(R.string.turnserver),
-                    subtitle = "TURN relay for remote connections",
+                    subtitle = "用于远程连接的 TURN 中继",
                     icon = Icons.Filled.Cloud,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     showArrow = true,
@@ -713,7 +713,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
             )
 
             // Connection Type
-            SectionLabel("Connection Type", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
+            SectionLabel("连接类型", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
             ConnectedButtonGroup(
                 options = ConnectionType.entries.toList(),
                 selectedOption = connectionType,
@@ -722,14 +722,14 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
                     when (option) {
                         ConnectionType.LOCAL -> "Local"
                         ConnectionType.ICE -> "ICE"
-                        ConnectionType.DIRECT -> "Direct IP"
+                        ConnectionType.DIRECT -> "直接 IP"
                     }
                 },
                 label = { option ->
                     Text(when (option) {
                         ConnectionType.LOCAL -> "Local"
                         ConnectionType.ICE -> "ICE"
-                        ConnectionType.DIRECT -> "Direct IP"
+                        ConnectionType.DIRECT -> "直接 IP"
                     })
                 },
                 itemHeight = 40.dp,
@@ -741,20 +741,20 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
 
             // Type hint
             val typeHint = when (connectionType) {
-                ConnectionType.LOCAL -> "Same Wi-Fi. IP auto-detected."
-                ConnectionType.ICE -> "Across networks via STUN/TURN."
-                ConnectionType.DIRECT -> "Specific IP/hostname."
+                ConnectionType.LOCAL -> "同一 Wi-Fi，IP 自动检测"
+                ConnectionType.ICE -> "跨网络通过 STUN/TURN"
+                ConnectionType.DIRECT -> "指定 IP/主机名"
             }
             Text(typeHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
 
             // Fields per connection type
-            SectionLabel("Details", modifier = Modifier.padding(horizontal = 24.dp))
+            SectionLabel("详情", modifier = Modifier.padding(horizontal = 24.dp))
             Column(modifier = Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 when (connectionType) {
                     ConnectionType.LOCAL -> {
                         SettingsSwitchItem(
-                            title = "Auto-detect IP",
-                            subtitle = "Use local network discovery for this connection",
+                            title = "自动检测 IP",
+                            subtitle = "此连接使用局域网发现",
                             checked = autoDetect,
                             onCheckedChange = { autoDetect = it },
                             icon = Icons.Filled.Wifi,
@@ -764,8 +764,8 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
                         if (!autoDetect) {
                             OutlinedTextField(
                                 value = hostname, onValueChange = { hostname = it },
-                                label = { Text("IP Address") },
-                                supportingText = { Text("Manual local IP for this device") },
+                                label = { Text("IP 地址") },
+                                supportingText = { Text("此设备的手动本地 IP") },
                                 modifier = Modifier.fillMaxWidth(), singleLine = true
                             )
                         }
@@ -773,7 +773,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
                     ConnectionType.ICE -> {
                         OutlinedTextField(
                             value = iceLabel, onValueChange = { iceLabel = it },
-                            label = { Text("ICE Label") },
+                            label = { Text("ICE 标签") },
                             supportingText = { Text("Email or identifier — must match on both devices") },
                             modifier = Modifier.fillMaxWidth(), singleLine = true
                         )
@@ -781,7 +781,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
                     ConnectionType.DIRECT -> {
                         OutlinedTextField(
                             value = hostname, onValueChange = { hostname = it },
-                            label = { Text("Hostname / IP Address") },
+                            label = { Text("主机名 / IP 地址") },
                             supportingText = { Text("e.g. 192.168.1.100 or myserver.com") },
                             modifier = Modifier.fillMaxWidth(), singleLine = true
                         )
@@ -797,7 +797,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
             }
 
             // Connection label
-            SectionLabel("Label", modifier = Modifier.padding(horizontal = 24.dp))
+            SectionLabel("标签", modifier = Modifier.padding(horizontal = 24.dp))
             OutlinedTextField(
                 value = connectionLabel, onValueChange = { connectionLabel = it },
                 label = { Text("Connection Label (optional)") },
@@ -807,7 +807,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
 
             // Connection Direction (visible for Local and Direct only)
             if (connectionType != ConnectionType.ICE) {
-                SectionLabel("Direction", modifier = Modifier.padding(horizontal = 24.dp))
+                SectionLabel("方向", modifier = Modifier.padding(horizontal = 24.dp))
                 ConnectedButtonGroup(
                     options = ConnectionDirection.entries.toList(),
                     selectedOption = direction,
@@ -841,16 +841,16 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
             }
 
             // Role
-            SectionLabel("Role", modifier = Modifier.padding(horizontal = 24.dp))
+            SectionLabel("角色", modifier = Modifier.padding(horizontal = 24.dp))
             Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.padding(horizontal = 24.dp)) {
                 SettingsSwitchItem(
-                    title = "Receive Data", subtitle = "This device receives glucose data",
+                    title = "接收数据", subtitle = "此设备接收血糖数据",
                     checked = isReceiving, onCheckedChange = { isReceiving = it },
                     icon = Icons.Filled.Download, iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.TOP
                 )
                 SettingsSwitchItem(
-                    title = "Send Data", subtitle = "This device sends glucose data",
+                    title = "发送数据", subtitle = "此设备发送血糖数据",
                     checked = isSending, onCheckedChange = { isSending = it },
                     icon = Icons.Filled.Upload, iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.BOTTOM
@@ -858,7 +858,7 @@ fun MirrorEditSheet(pos: Int, sheetState: SheetState, onDismiss: () -> Unit) {
             }
 
             // Password
-            SectionLabel("Security", modifier = Modifier.padding(horizontal = 24.dp))
+            SectionLabel("安全", modifier = Modifier.padding(horizontal = 24.dp))
             OutlinedTextField(
                 value = password, onValueChange = { password = it },
                 label = { Text(stringResource(R.string.password)) },
