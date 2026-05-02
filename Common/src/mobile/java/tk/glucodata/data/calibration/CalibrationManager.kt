@@ -20,7 +20,7 @@ import kotlin.math.abs
 import kotlin.math.pow
 
 object CalibrationManager {
-    private const val TAG = "CalibrationManager"
+    private const val TAG = "校准管理器"
     private const val PREFS_NAME = "calibration_prefs"
     private const val KEY_ENABLED_RAW = "calibration_enabled_raw"
     private const val KEY_ENABLED_AUTO = "calibration_enabled_auto"
@@ -47,22 +47,22 @@ object CalibrationManager {
         XDRIP_MEDIAN_SLOPE(
             storageValue = "xdrip_median_slope",
             title = "xDrip Median Slope",
-            description = "Median pair-slope fit (Theil-Sen style), robust to outliers"
+            description = "中位数配对斜率拟合（Theil-Sen风格），抗异常值"
         ),
         TIME_WEIGHTED_ROBUST_REGRESSION(
             storageValue = "time_weighted_robust_regression",
             title = "Time-Weighted Robust Regression",
-            description = "Huber-style weighted regression with temporal decay"
+            description = "带时间衰减的Huber加权回归"
         ),
         ELASTIC_TIME_WEIGHTED_INTERPOLATION(
             storageValue = "elastic_time_weighted_interpolation",
-            title = "Elastic Time-Weighted Point Interpolation",
-            description = "Local anchor interpolation blended with global trend"
+            title = "弹性时间加权插值",
+            description = "局部锚点插值混合全局趋势"
         ),
         ADAPTIVE_ENSEMBLE(
             storageValue = "adaptive_ensemble",
-            title = "Adaptive Ensemble (Recommended)",
-            description = "Blends robust, elastic and median-slope predictions"
+            title = "自适应集成（推荐）",
+            description = "混合稳健、弹性和中位数斜率预测"
         );
 
         companion object {
@@ -253,7 +253,7 @@ object CalibrationManager {
             val list = runCatching {
                 runBlocking(Dispatchers.IO) { dao.getAllSync() }
             }.onFailure {
-                Log.w(TAG, "Failed to load calibrations for background access", it)
+                Log.w(TAG, "加载校准失败（后台访问）", it)
             }.getOrNull() ?: return false
             _calibrations.value = list
             calibrationStateLoaded = true
@@ -270,7 +270,7 @@ object CalibrationManager {
         synchronized(validPointsCache) {
             validPointsCache.clear()
         }
-        Log.d(TAG, "Calibration cache invalidated: $reason")
+        Log.d(TAG, "校准缓存已失效：$reason")
     }
 
     fun getRevision(): Long = calibrationRevision
@@ -296,7 +296,7 @@ object CalibrationManager {
         val normalized = normalizeSensorId(sensorId)
         if (normalized.isBlank()) return
         runCatching { Natives.requestMirrorCalibrationSync(normalized) }
-            .onFailure { Log.w(TAG, "Failed requesting mirror calibration sync for $normalized", it) }
+            .onFailure { Log.w(TAG, "请求镜像校准同步失败：$normalized", it) }
     }
 
     private fun requestMirrorCalibrationSyncForSensors(sensorIds: Iterable<String?>) {
@@ -380,7 +380,7 @@ object CalibrationManager {
         invalidateComputationCache("setEnabledForMode(${if (isRawMode) "raw" else "auto"})")
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Calibration enabled for ${if (isRawMode) "Raw" else "Auto"}: $enabled")
+        Log.i(TAG, "校准已启用（${if (isRawMode) "Raw" else "Auto"}: $enabled")
     }
     
     fun isEnabledForMode(isRawMode: Boolean): Boolean {
@@ -396,7 +396,7 @@ object CalibrationManager {
         }
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Hide initial when calibrated: $enabled")
+        Log.i(TAG, "校准后隐藏初始值：$enabled")
     }
 
     fun shouldHideInitialWhenCalibrated(): Boolean {
@@ -414,7 +414,7 @@ object CalibrationManager {
         invalidateComputationCache("setApplyToPast")
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Apply calibration to past: $enabled")
+        Log.i(TAG, "将校准应用于过去：$enabled")
     }
 
     fun shouldApplyToPast(): Boolean {
@@ -431,7 +431,7 @@ object CalibrationManager {
         invalidateComputationCache("setLockPastHistory")
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Lock past history calibration rewrite: $enabled")
+        Log.i(TAG, "锁定历史校准重写：$enabled")
     }
 
     fun shouldLockPastHistory(): Boolean {
@@ -447,7 +447,7 @@ object CalibrationManager {
         }
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Overwrite sensor values in history DB: $enabled")
+        Log.i(TAG, "覆盖历史数据库中的传感器值：$enabled")
     }
 
     fun shouldOverwriteSensorValues(): Boolean {
@@ -489,7 +489,7 @@ object CalibrationManager {
         refreshDiagnosticsPreview(isRawMode = isRawMode, force = true)
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Calibration algorithm for ${if (isRawMode) "Raw" else "Auto"}: ${algorithm.title}")
+        Log.i(TAG, "校准算法（${if (isRawMode) "Raw" else "Auto"}: ${algorithm.title}")
     }
 
     fun getAlgorithmForMode(isRawMode: Boolean): CalibrationAlgorithm {
@@ -557,7 +557,7 @@ object CalibrationManager {
                 imported = 0,
                 skipped = 0,
                 replaced = 0,
-                message = "No target sensor found in profile"
+                message = "配置文件中未找到目标传感器"
             )
         }
 
@@ -648,7 +648,7 @@ object CalibrationManager {
             imported = deduped.size,
             skipped = skipped,
             replaced = replaced,
-            message = "Imported ${deduped.size} calibration(s) for $targetSensorId"
+            message = "已导入${deduped.size}个校准（目标传感器$targetSensorId）"
         )
     }
     
@@ -675,7 +675,7 @@ object CalibrationManager {
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = isRawMode, force = true)
         requestMirrorCalibrationSync(entity.sensorId)
-        Log.i(TAG, "Added calibration: auto=$sensorValue raw=$sensorValueRaw user=$userValue isRaw=$isRawMode at $timestamp")
+        Log.i(TAG, "已添加校准：自动=$sensorValue 原始=$sensorValueRaw 用户=$userValue 原始模式=$isRawMode 时间=$timestamp")
     }
 
     suspend fun restoreCalibration(entity: CalibrationEntity) {
@@ -691,7 +691,7 @@ object CalibrationManager {
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = entity.isRawMode, force = true)
         requestMirrorCalibrationSync(entity.sensorId)
-        Log.i(TAG, "Deleted calibration: id=${entity.id}")
+        Log.i(TAG, "已删除校准：id=${entity.id}")
     }
     
     suspend fun updateCalibration(entity: CalibrationEntity) {
@@ -708,7 +708,7 @@ object CalibrationManager {
         refreshDiagnosticsPreview(isRawMode = true, force = true)
         refreshDiagnosticsPreview(isRawMode = false, force = true)
         requestMirrorCalibrationSyncForSensors(affectedSensors)
-        Log.i(TAG, "Cleared all calibrations")
+        Log.i(TAG, "已清除所有校准")
     }
 
     suspend fun restoreAll(calibrations: List<CalibrationEntity>) {
@@ -1049,7 +1049,7 @@ object CalibrationManager {
                 diagnostics = CalibrationDiagnostics(
                     algorithm = algorithm,
                     pointCount = points.size,
-                    note = "Calibration disabled"
+                    note = "校准已禁用"
                 ),
                 force = force
             )
@@ -1062,7 +1062,7 @@ object CalibrationManager {
                 diagnostics = CalibrationDiagnostics(
                     algorithm = algorithm,
                     pointCount = 0,
-                    note = "Add calibration points to see diagnostics"
+                    note = "添加校准点以查看诊断"
                 ),
                 force = force
             )
@@ -1216,7 +1216,7 @@ object CalibrationManager {
                 offset = blended - targetValue,
                 anchorInfluence = snap,
                 confidence = confidence,
-                note = "Recency-weighted OLS with local anchor snap"
+                note = "近期加权OLS与局部锚点吸附"
             )
         }
 
@@ -1257,7 +1257,7 @@ object CalibrationManager {
                 offset = prediction - targetValue,
                 anchorInfluence = 0.0,
                 confidence = 0.35,
-                note = "Median slope fallback to weighted offset"
+                note = "中位数斜率回退到加权偏移"
             )
         }
 
@@ -1285,7 +1285,7 @@ object CalibrationManager {
                 offset = fallback - targetValue,
                 anchorInfluence = 0.0,
                 confidence = 0.40,
-                note = "Median slope invalid, using weighted offset"
+                note = "中位数斜率无效，使用加权偏移"
             )
         }
     }
@@ -1342,7 +1342,7 @@ object CalibrationManager {
                 offset = prediction - targetValue,
                 anchorInfluence = 0.0,
                 confidence = confidence,
-                note = "Huber-style robust regression"
+                note = "Huber式稳健回归"
             )
         } else {
             AlgorithmComputation(
@@ -1469,7 +1469,7 @@ object CalibrationManager {
             offset = blended - targetValue,
             anchorInfluence = snapApplied,
             confidence = harmony,
-            note = "Adaptive ensemble blend of sane/xDrip/robust/elastic"
+            note = "自适应混合 sane/xDrip/robust/elastic"
         )
     }
     
