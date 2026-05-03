@@ -12,14 +12,13 @@ import kotlinx.coroutines.CoroutineScope
 import tk.glucodata.Applic
 import tk.glucodata.BatteryTrace
 import tk.glucodata.Natives
-import tk.glucodata.SensorBluetooth
 import tk.glucodata.SensorIdentity
 import tk.glucodata.UiRefreshBus
 import tk.glucodata.data.calibration.CalibrationManager
-import tk.glucodata.drivers.ManagedSensorIdentityRegistry
 import tk.glucodata.ui.GlucosePoint
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.HashMap
 import java.util.LinkedHashSet
 import java.util.Locale
 import java.util.concurrent.locks.ReentrantLock
@@ -42,17 +41,37 @@ class HistoryRepository(context: Context = Applic.app) {
             .ifEmpty {
                 sensorSerial?.trim()?.takeIf { it.isNotEmpty() }?.let(::listOf) ?: emptyList()
             }
+
+    private fun resolveDisplayQuerySensorSerials(sensorSerial: String?): List<String> {
+        val resolved = LinkedHashSet<String>()
+        resolveQuerySensorSerials(sensorSerial).forEach(resolved::add)
+        IMPORTED_HISTORY_SENSOR_SERIALS.forEach(resolved::add)
+        return resolved.toList()
+    }
     
     companion object {
         private const val TAG = "HistoryRepo"
         private const val SENSOR_MINUTE_BUCKET_MS = 60_000L
+        private const val NATIVE_BACKFILL_OVERLAP_MS = 6L * 60L * 60L * 1000L
+        private const val HISTORY_COVERAGE_TOLERANCE_MS = 5L * 60L * 1000L
+        private const val BACKFILL_RETRY_COOLDOWN_MS = 2L * 60L * 1000L
+        private const val NATIVE_BACKFILL_INSERT_CHUNK = 1_000
         private const val DELETED_TIMESTAMP_QUERY_CHUNK = 900
+        const val IMPORTED_SENSOR_SERIAL = "__imported_csv__"
+        private val IMPORTED_HISTORY_SENSOR_SERIALS = listOf(
+            IMPORTED_SENSOR_SERIAL,
+            "imported",
+            "unknown"
+        )
         private val TIME_FORMATTER = object : ThreadLocal<SimpleDateFormat>() {
             override fun initialValue(): SimpleDateFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
         }
         private val backfillLock = ReentrantLock()
-        private val backfilledSensors = LinkedHashSet<String>()
-        private val backfillInProgressSensors = LinkedHashSet<String>()
+        private val backfillFinished = backfillLock.newCondition()
+        private val backfilledSensorStartMs = HashMap<String, Long>()
+        private val backfillInProgressStartMs = HashMap<String, Long>()
+        private val backfillAttemptStartMs = HashMap<String, Long>()
+        private val backfillAttemptWallMs = HashMap<String, Long>()
         
         /**
          * Reset per-sensor backfill tracking so [ensureBackfilled] re-checks native
@@ -62,8 +81,11 @@ class HistoryRepository(context: Context = Applic.app) {
         @JvmStatic
         fun resetBackfillFlag() {
             backfillLock.withLock {
-                backfilledSensors.clear()
-                backfillInProgressSensors.clear()
+                backfilledSensorStartMs.clear()
+                backfillInProgressStartMs.clear()
+                backfillAttemptStartMs.clear()
+                backfillAttemptWallMs.clear()
+                backfillFinished.signalAll()
             }
             Log.d(TAG, "backfill sensor tracking reset — ensureBackfilled() will re-run")
         }
@@ -150,7 +172,7 @@ class HistoryRepository(context: Context = Applic.app) {
                 val serial = SensorIdentity.resolveMainSensor() ?: ""
                 val repo = HistoryRepository()
                 val uiPoints = if (serial.isNotEmpty()) {
-                    repo.getHistoryForSensor(serial, startTime)
+                    repo.getHistoryForDisplaySensor(serial, startTime)
                 } else {
                     Log.w(TAG, "getHistoryForNotification: no main sensor serial, returning empty list")
                     emptyList()
@@ -181,7 +203,7 @@ class HistoryRepository(context: Context = Applic.app) {
                     Log.w(TAG, "getHistoryForNotificationForSensor: no sensor serial, returning empty list")
                     return@runBlocking emptyList()
                 }
-                val raw = HistoryRepository().getHistoryForSensor(serial, startTime)
+                val raw = HistoryRepository().getHistoryForDisplaySensor(serial, startTime)
                 raw.map { p ->
                     val v = if (isMmol) p.value / 18.0182f else p.value
                     val r = if (isMmol) p.rawValue / 18.0182f else p.rawValue
@@ -200,7 +222,7 @@ class HistoryRepository(context: Context = Applic.app) {
                 val serial = SensorIdentity.resolveMainSensor() ?: ""
                 val repo = HistoryRepository()
                 val uiPoints = if (serial.isNotEmpty()) {
-                    repo.getHistoryForSensor(serial, startTime)
+                    repo.getHistoryForDisplaySensor(serial, startTime)
                 } else {
                     Log.w(TAG, "getHistoryRawForNotification: no main sensor serial, returning empty list")
                     emptyList()
@@ -523,6 +545,24 @@ class HistoryRepository(context: Context = Applic.app) {
     }
 
     /**
+     * Display/history UI query for one live sensor plus CSV imports. Imported
+     * readings are intentionally kept out of sync/latest cursors so native
+     * backfill and current-glucose code cannot mistake them for sensor data.
+     */
+    fun getHistoryFlowForDisplaySensor(
+        serial: String,
+        startTime: Long = 0L
+    ): kotlinx.coroutines.flow.Flow<List<GlucosePoint>> {
+        val serials = resolveDisplayQuerySensorSerials(serial)
+        if (serials.isEmpty()) {
+            return kotlinx.coroutines.flow.flowOf(emptyList())
+        }
+        return dao.getHistoryFlowForSensors(serials, startTime).map { readings ->
+            mapReadings(mergeQueryReadings(readings, serial))
+        }.flowOn(Dispatchers.IO)
+    }
+
+    /**
      * Stats-only flow optimized for large datasets:
      * - No per-point time formatting
      * - No extra sorting/distinct pass (DAO already returns ASC by timestamp)
@@ -546,6 +586,21 @@ class HistoryRepository(context: Context = Applic.app) {
                     sensorSerial = reading.sensorSerial
                 )
             }
+        }.flowOn(Dispatchers.IO)
+    }
+
+    /**
+     * Stats should cover the persisted historical timeline, including imported
+     * CSV data and previous sensors. This uses all Room history and only applies
+     * merge preference to overlapping timestamps, so imported/old sensor data is
+     * visible without changing live sensor or native sync behavior.
+     */
+    fun getDisplayHistoryFlowForStats(
+        preferredSerial: String?,
+        startTime: Long
+    ): kotlinx.coroutines.flow.Flow<List<GlucosePoint>> {
+        return dao.getHistoryFlow(startTime).map { readings ->
+            mergeQueryReadings(readings, preferredSerial).map(::mapReadingForStats)
         }.flowOn(Dispatchers.IO)
     }
 
@@ -583,6 +638,32 @@ class HistoryRepository(context: Context = Applic.app) {
                 mapReadings(mergeQueryReadings(readings, serial))
             } catch (e: Exception) {
                 Log.e(TAG, "Error getting history for sensor $serial", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun getHistoryForDisplaySensor(serial: String, startTime: Long): List<GlucosePoint> {
+        val serials = resolveDisplayQuerySensorSerials(serial)
+        if (serials.isEmpty()) return emptyList()
+        return withContext(Dispatchers.IO) {
+            try {
+                val readings = dao.getReadingsSinceForSensors(serials, startTime)
+                mapReadings(mergeQueryReadings(readings, serial))
+            } catch (e: Exception) {
+                Log.e(TAG, "Error getting display history for sensor $serial", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun getDisplayHistoryForStats(preferredSerial: String?, startTime: Long): List<GlucosePoint> {
+        return withContext(Dispatchers.IO) {
+            try {
+                val readings = dao.getReadingsSince(startTime)
+                mergeQueryReadings(readings, preferredSerial).map(::mapReadingForStats)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error getting stats display history", e)
                 emptyList()
             }
         }
@@ -630,6 +711,17 @@ class HistoryRepository(context: Context = Applic.app) {
                 dao.getOldestTimestampForSensors(serials) ?: 0L
             } catch (e: Exception) {
                 Log.e(TAG, "Error getting oldest timestamp for sensor $serial", e)
+                0L
+            }
+        }
+    }
+
+    suspend fun getOldestDisplayTimestamp(): Long {
+        return withContext(Dispatchers.IO) {
+            try {
+                dao.getOldestTimestamp() ?: 0L
+            } catch (e: Exception) {
+                Log.e(TAG, "Error getting oldest display timestamp", e)
                 0L
             }
         }
@@ -782,6 +874,17 @@ class HistoryRepository(context: Context = Applic.app) {
         }
     }
 
+    private fun mapReadingForStats(reading: HistoryReading): GlucosePoint {
+        return GlucosePoint(
+            value = reading.value,
+            time = "",
+            timestamp = reading.timestamp,
+            rawValue = reading.rawValue,
+            rate = reading.rate,
+            sensorSerial = reading.sensorSerial
+        )
+    }
+
     private fun mapDisplayReadings(
         readings: List<HistoryReading>,
         preferredSerial: String?
@@ -803,46 +906,70 @@ class HistoryRepository(context: Context = Applic.app) {
      * Backfill native history for any sensor that the current UI/session needs and
      * has not yet been merged into Room during this process lifetime.
      */
-    suspend fun ensureBackfilled(preferredSerial: String? = null) {
-        val runtimeSensors = LinkedHashSet<String>()
-        SensorBluetooth.mygatts().forEach { callback ->
-            callback.SerialNumber
-                ?.takeIf { it.isNotBlank() }
-                ?.let(runtimeSensors::add)
+    suspend fun ensureBackfilled(preferredSerial: String? = null, startTime: Long = 0L) {
+        val preferred = (SensorIdentity.resolveAppSensorId(preferredSerial) ?: preferredSerial)
+            ?.takeIf { it.isNotBlank() }
+        val sensorsToCheck = if (preferred != null) {
+            linkedSetOf(preferred)
+        } else {
+            linkedSetOfSensors(
+                Natives.activeSensors(),
+                Natives.lastsensorname()
+            )
+        }.filter { sensor ->
+            sensor != IMPORTED_SENSOR_SERIAL && SensorIdentity.shouldUseNativeHistorySync(sensor)
         }
-        ManagedSensorIdentityRegistry.persistedSensorIds(Applic.app).forEach { serial ->
-            serial.takeIf { it.isNotBlank() }?.let(runtimeSensors::add)
-        }
-        val sensorsToCheck = linkedSetOfSensors(
-            runtimeSensors.toTypedArray(),
-            Natives.lastsensorname(),
-            preferredSerial
-        ).filter(SensorIdentity::shouldUseNativeHistorySync)
         if (sensorsToCheck.isEmpty()) {
             Log.d(TAG, "No sensors for backfill")
             return
         }
 
         withContext(Dispatchers.IO) {
-            val sensorsToBackfill = backfillLock.withLock {
-                sensorsToCheck.filterNot {
-                    backfilledSensors.contains(it) || backfillInProgressSensors.contains(it)
-                }.also { pending ->
-                    backfillInProgressSensors.addAll(pending)
-                }
-            }
-            if (sensorsToBackfill.isEmpty()) {
-                return@withContext
-            }
-
-            Log.d(TAG, "Merging native history into Room for sensors=$sensorsToBackfill")
-            for (serial in sensorsToBackfill) {
-                val success = backfillSensor(serial)
-                backfillLock.withLock {
-                    backfillInProgressSensors.remove(serial)
-                    if (success) {
-                        backfilledSensors.add(serial)
+            val requestedStart = startTime.coerceAtLeast(0L)
+            Log.d(TAG, "Merging native history into Room for sensors=$sensorsToCheck start=$requestedStart")
+            for (serial in sensorsToCheck) {
+                var shouldBackfill = false
+                while (!shouldBackfill) {
+                    var alreadyCovered = false
+                    backfillLock.withLock {
+                        val coveredStart = backfilledSensorStartMs[serial]
+                        val lastAttemptStart = backfillAttemptStartMs[serial]
+                        val lastAttemptWall = backfillAttemptWallMs[serial] ?: 0L
+                        val recentAttemptCovers = lastAttemptStart != null &&
+                            lastAttemptStart <= requestedStart &&
+                            (System.currentTimeMillis() - lastAttemptWall) < BACKFILL_RETRY_COOLDOWN_MS
+                        if (coveredStart != null && coveredStart <= requestedStart) {
+                            alreadyCovered = true
+                        } else if (recentAttemptCovers) {
+                            alreadyCovered = true
+                        } else if (!backfillInProgressStartMs.containsKey(serial)) {
+                            backfillInProgressStartMs[serial] = requestedStart
+                            backfillAttemptStartMs[serial] = requestedStart
+                            backfillAttemptWallMs[serial] = System.currentTimeMillis()
+                            shouldBackfill = true
+                        } else {
+                            backfillFinished.awaitUninterruptibly()
+                        }
                     }
+                    if (alreadyCovered) {
+                        break
+                    }
+                }
+                if (!shouldBackfill) {
+                    continue
+                }
+                val success = backfillSensor(serial, startTime)
+                backfillLock.withLock {
+                    backfillInProgressStartMs.remove(serial)
+                    if (success) {
+                        val previousStart = backfilledSensorStartMs[serial]
+                        backfilledSensorStartMs[serial] = if (previousStart == null) {
+                            requestedStart
+                        } else {
+                            minOf(previousStart, requestedStart)
+                        }
+                    }
+                    backfillFinished.signalAll()
                 }
             }
         }
@@ -851,16 +978,18 @@ class HistoryRepository(context: Context = Applic.app) {
     /**
      * Backfill a single sensor's data from the native layer.
      */
-    private suspend fun backfillSensor(serial: String): Boolean {
+    private suspend fun backfillSensor(serial: String, requestedStartTimeMs: Long): Boolean {
         try {
-            val rawHistory = loadNativeHistory(serial, 0L)
+            val roomSerial = SensorIdentity.resolveRoomStorageSensorId(serial) ?: serial
+            val startSec = resolveNativeBackfillStartSec(serial, requestedStartTimeMs)
+            val rawHistory = loadNativeHistory(serial, startSec)
             if (rawHistory == null) {
-                Log.d(TAG, "Native history for $serial returned null")
+                Log.d(TAG, "Native history for $serial returned null from start=$startSec")
                 return false
             }
 
-            val roomSerial = SensorIdentity.resolveRoomStorageSensorId(serial) ?: serial
-            val readings = mutableListOf<HistoryReading>()
+            val readings = ArrayList<HistoryReading>(NATIVE_BACKFILL_INSERT_CHUNK)
+            var storedCount = 0
             for (i in rawHistory.indices step 3) {
                 if (i + 2 >= rawHistory.size) break
 
@@ -869,6 +998,7 @@ class HistoryRepository(context: Context = Applic.app) {
                 val valueRawRaw = rawHistory[i + 2]
 
                 // Values from native are in mg/dL * 10
+                if (timeSec < startSec) continue
                 val value = valueAutoRaw / 10f
                 val rawValue = valueRawRaw / 10f
 
@@ -880,17 +1010,19 @@ class HistoryRepository(context: Context = Applic.app) {
                         rawValue = rawValue,
                         rate = 0f  // Rate not available from history
                     ))
+                    if (readings.size >= NATIVE_BACKFILL_INSERT_CHUNK) {
+                        storedCount += insertBackfillChunk(serial, readings)
+                        readings.clear()
+                    }
                 }
             }
 
             if (readings.isNotEmpty()) {
-                val filteredReadings = filterDeletedReadings(readings)
-                if (filteredReadings.isNotEmpty()) {
-                    dao.insertAll(filteredReadings)
-                    Log.d(TAG, "Backfilled ${filteredReadings.size} readings from native for sensor $serial")
-                } else {
-                    Log.d(TAG, "Backfill for $serial skipped — all readings were tombstoned")
-                }
+                storedCount += insertBackfillChunk(serial, readings)
+                readings.clear()
+            }
+            if (storedCount > 0) {
+                Log.d(TAG, "Backfilled $storedCount readings from native for sensor $serial start=$startSec")
             } else {
                 Log.d(TAG, "Backfill for $serial completed with 0 readings")
             }
@@ -899,6 +1031,26 @@ class HistoryRepository(context: Context = Applic.app) {
             Log.e(TAG, "Error backfilling sensor $serial", e)
             return false
         }
+    }
+
+    private suspend fun insertBackfillChunk(serial: String, readings: List<HistoryReading>): Int {
+        if (readings.isEmpty()) return 0
+        val filteredReadings = filterDeletedReadings(readings)
+        if (filteredReadings.isEmpty()) return 0
+        dao.insertAll(filteredReadings)
+        return filteredReadings.size
+    }
+
+    private suspend fun resolveNativeBackfillStartSec(serial: String, requestedStartTimeMs: Long): Long {
+        val requestedStart = requestedStartTimeMs.coerceAtLeast(0L)
+        val oldest = getOldestTimestampForSensor(serial)
+        val latest = getLatestTimestampForSensor(serial)
+        val startMs = when {
+            latest <= 0L -> requestedStart
+            requestedStart > 0L && (oldest <= 0L || oldest > requestedStart + HISTORY_COVERAGE_TOLERANCE_MS) -> requestedStart
+            else -> (latest - NATIVE_BACKFILL_OVERLAP_MS).coerceAtLeast(0L)
+        }
+        return startMs / 1000L
     }
 
     private fun loadNativeHistory(serial: String, startSec: Long): LongArray? {
