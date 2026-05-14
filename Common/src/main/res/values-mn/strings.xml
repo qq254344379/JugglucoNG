@@ -1,384 +1,369 @@
 <resources>
-    <string name="language">en</string>
-    <string name="languagename">Language</string>
+    <string name="language">mn</string>
+    <string name="languagename">Монгол хэл</string>
     <string name="app_name">JugglucoNG</string>
-
     <string name="ok">OK</string>
-    <string name="cancel">Cancel</string>
-
-    <string name="garmin_initialization_error">"Init Garmin connect SDK failed: "</string>
-
-    <string name="error_nfc_device_not_supported">Scanning impossible, no NFC on this device</string>
-    <string name="error_nfc_disabled">NFC is disabled, you can enable it in device settings.</string>
-
-   <string name="kerfstok_missing_title">Kerfstok is not installed on watch</string>
-    <string name="kerfstok_missing_message">Kerfstok is not installed on watch. In Garmin Connect IQ store you can get it</string>
-
-    <string name="alarm_description">Too low or too high glucose</string>
-    <string name="loss_description">Juggluco has lost contact with sensor</string>
-    <string name="numalarm_description">Reminder to dose, eat or exercise</string>
-    <string name="notification_description">Notifies current glucose value</string>
-    <string name="ongoing_description">Ongoing program</string>
-    <string name="scan_permission">Permission</string>
-    <string name="scanname">Scan</string>
-    <string name="scansname">Scans</string>
-    <string name="historyname">History</string>
-    <string name="streamname">Stream</string>
-    <string name="resetname">Reset</string>
-    <string name="helpname">Help</string>
-    <string name="searchtopast">Search to past</string>
-    <string name="nobluetooth">No bluetooth</string>
-    <string name="bluetoothenabled">Bluetooth Enabled</string>
-    <string name="bluetoothdisabled">Bluetooth Disabled</string>
-    <string name="amountsname">Amounts</string>
+    <string name="cancel">Цуцлах</string>
+    <string name="garmin_initialization_error">"Garmin Connect SDK эхлүүлэхэд алдаа гарлаа: "</string>
+    <string name="error_nfc_device_not_supported">Скан хийх боломжгүй. Энэ төхөөрөмж NFC дэмждэггүй.</string>
+    <string name="error_nfc_disabled">NFC унтраалттай байна. Төхөөрөмжийн тохиргооноос асаана уу.</string>
+    <string name="kerfstok_missing_title">Kerfstok цаг дээр суулгагдаагүй байна</string>
+    <string name="kerfstok_missing_message">Kerfstok цаг дээр суулгагдаагүй байна. Garmin Connect IQ дэлгүүрээс суулгаж болно.</string>
+    <string name="alarm_description">Глюкоз хэт бага эсвэл хэт өндөр байна</string>
+    <string name="loss_description">Juggluco мэдрэгчтэй холболтоо алдсан байна</string>
+    <string name="numalarm_description">Тун хийх, хооллох эсвэл дасгал хийх сануулга</string>
+    <string name="notification_description">Одоогийн глюкозын утгыг мэдэгдэнэ</string>
+    <string name="ongoing_description">Ажиллаж байгаа програм</string>
+    <string name="scan_permission">Зөвшөөрөл</string>
+    <string name="scanname">Скан хийх</string>
+    <string name="scansname">Сканууд</string>
+    <string name="historyname">Түүх</string>
+    <string name="streamname">Дамжуулалт</string>
+    <string name="resetname">Дахин тохируулах</string>
+    <string name="helpname">Тусламж</string>
+    <string name="searchtopast">Өмнөх үе рүү хайх</string>
+    <string name="nobluetooth">Bluetooth байхгүй</string>
+    <string name="bluetoothenabled">Bluetooth асаалттай</string>
+    <string name="bluetoothdisabled">Bluetooth унтраалттай</string>
+    <string name="amountsname">Хэмжээ</string>
     <string name="amountshort">@string/amountsname</string>
-    <string name="mealsname">Meals</string>
-    <string name="closename">Close</string>
-    <string name="exporthelp">Saves up to the last value displayed on the screen. The beginning is the number of specified days back in time.</string>
-    <string name="detect">Detect</string>
-    <string name="testip">Test IP</string>
-    <string name="testlabel">Test Label</string>
-    <string name="passiveonly">Passive only</string>
-    <string name="activeonly">Active only</string>
-    <string name="both">Both</string>
-    <string name="receivefrom">Receive from</string>
-    <string name="datapresentuntil">"Data present on receiver until: "</string>
-    <string name="visible">Visible</string>
-    <string name="password">Password</string>
-    <string name="delete">Delete</string>
-    <string name="specifyreceiveordata">Specify \'Receive from\' or data to send to other device</string>
-    <string name="specifyip">You should specify an IP</string>
-    <string name="portrange">Network ports should be between 1024 and 65535</string>
-    <string name="start">Start</string>
-    <string name="now">Now</string>
-    <string name="dontchangeamounts">Mirror sends amounts</string>
-    <string name="thishost">This host:</string>
-    <string name="dozemode">Doze mode?</string>
-    <string name="sync">Sync</string>
-    <string name="alarms">Alarms</string>
-    <string name="save">Save</string>
- <string name="addconnectionbutton">Add Connection</string>
- <string name="offtouch">Off Touch</string>
- <string name="glucosestatusbar">Glucose notification</string>
- <string name="lowglucosealarm">Low glucose alarm</string>
- <string name="numlabel">"Label: "</string>
- <string name="roundto">"Round to: "</string>
- <string name="weight">"Weight: "</string>
- <string name="ringtonename">Ringtone</string>
- <string name="highglucosealarm">High glucose alarm</string>
- <string name="valueavailablenotification">Value available notification</string>
- <string name="lossofsignalalarm">Loss of signal alarm after</string>
- <string name="cantsetminutes">"Can't set minutes to "</string>
-  <string name="minutes">minutes</string>
- <string name="toolarg"> is too long</string>
- <string name="targetrange">"Target range: "</string>
- <string name="graphrange">"Chart range: "</string>
- <string name="unit">"Units"</string>
- <string name="glucoseaxisleft">Glucose-axis LEFT</string>
- <string name="startsapp">Scanning starts app</string>
- <string name="patchedlibrebroadcast">xDrip compatible</string>
- <string name="disablecamerakey">Disable camera key</string>
- <string name="invertscreen">Invert screen</string>
- <string name="nfcsound">NFC sound</string>
- <string name="manuallyscale">Manually scale </string>
- <string name="time">Time</string>
- <string name="glucose">Glucose</string>
- <string name="sensorviabluetooth">Sensor via bluetooth</string>
- <string name="sensorviabluetoothon">For Alarms in non-Mirror devices \'Sensor via bluetooth\' should be turned on</string>
- <string name="setunitfirst">Set unit first</string>
- <string name="numberlabels">Number Labels</string>
- <string name="colors">Colors</string>
- <string name="remindersname">Reminders</string>
- <string name="display">Display</string>
- <string name="shutcuts">Shortcuts</string>
- <string name="advanced">Advanced</string>
- <string name="newname">New</string>
- <string name="deletelast">Delete last</string>
- <string name="meal">Meal:</string>
- <string name="ringshort">Ring</string>
- <string name="days">Days</string>
- <string name="invaliddays">\' invalid. Days should be a natural number.</string>
- <string name="summarygraph">Summary graph</string>
- <string name="forget">Forget</string>
- <string name="reenable">Reenable</string>
- <string name="failure_info">Info</string>
- <string name="last_failure">Last failure</string>
- <string name="last_success">Last success</string>
- <string name="stage">Stage</string>
- <string name="use_bluetooth">Use Bluetooth</string>
- <string name="connection">Connection</string>
- <string name="unlock_key">Handshake</string>
- <string name="glucose_value">Glucose value</string>
- <string name="info">Info</string>
- <string name="devicespecific">Set device specific setting</string>
- <string name="dozeupdate">Update in doze mode</string>
- <string name="refresh">Refresh</string>
- <string name="sendqueue">Send queue</string>
- <string name="reinit">Reinit</string>
- <string name="watchappinstalled">Watch app installed on watch</string>
- <string name="error">Error</string>
- <string name="additem">Add Item</string>
- <string name="round">"Round "</string>
- <string name="repeat">Repeat</string>
- <string name="ingredient">Ingredient: </string>
- <string name="select">Select</string>
- <string name="carbohydrate">Carbohydrate: </string>
- <string name="carbo">Carbohydrate</string>
- <string name="total">Total: </string>
- <string name="mealtotal">Meal total: </string>
- <string name="quantity">Quantity</string>
- <string name="per">" per "</string>
- <string name="specifyingredient">You need to specify ingredient</string>
- <string name="specifyhowmuch">You need to specify how much</string>
- <string name="define">Define</string>
- <string name="edit">Edit</string>
- <string name="name">Name:</string>
- <string name="carbperunit">Carbohydrates/unit:</string>
- <string name="database">Database</string>
- <string name="search">Search</string>
- <string name="trace">Trace</string>
- <string name="unknown">Unknown</string>
- <string name="showzero">Show zero</string>
- <string name="compositionof100gram">Composition of 100 gram</string>
- <string name="status">Status</string>
- <string name="config">Config</string>
- <string name="initwatchapp">Init watch app</string>
- <string name="nowatchesfound">No watches found</string>
- <string name="getkerfstok">Get watch app Kerfstok</string>
- <string name="mealname">Meal</string>
- <string name="deletequestion">Delete?</string>
- <string name="soundname">Sound</string>
- <string name="play">Play</string>
- <string name="defaultname">Default</string>
- <string name="flash">Flash</string>
- <string name="permission">Permission</string>
- <string name="shortcut">Shortcut</string>
- <string name="value">Value</string>
- <string name="nextpage">Next page</string>
- <string name="ips">IPs:</string>
- <string name="port">Port</string>
- <string name="saved">"saved"</string>
- <string name="savefailed">Save failed</string>
- <string name="notsaved">Not saved</string>
- <string name="failedbyexception">Failed by exception</string>
- <string name="nodata">No data</string>
- <string name="addsensorenddate">Add sensor end date to calendar app</string>
- <string name="enddatesensor">"End date sensor "</string>
- <string name="open">Open</string>
- <string name="withoutsensor">Without sensor</string>
- <string name="wronglibrary">Library not functioning properly, try a different one</string>
- <string name="installedlibrary">Installed library</string>
- <string name="cantextract">Can\'t extract %s, try a different apk</string>
- <string name="connectwithsensor">Connecting</string>
- <string name="exchangedata">Runs to exchange data</string>
- <string name="nonewvalue">"No new value since "</string>
- <string name="status_no_new_value_for_duration">No new value for %1$s</string>
- <string name="status_no_new_value_since_time">No new value since %1$s</string>
- <string name="lowglucose">" Low Glucose!"</string>
- <string name="highglucose">" High Glucose!"</string>
- <string name="lowglucoseshort">@string/lowglucose</string>
- <string name="highglucoseshort">@string/highglucose</string>
- <string name="sendto">Send to</string>
- <string name="resenddata">Resend data</string>
- <string name="minimum">Minimum</string>
- <string name="minuteddeactivated">Minutes deactivated:</string>
- <string name="duractionsec">Duration (sec):</string>
- <string name="duraction">Duration:</string>
- <string name="sec">sec</string>
- <string name="notentered">" not entered"</string>
- <string name="spacedand">" and "</string>
-    <string name="disturb">Disturb</string>
-    <string name="uselibreview">Send to Libreview</string>
+    <string name="mealsname">Хоол</string>
+    <string name="closename">Хаах</string>
+    <string name="exporthelp">Дэлгэц дээр харагдаж буй сүүлийн утга хүртэл хадгална. Эхлэх хугацаа нь заасан хоногийн тоогоор өмнөх үеэс эхэлнэ.</string>
+    <string name="detect">Илрүүлэх</string>
+    <string name="testip">IP шалгах</string>
+    <string name="testlabel">Шошго шалгах</string>
+    <string name="passiveonly">Зөвхөн идэвхгүй</string>
+    <string name="activeonly">Зөвхөн идэвхтэй</string>
+    <string name="both">Хоёулаа</string>
+    <string name="receivefrom">Хүлээн авах эх үүсвэр</string>
+    <string name="datapresentuntil">"Хүлээн авагч дээрх өгөгдөл дараах хүртэл байна: "</string>
+    <string name="visible">Харагдах</string>
+    <string name="password">Нууц үг</string>
+    <string name="delete">Устгах</string>
+    <string name="specifyreceiveordata">Өөр төхөөрөмж рүү илгээх өгөгдлийг заана уу</string>
+    <string name="specifyip">IP хаяг заах шаардлагатай</string>
+    <string name="portrange">Сүлжээний порт 1024–65535 хооронд байх ёстой</string>
+    <string name="start">Эхлэх</string>
+    <string name="now">Одоо</string>
+    <string name="dontchangeamounts">Mirror хэмжээний мэдээллийг илгээнэ</string>
+    <string name="thishost">Энэ төхөөрөмж:</string>
+    <string name="dozemode">Doze горим уу?</string>
+    <string name="sync">Синк хийх</string>
+    <string name="alarms">Дохио</string>
+    <string name="save">Хадгалах</string>
+    <string name="addconnectionbutton">Холболт нэмэх</string>
+    <string name="offtouch">Дэлгэц хүрэхийг унтраах</string>
+    <string name="glucosestatusbar">Глюкозын мэдэгдэл</string>
+    <string name="lowglucosealarm">Глюкоз бага үеийн дохио</string>
+    <string name="numlabel">"Шошго: "</string>
+    <string name="roundto">"Бүхэлдэх: "</string>
+    <string name="weight">"Жин: "</string>
+    <string name="ringtonename">Дуудлагын ая</string>
+    <string name="highglucosealarm">Глюкоз өндөр үеийн дохио</string>
+    <string name="valueavailablenotification">Утга бэлэн болсон мэдэгдэл</string>
+    <string name="lossofsignalalarm">Дохио тасарсны дараах анхааруулга</string>
+    <string name="cantsetminutes">"Can't set minutes to "</string>
+    <string name="minutes">минут</string>
+    <string name="toolarg"> хэт урт байна</string>
+    <string name="targetrange">"Зорилтот хүрээ: "</string>
+    <string name="graphrange">"Графикийн хүрээ: "</string>
+    <string name="unit">"Нэгж"</string>
+    <string name="glucoseaxisleft">Глюкозын тэнхлэг ЗҮҮН</string>
+    <string name="startsapp">Скан хийхэд апп нээгдэнэ</string>
+    <string name="patchedlibrebroadcast">xDrip-тэй нийцтэй</string>
+    <string name="disablecamerakey">Камерын товчийг идэвхгүй болгох</string>
+    <string name="invertscreen">Дэлгэцийг урвуулах</string>
+    <string name="nfcsound">NFC дуу</string>
+    <string name="manuallyscale">Гараар масштаблах </string>
+    <string name="time">Цаг</string>
+    <string name="glucose">Глюкоз</string>
+    <string name="sensorviabluetooth">Bluetooth-ээр мэдрэгчтэй холбогдох</string>
+    <string name="sensorviabluetoothon">Mirror биш төхөөрөмж дээр дохио ажиллуулахын тулд Sensor via bluetooth-ийг асаасан байх ёстой</string>
+    <string name="setunitfirst">Эхлээд нэгж тохируулна уу</string>
+    <string name="numberlabels">Тоон шошго</string>
+    <string name="colors">Өнгө</string>
+    <string name="remindersname">Сануулга</string>
+    <string name="display">Дэлгэц</string>
+    <string name="shutcuts">Товчлол</string>
+    <string name="advanced">Нарийвчилсан</string>
+    <string name="newname">Шинэ</string>
+    <string name="deletelast">Сүүлийнхийг устгах</string>
+    <string name="meal">Хоол:</string>
+    <string name="ringshort">Дуугарах</string>
+    <string name="days">Хоног</string>
+    <string name="invaliddays"> буруу. Хоног нь эерэг бүхэл тоо байх ёстой.</string>
+    <string name="summarygraph">Хураангуй график</string>
+    <string name="forget">Мартах</string>
+    <string name="reenable">Дахин идэвхжүүлэх</string>
+    <string name="failure_info">Мэдээлэл</string>
+    <string name="last_failure">Сүүлийн алдаа</string>
+    <string name="last_success">Сүүлийн амжилт</string>
+    <string name="stage">Үе шат</string>
+    <string name="use_bluetooth">Bluetooth ашиглах</string>
+    <string name="connection">Холболт</string>
+    <string name="unlock_key">Гар барилт</string>
+    <string name="glucose_value">Глюкозын утга</string>
+    <string name="info">Мэдээлэл</string>
+    <string name="devicespecific">Төхөөрөмжид зориулсан тохиргоо хийх</string>
+    <string name="dozeupdate">Doze горимд шинэчлэх</string>
+    <string name="refresh">Шинэчлэх</string>
+    <string name="sendqueue">Илгээх дараалал</string>
+    <string name="reinit">Дахин эхлүүлэх</string>
+    <string name="watchappinstalled">Цагны апп цаг дээр суусан байна</string>
+    <string name="error">Алдаа</string>
+    <string name="additem">Зүйл нэмэх</string>
+    <string name="round">"Бүхэлдэх "</string>
+    <string name="repeat">Давтах</string>
+    <string name="ingredient">Орц: </string>
+    <string name="select">Сонгох</string>
+    <string name="carbohydrate">Нүүрс ус: </string>
+    <string name="carbo">Нүүрс ус</string>
+    <string name="total">Нийт: </string>
+    <string name="mealtotal">Хоолны нийт: </string>
+    <string name="quantity">Тоо хэмжээ</string>
+    <string name="per">" тутамд "</string>
+    <string name="specifyingredient">Орцыг заах шаардлагатай</string>
+    <string name="specifyhowmuch">Хэмжээг заах шаардлагатай</string>
+    <string name="define">Тодорхойлох</string>
+    <string name="edit">Засах</string>
+    <string name="name">Нэр:</string>
+    <string name="carbperunit">Нэгж дэх нүүрс ус:</string>
+    <string name="database">Өгөгдлийн сан</string>
+    <string name="search">Хайх</string>
+    <string name="trace">Мөрдөх</string>
+    <string name="unknown">Тодорхойгүй</string>
+    <string name="showzero">Тэгийг харуулах</string>
+    <string name="compositionof100gram">100 граммын найрлага</string>
+    <string name="status">Төлөв</string>
+    <string name="config">Тохиргоо</string>
+    <string name="initwatchapp">Цагны апп эхлүүлэх</string>
+    <string name="nowatchesfound">Цаг олдсонгүй</string>
+    <string name="getkerfstok">Kerfstok цагны апп авах</string>
+    <string name="mealname">Хоол</string>
+    <string name="deletequestion">Устгах уу?</string>
+    <string name="soundname">Дуу</string>
+    <string name="play">Тоглуулах</string>
+    <string name="defaultname">Үндсэн</string>
+    <string name="flash">Гэрэл анивчих</string>
+    <string name="permission">Зөвшөөрөл</string>
+    <string name="shortcut">Товчлол</string>
+    <string name="value">Утга</string>
+    <string name="nextpage">Дараагийн хуудас</string>
+    <string name="ips">IP-үүд:</string>
+    <string name="port">Порт</string>
+    <string name="saved">"хадгалагдлаа"</string>
+    <string name="savefailed">Хадгалах амжилтгүй</string>
+    <string name="notsaved">Хадгалагдаагүй</string>
+    <string name="failedbyexception">Exception алдаанаас болж амжилтгүй боллоо</string>
+    <string name="nodata">Өгөгдөл байхгүй</string>
+    <string name="addsensorenddate">Мэдрэгчийн дуусах огноог календарьт нэмэх</string>
+    <string name="enddatesensor">"Мэдрэгчийн дуусах огноо "</string>
+    <string name="open">Нээх</string>
+    <string name="withoutsensor">Мэдрэгчгүй</string>
+    <string name="wronglibrary">Library зөв ажиллахгүй байна. Өөрийг туршина уу.</string>
+    <string name="installedlibrary">Суулгасан library</string>
+    <string name="cantextract">%s задлах боломжгүй. Өөр APK туршина уу.</string>
+    <string name="connectwithsensor">Холбогдож байна</string>
+    <string name="exchangedata">Өгөгдөл солилцохоор ажиллана</string>
+    <string name="nonewvalue">"Үүнээс хойш шинэ утга алга: "</string>
+    <string name="status_no_new_value_for_duration">%1$s хугацаанд шинэ утга алга</string>
+    <string name="status_no_new_value_since_time">%1$s цагаас хойш шинэ утга алга</string>
+    <string name="lowglucose">" Глюкоз бага!"</string>
+    <string name="highglucose">" Глюкоз өндөр!"</string>
+    <string name="lowglucoseshort">@string/lowglucose</string>
+    <string name="highglucoseshort">@string/highglucose</string>
+    <string name="sendto">Илгээх газар</string>
+    <string name="resenddata">Өгөгдлийг дахин илгээх</string>
+    <string name="minimum">Хамгийн бага</string>
+    <string name="minuteddeactivated">Идэвхгүй минут:</string>
+    <string name="duractionsec">Үргэлжлэх хугацаа (сек):</string>
+    <string name="duraction">Үргэлжлэх хугацаа:</string>
+    <string name="sec">сек</string>
+    <string name="notentered">" оруулаагүй"</string>
+    <string name="spacedand">" болон "</string>
+    <string name="disturb">Саад болох</string>
+    <string name="uselibreview">Libreview рүү илгээх</string>
     <string name="libreviewname">Libreview</string>
-    <string name="sendnow">Send now</string>
-    <string name="blueormirror">"Sensor via Bluetooth" should be turned on or this should be configured as a mirror</string>
-    <string name="vibrationname">Vibrate</string>
-    <string name="high_priority">Turbo</string>
-    <string name="darkmode">Dark mode</string>
-    <string name="multiply">Multiply with:</string>
-    <string name="rapidinsulin">Rapid acting insulin</string>
- <string name="longinsulin">Long acting insulin</string>
-    <string name="comments">Comments</string>
- <string name="dontsend">Don\'t send</string>
- <string name="sendamounts">Send amounts</string>
- <string name="resendquestion">Resend data?</string>
- <string name="resendmessage">Be careful not to send overlapping data to Libreview.</string>
- <string name="getaccountidquestion">Get Account ID from Libreview?</string>
- <string name="getaccountidmessage">The Account ID is needed to use Libre3 sensors that are activated with Abbotts Libre3 app with this Libreview account.</string>
- <string name="deleteconnection">Delete connection?</string>
- <string name="wakelock">Wakelock</string>
- <string name="wifi">Wifi</string>
- <string name="heartrate">Heart rate</string>
-    <string name="xdripbroadcast">Libre (patched App)</string>
+    <string name="sendnow">Одоо илгээх</string>
+    <string name="blueormirror">"Sensor via Bluetooth" асаалттай байх эсвэл үүнийг mirror болгон тохируулсан байх шаардлагатай</string>
+    <string name="vibrationname">Чичиргээ</string>
+    <string name="high_priority">Турбо</string>
+    <string name="darkmode">Харанхуй горим</string>
+    <string name="multiply">Үржүүлэх:</string>
+    <string name="rapidinsulin">Хурдан үйлчилдэг инсулин</string>
+    <string name="longinsulin">Урт үйлчилдэг инсулин</string>
+    <string name="comments">Тайлбар</string>
+    <string name="dontsend">Илгээхгүй</string>
+    <string name="sendamounts">Хэмжээг илгээх</string>
+    <string name="resendquestion">Өгөгдлийг дахин илгээх үү?</string>
+    <string name="resendmessage">Libreview рүү давхардсан өгөгдөл илгээхээс болгоомжилно уу.</string>
+    <string name="getaccountidquestion">Account ID-г Libreview-ээс авах уу?</string>
+    <string name="getaccountidmessage">The Account ID is needed to use Libre3 sensors that are activated with Abbotts Libre3 app with this Libreview account.</string>
+    <string name="deleteconnection">Холболтыг устгах уу?</string>
+    <string name="wakelock">Wakelock</string>
+    <string name="wifi">Wi-Fi</string>
+    <string name="heartrate">Зүрхний цохилт</string>
+    <string name="xdripbroadcast">Libre (засварласан апп)</string>
     <string name="aaps_broadcast">Glucodata</string>
     <string name="glucodata_subtitle">GlucoDataHandler (GDH)</string>
     <string name="xdrip_compatible_title">xDrip broadcast</string>
     <string name="xdrip_compatible_desc">AAPS compatible</string>
-    <string name="sensorpermission">Sensors permission</string>
- <string name="sensorpermissionmessage">needed to display heart rate. Set it in Device Settings, Apps, Permissions, Juggluco</string>
- <string name="floatglucose">Floating glucose</string>
- <string name="floatglucoseshort">@string/floatglucose</string>
-
- <string name="fontsize">Font size</string>
- <string name="fontsizeshort">@string/fontsize</string>
- <string name="fonttoolarge">Font size too large: max=</string>
- <string name="foreground">Foreground</string>
- <string name="background">Background</string>
- <string name="backgroundshort">Back-</string>
-
- <string name="transparent">Transparent</string>
- <string name="touchable">Touchable</string>
-
- <string name="overlaypermission">Needs permission</string>
- <string name="overlaypermissionmessage">adb shell pm grant tk.glucodata android.permission.SYSTEM_ALERT_WINDOW</string>
+    <string name="sensorpermission">Мэдрэгчийн зөвшөөрөл</string>
+    <string name="sensorpermissionmessage">needed to display heart rate. Set it in Device Settings, Apps, Permissions, Juggluco</string>
+    <string name="floatglucose">Хөвөгч глюкоз</string>
+    <string name="floatglucoseshort">@string/floatglucose</string>
+    <string name="fontsize">Үсгийн хэмжээ</string>
+    <string name="fontsizeshort">@string/fontsize</string>
+    <string name="fonttoolarge">Үсгийн хэмжээ хэт том байна. Дээд хэмжээ=</string>
+    <string name="foreground">Урд өнгө</string>
+    <string name="background">Арын өнгө</string>
+    <string name="backgroundshort">Арын-</string>
+    <string name="transparent">Тунгалаг</string>
+    <string name="touchable">Хүрч болох</string>
+    <string name="overlaypermission">Зөвшөөрөл шаардлагатай</string>
+    <string name="overlaypermissionmessage">adb shell pm grant tk.glucodata android.permission.SYSTEM_ALERT_WINDOW</string>
  https://www.juggluco.nl/Jugglucohelp/floatingconfig.html
- <string name="deletereminder">Delete reminder?</string>
- <string name="deletelabel">Delete label?</string>
-
- <string name="finish">Disconnect</string>
- <string name="finishsensormessage">Stop using this sensor for streaming?</string>
- 
- <string name="email">E-Mail:</string>
- <string name="getaccountid">Get Account ID</string>
-
- <string name="emailaddresstooshort">E-Mail address too short </string>
- <string name="emailaddresstoolong">E-Mail address too long </string>
- <string name="password8">Password should be at least 8 characters long </string>
- <string name="password36">Maximal password length is 36 characters </string>
- <string name="fromlibreview">From Libreview</string>
- <string name="manual">Manually</string>
-<string name="noaccountidspecified">"No account id specified "</string>
-<string name="wrongformat">"Wrong format "</string>
-<string name="noapplisteningto">"No app listening to "</string>
-<string name="secret">api_secret</string>
-<string name="withoutsaving">Leave without saving?</string>
-<string name="active">Active</string>
-<string name="usessl">Use SSL</string>
-<string name="fullchain">Full Chain</string>
-
-	<string name="privatekey">Private Key</string>
-<string name="localonly">Local only</string>
-<string name="toolongsecret">: api_secret too long. max=</string>
-<string name="invalidport">" invalid port number"</string>
-<string name="newsecret">"new api_secret: "</string>
-<string name="newport">"new port ="</string>
-<string name="webserver">Web server</string>
-<string name="treatments">Give Amounts</string>
-<string name="android13">Android</string>
-    <string name="wentwrong">Something went wrong</string>
-    <string name="dosis">" dose "</string>
-    <string name="doses">" doses "</string>
- <string name="penfailed">Reading insulin pen failed. Try again.</string>
- <string name="changeinsulin">"Change insulin type to "</string>
-    <string name="type">"Type: "</string>
-    <string name="dosesprior">Only add doses from after:</string>
-    <string name="modify">Modify</string>
-    <string name="notsynced">Not synced</string>
- <string name="lossdata">Setting to defaults can result in loss of data.</string>
- <string name="defaults">Defaults</string>
-    <string name="notify">Notify</string>
- <string name="separate">Separate</string>
-    <string name="librecurrent">Immediate</string>
-    <string name="USE_ALARM">Alarm is alarm</string>
-    <string name="speed">Speed</string>
- <string name="pitch">Pitch</string>
- <string name="talker">Voice</string>
- <string name="secondsbetween">Seconds between</string>
- <string name="test">Test</string>
- <string name="streamhistory">Bluetooth History</string>
- <string name="libreisviewed">Spy views</string>
- <string name="novalue">No value</string>
- <string name="talk">Talk</string>
- <string name="watches">Watch</string>
- <string name="menus">Menus</string>
- <string name="system_ui">System UI</string>
- <string name="sensor">Sensors</string>
- <string name="settings">Settings</string>
- <string name="aboutname">About</string>
- <string name="export">Export</string>
- <string name="mirror">Mirror</string>
- <string name="new_amount">New Amount</string>
- <string name="list">List</string>
- <string name="statistics">Statistics</string>
- <string name="floatname">Float</string>
- <string name="last_scan">Last Scan</string>
-    <string name="date">Date</string>
- <string name="day_back">Day back</string>
- <string name="day_later">Day later</string>
- <string name="week_back">Week back</string>
- <string name="week_later">Week later</string>
- <string name="talk_touch">Talk touch</string>
- <string name="speakmessages">Speak messages</string>
- <string name="speakalarms">Speak alarms</string>
- <string name="speakglucose">Speak glucose</string>
-    <string name="notfound">Not found</string>
- <string name="no_ringtone_picker_found">No Ringtone Picker found</string>
- <string name="can_t_play">"Can't play "</string>
- <string name="seconds">" seconds"</string>
- <string name="duration_can_t_be_negative">"Duration can't be negative: "</string>
- <string name="too_large_maximum_65535">" too large, maximum=65535, "</string>
- <string name="too_large">" too large"</string>
- <string name="can_t_use_specification">Can\'t use specification</string>
- <string name="turn_on_nearby_devices_permission">Turn on NEARBY DEVICES permission</string>
+ <string name="deletereminder">Сануулгыг устгах уу?</string>
+    <string name="deletelabel">Шошгыг устгах уу?</string>
+    <string name="finish">Салгах</string>
+    <string name="finishsensormessage">Энэ мэдрэгчийг дамжуулалтад ашиглахаа зогсоох уу?</string>
+    <string name="email">И-мэйл:</string>
+    <string name="getaccountid">Account ID авах</string>
+    <string name="emailaddresstooshort">И-мэйл хаяг хэт богино байна </string>
+    <string name="emailaddresstoolong">И-мэйл хаяг хэт урт байна </string>
+    <string name="password8">Нууц үг хамгийн багадаа 8 тэмдэгт байх ёстой </string>
+    <string name="password36">Нууц үгийн дээд урт 36 тэмдэгт </string>
+    <string name="fromlibreview">Libreview-ээс</string>
+    <string name="manual">Гараар</string>
+    <string name="noaccountidspecified">"Account ID заагаагүй байна "</string>
+    <string name="wrongformat">"Формат буруу "</string>
+    <string name="noapplisteningto">"Дараахыг сонсож буй апп алга: "</string>
+    <string name="secret">api_secret</string>
+    <string name="withoutsaving">Хадгалалгүй гарах уу?</string>
+    <string name="active">Идэвхтэй</string>
+    <string name="usessl">SSL ашиглах</string>
+    <string name="fullchain">Full Chain</string>
+    <string name="privatekey">Private Key</string>
+    <string name="localonly">Зөвхөн локал</string>
+    <string name="toolongsecret">: api_secret too long. max=</string>
+    <string name="invalidport">" invalid port number"</string>
+    <string name="newsecret">"new api_secret: "</string>
+    <string name="newport">"new port ="</string>
+    <string name="webserver">Веб сервер</string>
+    <string name="treatments">Хэмжээ оруулах</string>
+    <string name="android13">Android</string>
+    <string name="wentwrong">Алдаа гарлаа</string>
+    <string name="dosis">" тун "</string>
+    <string name="doses">" тун "</string>
+    <string name="penfailed">Инсулины үзгийг уншиж чадсангүй. Дахин оролдоно уу.</string>
+    <string name="changeinsulin">"Инсулины төрлийг дараах болгож өөрчлөх: "</string>
+    <string name="type">"Төрөл: "</string>
+    <string name="dosesprior">Зөвхөн дараах хугацаанаас хойших тунг нэмэх:</string>
+    <string name="modify">Өөрчлөх</string>
+    <string name="notsynced">Синк хийгдээгүй</string>
+    <string name="lossdata">Үндсэн тохиргоо руу буцаахад өгөгдөл алдагдаж болзошгүй.</string>
+    <string name="defaults">Үндсэн тохиргоо</string>
+    <string name="notify">Мэдэгдэх</string>
+    <string name="separate">Тусдаа</string>
+    <string name="librecurrent">Шууд</string>
+    <string name="USE_ALARM">Дохио нь сэрүүлэг шиг ажиллана</string>
+    <string name="speed">Хурд</string>
+    <string name="pitch">Өнгө аяс</string>
+    <string name="talker">Дуу хоолой</string>
+    <string name="secondsbetween">Хоорондын секунд</string>
+    <string name="test">Турших</string>
+    <string name="streamhistory">Bluetooth түүх</string>
+    <string name="libreisviewed">Spy views</string>
+    <string name="novalue">Утга байхгүй</string>
+    <string name="talk">Ярих</string>
+    <string name="watches">Цаг</string>
+    <string name="menus">Цэсүүд</string>
+    <string name="system_ui">Системийн UI</string>
+    <string name="sensor">Мэдрэгчүүд</string>
+    <string name="settings">Тохиргоо</string>
+    <string name="aboutname">Тухай</string>
+    <string name="export">Экспортлох</string>
+    <string name="mirror">Mirror</string>
+    <string name="new_amount">Шинэ хэмжээ</string>
+    <string name="list">Жагсаалт</string>
+    <string name="statistics">Статистик</string>
+    <string name="floatname">Хөвөгч</string>
+    <string name="last_scan">Сүүлийн скан</string>
+    <string name="date">Огноо</string>
+    <string name="day_back">Нэг хоног өмнө</string>
+    <string name="day_later">Нэг хоног дараа</string>
+    <string name="week_back">Нэг долоо хоног өмнө</string>
+    <string name="week_later">Нэг долоо хоног дараа</string>
+    <string name="talk_touch">Хүрэхэд ярих</string>
+    <string name="speakmessages">Мессежийг унших</string>
+    <string name="speakalarms">Дохиог унших</string>
+    <string name="speakglucose">Глюкозыг унших</string>
+    <string name="notfound">Олдсонгүй</string>
+    <string name="no_ringtone_picker_found">No Ringtone Picker found</string>
+    <string name="can_t_play">"Can't play "</string>
+    <string name="seconds">" seconds"</string>
+    <string name="duration_can_t_be_negative">"Duration can't be negative: "</string>
+    <string name="too_large_maximum_65535">" too large, maximum=65535, "</string>
+    <string name="too_large">" too large"</string>
+    <string name="can_t_use_specification">Can\'t use specification</string>
+    <string name="turn_on_nearby_devices_permission">Turn on NEARBY DEVICES permission</string>
     <string name="enable_bluetooth">Enable Bluetooth</string>
- <string name="turn_on_location_permission">Turn on Location permission</string>
- <string name="bluetooth_is_turned_off">Bluetooth is turned off</string>
- <string name="allsentnoreceive">When everything is sent to a host, \"Receive from\" should be turned off.</string>
- <string name="nomirrorport">The port number should be different from the mirror port</string>
- <string name="nohttpport">The port number should be different from the http port</string>
-<string name="ready_in">" ready in "</string>
-<string name="ready_for_use">Sensor ready for use</string>
-<string name="endstime">" ends at this time"</string>
-<string name="triednothing">Tried nothing</string>
-<string name="success">Success</string>
-<string name="resendwarning">All data will be sent again which takes time and can have consequences for Libreview and Kerfstok</string>
-<string name="parseip">Error parsing IP</string>
-<string name="toomanyhosts">Maximal number of hosts exceeded</string>
-<string name="senthosts">Juggluco sends to maximal 6 hosts</string>
+    <string name="turn_on_location_permission">Turn on Location permission</string>
+    <string name="bluetooth_is_turned_off">Bluetooth is turned off</string>
+    <string name="allsentnoreceive">When everything is sent to a host, \"Receive from\" should be turned off.</string>
+    <string name="nomirrorport">The port number should be different from the mirror port</string>
+    <string name="nohttpport">The port number should be different from the http port</string>
+    <string name="ready_in">" ready in "</string>
+    <string name="ready_for_use">Sensor ready for use</string>
+    <string name="endstime">" ends at this time"</string>
+    <string name="triednothing">Tried nothing</string>
+    <string name="success">Success</string>
+    <string name="resendwarning">All data will be sent again which takes time and can have consequences for Libreview and Kerfstok</string>
+    <string name="parseip">Error parsing IP</string>
+    <string name="toomanyhosts">Maximal number of hosts exceeded</string>
+    <string name="senthosts">Juggluco sends to maximal 6 hosts</string>
     <string name="hostname">hostname</string>
-   <string name="clampnow">Now clamp</string>
+    <string name="clampnow">Now clamp</string>
     <string name="sendfrom">"Send from: "</string>
- <string name="changestartbutton">Change start</string>
- <string name="floatjuggluco">Above</string>
- <string name="uploader">Uploader</string>
- <string name="upload">Upload</string>
- <string name="sibionics">Sibionics</string>
- <string name="mmolL">mmol/L</string>
- <string name="mgdL">mg/dL</string>
- <string name="interval">Interval</string>
- <string name="off">Off</string>
- <string name="shortoff">Off</string>
- <string name="streamingenabled">" Streaming enabled"</string>
- <string name="streamingnotenabled">" Streaming not enabled"</string>
+    <string name="changestartbutton">Change start</string>
+    <string name="floatjuggluco">Above</string>
+    <string name="uploader">Uploader</string>
+    <string name="upload">Upload</string>
+    <string name="sibionics">Sibionics</string>
+    <string name="mmolL">mmol/L</string>
+    <string name="mgdL">mg/dL</string>
+    <string name="interval">Interval</string>
+    <string name="off">Off</string>
+    <string name="shortoff">Off</string>
+    <string name="streamingenabled">" Streaming enabled"</string>
+    <string name="streamingnotenabled">" Streaming not enabled"</string>
     <string name="everSensebroadcast">EverSense Broadcast</string>
- <string name="threshold">Threshold</string>
- <string name="untouchablequestion">Make floating glucose untouchable?</string>
-
- <string name="hour12">12h</string>
-<string name="complications">Complications</string>
+    <string name="threshold">Threshold</string>
+    <string name="untouchablequestion">Make floating glucose untouchable?</string>
+    <string name="hour12">12h</string>
+    <string name="complications">Complications</string>
     <string name="colors_style_setting_description">Watchface color</string>
-
-   <string name="glucosenumbercomplicationlabel">Glucose value</string>
-   <string name="glucosearrowcomplicationlabel">Glucose arrow</string>
-   <string name="glucosearrowvaluecomplicationlabel">Value + arrow</string>
- <string name="glucosevalueiconcomplicationlabel">Glucose Value small</string>
- <string name="glucosearrowiconcomplicationlabel">Glucose Arrow small</string>
- <string name="glucoseshortcomplicationlabel">Value + arrow small</string>
-
-   <string name="text">Text</string>
-   <string name="arrow">Arrow</string>
-   <string name="notalldata">WARNING: “Receive from” not set, but some data types are not sent.</string>
-  <string name="libresetalllabels">First specify for each label what should be done with it.</string>
-   <string name="photo">Photo</string>
-   <string name="photomessage">Scan the data matrix of a Dexcom G7/ONE+ or Sibionics GS1 sensor or the mirror QR code.</string>
-   <string name="dexfuture">Predict (Dexcom)</string>
-   <string name="initializing">Initializing</string> 
-   <string name="startjuggluco">Juggluco running on phone?\n\nWIFI and Bluetooth enabled?</string> 
-   <string name="connected">Connected!</string> 
-   <string name="useclose">Close button</string> 
-   <string name="alarmclock">\u23F0</string> 
-   <string name="filesize">File size</string> 
-   <string name="logging">Logging</string> 
+    <string name="glucosenumbercomplicationlabel">Глюкозын утга</string>
+    <string name="glucosearrowcomplicationlabel">Glucose arrow</string>
+    <string name="glucosearrowvaluecomplicationlabel">Value + arrow</string>
+    <string name="glucosevalueiconcomplicationlabel">Glucose Value small</string>
+    <string name="glucosearrowiconcomplicationlabel">Glucose Arrow small</string>
+    <string name="glucoseshortcomplicationlabel">Value + arrow small</string>
+    <string name="text">Text</string>
+    <string name="arrow">Arrow</string>
+    <string name="notalldata">WARNING: “Receive from” not set, but some data types are not sent.</string>
+    <string name="libresetalllabels">First specify for each label what should be done with it.</string>
+    <string name="photo">Photo</string>
+    <string name="photomessage">Scan the data matrix of a Dexcom G7/ONE+ or Sibionics GS1 sensor or the mirror QR code.</string>
+    <string name="dexfuture">Predict (Dexcom)</string>
+    <string name="initializing">Initializing</string>
+    <string name="startjuggluco">Juggluco running on phone?\n\nWIFI and Bluetooth enabled?</string>
+    <string name="connected">Connected!</string>
+    <string name="useclose">Close button</string>
+    <string name="alarmclock">\u23F0</string>
+    <string name="filesize">File size</string>
+    <string name="logging">Logging</string>
     <string name="aspart">Insulin Aspart/NovoRapid/NovoLog</string>
     <string name="fiasp">Fiasp</string>
     <string name="lispro">Insulin Lispro/Humalog</string>
@@ -397,77 +382,68 @@
     <string name="autoqrmessage">
 Send data from this phone to another phone on your home network.
 Pressing OK will generate a connection on this phone and display a QR code that can be scanned by another Android device. Scanning the QR code with left menu→Photo on the other phone will generate a connection, by which it will receive all data from this phone.</string>
-    
     <string name="googlescan">Google scan</string>
     <string name="usedweight">WARNING: weight (%.1f) not 0</string>
-
- <string name="verylowglucose">" Very LOW glucose!"</string>
- <string name="veryhighglucose">" Very HIGH glucose!"</string>
-
- <string name="verylowglucoseshort">" Very LOW!"</string>
- <string name="veryhighglucoseshort">" Very HIGH!"</string>
-
- <string name="prelowglucose">" Soon LOW glucose!"</string>
- <string name="prehighglucose">" Soon HIGH glucose!"</string>
-
- <string name="verylowglucosealarm">Very low glucose alarm</string>
- <string name="veryhighglucosealarm">Very high glucose alarm</string>
-
- <string name="prelowglucosealarm">Alarm when soon below</string>
- <string name="prehighglucosealarm">Alarm when soon above</string>
+    <string name="verylowglucose">" Very LOW glucose!"</string>
+    <string name="veryhighglucose">" Very HIGH glucose!"</string>
+    <string name="verylowglucoseshort">" Very LOW!"</string>
+    <string name="veryhighglucoseshort">" Very HIGH!"</string>
+    <string name="prelowglucose">" Soon LOW glucose!"</string>
+    <string name="prehighglucose">" Soon HIGH glucose!"</string>
+    <string name="verylowglucosealarm">Very low glucose alarm</string>
+    <string name="veryhighglucosealarm">Very high glucose alarm</string>
+    <string name="prelowglucosealarm">Alarm when soon below</string>
+    <string name="prehighglucosealarm">Alarm when soon above</string>
     <string name="schedules">Schedules</string>
     <string name="profile">"Profile "</string>
- <string name="lossofsignal">Loss of signal</string>
- <string name="valuenotification">Value notification</string>
- <string name="nothing"></string>
- <string name="scantranstitle">Scan TRANSMITTER data matrix</string>
- <string name="scantransmessage">Sibionics 2 sensor data matrix succesfully scanned. \nScan now the transmitter data matrix."</string>
- <string name="mirrorscansucces">Successfully added connection to left middle menu→Mirror.</string>
- <string name="resettitle">Reset</string>
- <string name="resetmessage">Clears transmitter memory. Should be pressed before using a new sensor in an already used transmitter.</string>
- <string name="nolibrelink">Use the EverSense Broadcast instead. See help.</string>
- <string name="calibration">Calibration</string>
- <string name="exclude">Exclude</string>
- <string name="calibratepast">Apply to past</string>
- <string name="bloodvar">Blood glucose:</string>
- <string name="calibrate_a">Visual mode</string>
- <string name="calibrated">Calibrated</string>
- <string name="delete_calibration">Delete calibration?</string>
- <string name="hide">Hide</string>
- <string name="sensorstreamed"></string>
- <string name="sensornotstreamed">Nothing yet</string>
- <string name="calibrations">Calibrations</string>
- <string name="allvalues">All values</string>
- <string name="writedown">Write down!</string>
- <string name="switchtowatch">Switch</string>
- <string name="last">"Last: "</string>
- <string name="bloodafter">"Only add glucose readings from after: "</string>
- <string name="specifyblood">"First select the label for blood glucose"</string>
- <string name="meterlist">"Glucose Meters"</string>
- <string name="finddevices">"Find devices"</string>
- <string name="nonewdata">"No new data"</string>
- <string name="newdata">"New data"</string>
-<string name="isconnected">Connected</string> 
-<string name="isdisconnected">Disconnected</string> 
-<string name="phone">phone</string>
- <string name="watch">watch</string>
-<string name="directsensor">Direct sensor-</string>
-<string name="enternums">Enter amounts on</string>
-<string name="connectionl">connection</string>
-<string name="disconnectsensor">Bug</string>
-<string name="internet">Internet</string>
-<string name="homenet">Home net</string>
-<string name="ICE">ICE</string>
-<string name="username">Username</string>
-
-<string name="icelabel">ICE Label</string>
-<string name="zero">0</string>
-<string name="one">1</string>
-
-<string name="QRmirror">Mirror via QR</string>
+    <string name="lossofsignal">Loss of signal</string>
+    <string name="valuenotification">Value notification</string>
+    <string name="nothing" />
+    <string name="scantranstitle">Scan TRANSMITTER data matrix</string>
+    <string name="scantransmessage">Sibionics 2 sensor data matrix succesfully scanned. \nScan now the transmitter data matrix."</string>
+    <string name="mirrorscansucces">Successfully added connection to left middle menu→Mirror.</string>
+    <string name="resettitle">Дахин тохируулах</string>
+    <string name="resetmessage">Clears transmitter memory. Should be pressed before using a new sensor in an already used transmitter.</string>
+    <string name="nolibrelink">Use the EverSense Broadcast instead. See help.</string>
+    <string name="calibration">Calibration</string>
+    <string name="exclude">Exclude</string>
+    <string name="calibratepast">Apply to past</string>
+    <string name="bloodvar">Blood glucose:</string>
+    <string name="calibrate_a">Visual mode</string>
+    <string name="calibrated">Calibrated</string>
+    <string name="delete_calibration">Delete calibration?</string>
+    <string name="hide">Hide</string>
+    <string name="sensorstreamed" />
+    <string name="sensornotstreamed">Nothing yet</string>
+    <string name="calibrations">Calibrations</string>
+    <string name="allvalues">All values</string>
+    <string name="writedown">Write down!</string>
+    <string name="switchtowatch">Switch</string>
+    <string name="last">"Last: "</string>
+    <string name="bloodafter">"Only add glucose readings from after: "</string>
+    <string name="specifyblood">"First select the label for blood glucose"</string>
+    <string name="meterlist">"Glucose Meters"</string>
+    <string name="finddevices">"Find devices"</string>
+    <string name="nonewdata">"No new data"</string>
+    <string name="newdata">"New data"</string>
+    <string name="isconnected">Connected</string>
+    <string name="isdisconnected">Disconnected</string>
+    <string name="phone">phone</string>
+    <string name="watch">watch</string>
+    <string name="directsensor">Direct sensor-</string>
+    <string name="enternums">Enter amounts on</string>
+    <string name="connectionl">connection</string>
+    <string name="disconnectsensor">Bug</string>
+    <string name="internet">Internet</string>
+    <string name="homenet">Home net</string>
+    <string name="ICE">ICE</string>
+    <string name="username">Username</string>
+    <string name="icelabel">ICE Label</string>
+    <string name="zero">0</string>
+    <string name="one">1</string>
+    <string name="QRmirror">Mirror via QR</string>
     <string name="turnservers">TURN Servers</string>
     <string name="turnserver">TURN Server</string>
-
     <!-- New Strings for Material UI & Language Support -->
     <string name="notification_chart_title">Notification Chart</string>
     <string name="notification_chart_desc">Display glucose graph in notification bar</string>
@@ -485,7 +461,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="select_language">Select Language</string>
     <string name="system_default">System Default</string>
     <string name="scanner_label">Scanner</string>
-
     <!-- Debug Settings Strings -->
     <string name="debug_logs_title">Debug Logs</string>
     <string name="clear">Clear</string>
@@ -495,7 +470,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="log_unchecked">Log unchecked. Enable to start.</string>
     <string name="error_reading_file">"Error reading file: "</string>
     <string name="error_saving_file">"Error saving file: "</string>
-
     <!-- Mirror Settings Strings -->
     <string name="mirror_settings_title">Mirror Settings</string>
     <string name="auto_qr">Auto QR</string>
@@ -504,8 +478,8 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="internet_sender">Internet Sender</string>
     <string name="home_net_receiver">Home Net Receiver</string>
     <string name="internet_receiver">Internet Receiver</string>
-    <string name="close">Close</string>
-    <string name="connection_label">Connection</string>
+    <string name="close">Хаах</string>
+    <string name="connection_label">Холболт</string>
     <string name="label">Label</string>
     <string name="deactivated">Deactivated</string>
     <string name="enable">Enable</string>
@@ -513,26 +487,24 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="ice">ICE</string>
     <string name="ice_label">ICE Label</string>
     <string name="hostname_ip">Hostname / IP</string>
-    <string name="test_ip">Test IP</string>
-    <string name="test_label">Test Label</string>
+    <string name="test_ip">IP шалгах</string>
+    <string name="test_label">Шошго шалгах</string>
     <string name="master">Master</string>
     <string name="passive_only">Passive Only</string>
     <string name="active_only">Active Only</string>
     <string name="data_present_until">Data present until:</string>
     <string name="show_password">Show password</string>
     <string name="hide_password">Hide password</string>
-
     <string name="turn_server">Turn Server</string>
-    <string name="add_connection">Add Connection</string>
-    <string name="help">Help</string>
-    <string name="send_to">Send to</string>
-    <string name="receive_from">Receive from</string>
+    <string name="add_connection">Холболт нэмэх</string>
+    <string name="help">Тусламж</string>
+    <string name="send_to">Илгээх газар</string>
+    <string name="receive_from">Хүлээн авах эх үүсвэр</string>
     <string name="qr">QR</string>
-    <string name="amounts">Amounts</string>
-    <string name="scans">Scans</string>
-    <string name="stream">Stream</string>
+    <string name="amounts">Хэмжээ</string>
+    <string name="scans">Сканууд</string>
+    <string name="stream">Дамжуулалт</string>
     <string name="exchanges">Exchange data</string>
-    
     <!-- Main UI Strings -->
     <string name="dashboard">Dashboard</string>
     <string name="stats">Stats</string>
@@ -540,12 +512,11 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <!-- existing: <string name="settings">Settings</string> -->
     <string name="no_data_available">No data available</string>
     <string name="duration_days">days</string>
-    <string name="sensor_state">Status</string>
+    <string name="sensor_state">Төлөв</string>
     <string name="no_sensors_found">No sensors found</string>
     <string name="add_sensor">Add Sensor</string>
-    <string name="sensors_title">Sensors</string>
+    <string name="sensors_title">Мэдрэгчүүд</string>
     <string name="add_sensor_title">Add Sensor</string>
-    
     <!-- Sensor Screen Strings -->
     <string name="calibration_algorithm">Calibration Algorithm</string>
     <string name="restart_autocal_title">Restart auto-calibration?</string>
@@ -557,35 +528,30 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="raw_auto">Raw+Auto</string>
     <string name="broadcast_only">Broadcast</string>
     <string name="reset_autocal_button">Restart auto-calibration</string>
-
     <!-- Trend Descriptions -->
     <string name="trend_rising">The trend is rising by %1$s percent.</string>
     <string name="trend_falling">The trend is falling by %1$s percent.</string>
     <string name="trend_unchanged">The trend remains unchanged.</string>
-    
     <!-- Duration Strings (ViewModel) -->
     <string name="in_use">%1$s in use</string>
     <string name="remaining">%1$s remaining</string>
     <string name="expired">Expired</string>
     <string name="days_short">%1$dd</string>
     <string name="hours_short">%1$dh</string>
-    
     <!-- Settings Strings -->
     <string name="theme_title">Theme</string>
     <string name="theme_system">System Default</string>
     <string name="theme_light">Light</string>
     <string name="theme_dark">Dark</string>
-    
-    <string name="advanced_title">Advanced</string>
+    <string name="advanced_title">Нарийвчилсан</string>
     <string name="debug_logs">Debug Logs</string>
     <string name="nightscout_config">Nightscout Config</string>
-    
     <!-- LibreView Settings -->
     <string name="libreview_config">LibreView</string>
     <string name="libreview_desc">Sync with Abbott LibreView</string>
     <string name="libreview_settings_title">LibreView Settings</string>
     <string name="libreview_email">Email</string>
-    <string name="libreview_password">Password</string>
+    <string name="libreview_password">Нууц үг</string>
     <string name="libreview_active">Send to LibreView</string>
     <string name="libreview_active_desc">Enable LibreView upload</string>
     <string name="libreview_current">Show Current Glucose</string>
@@ -594,13 +560,11 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="libreview_send_now">Send Now</string>
     <string name="libreview_resend">Resend Data</string>
     <string name="libreview_account_id">Account ID</string>
-    <string name="libreview_get_account_id">Get Account ID</string>
-    <string name="libreview_status">Status</string>
+    <string name="libreview_get_account_id">Account ID авах</string>
+    <string name="libreview_status">Төлөв</string>
     <string name="libreview_russia">Russia region</string>
-    
     <string name="low_label">Low</string>
     <string name="high_label">High</string>
-    
     <!-- Sensor Management Strings -->
     <string name="disconnect_sensor_title">Disconnect Sensor?</string>
     <string name="disconnect_sensor_desc">This will permanently stop the sensor session.</string>
@@ -609,27 +573,21 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="remove_sensor_desc">This will permanently remove the sensor, wipe pairing keys, and stop the session. The sensor must be re-paired to use again.</string>
     <string name="remove">Remove</string>
     <string name="wipe_data">Wipe sensor data</string>
-    <string name="disconnect">Disconnect</string>
+    <string name="disconnect">Салгах</string>
     <string name="keep_data">Keep sensor info</string>
-
     <string name="reconnect_sensor_title">Reconnect Sensor?</string>
     <string name="reconnect_sensor_desc">This will reset the connection and attempt to reconnect.</string>
     <string name="reconnect">Reconnect</string>
-    
     <string name="forget_sensor_title">Forget Sensor?</string>
     <string name="forget_sensor_desc">This will remove the sensor from the list. It may reappear if scanned again.</string>
-    
     <string name="reset_sensor_title">Reset sensor?</string>
     <string name="reset_sensor_desc">This will reset the Sibionics 2 sensor. Continue?</string>
     <string name="reset_sensor">Reset sensor</string>
-    
     <string name="reset_all_title">Reset all?</string>
     <string name="reset_all_desc">Clear all old data, calibrations, and reset the sensor?</string>
     <string name="reset_all">Reset all</string>
-    
     <string name="unified_reset_desc">This will restart the sensor and reset the auto-calibration algorithm.</string>
     <string name="keep_auto_calibration">Keep auto-calibration data</string>
-    
     <string name="enabled_status">Enabled</string>
     <string name="disabled_status">Disabled</string>
     <string name="last_ble_status">Last BLE status</string>
@@ -640,23 +598,18 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="sensor_battery_voltage">Battery</string>
     <string name="auto_reset_title">Auto reset</string>
     <string name="auto_reset_days">%1$d days</string>
-    <string name="auto_reset_never">Never</string>
-    
+    <string name="auto_reset_never">Хэзээ ч үгүй</string>
     <!-- Sensor Onboarding Strings -->
     <string name="no_sensor_title">No Sensor Connected</string>
     <string name="no_sensor_description">Connect a continuous glucose monitor to start tracking your glucose levels.</string>
-
-    
     <!-- Sibionics Setup Wizard -->
     <string name="sibionics_setup_title">Sibionics Setup</string>
     <string name="scan_sensor_qr">Scan Sensor QR Code</string>
     <string name="scan_sensor_qr_desc">Scan the data matrix on the sensor packaging</string>
     <string name="select_sibionics_type">Select Sensor Type</string>
     <string name="scan_transmitter">Scan Transmitter</string>
-
     <string name="connecting">Connecting...</string>
     <string name="setup_complete">Setup Complete</string>
-    
     <!-- Libre Setup Wizard -->
     <string name="libre_setup_title">Libre Setup</string>
     <string name="libre_nfc_instruction">Hold your phone near the sensor to scan</string>
@@ -682,30 +635,24 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="libreview_account_missing_desc">Enter credentials and request the Account ID for Libre 3 sensors</string>
     <string name="libre_setup_account_id_obtained">Account ID obtained</string>
     <string name="libre_setup_account_id_timeout">Timed out. Check credentials and try again.</string>
-    
     <!-- Dexcom Setup Wizard -->
     <string name="dexcom_setup_title">Dexcom Setup</string>
     <string name="dexcom_scan_instruction">Scan the data matrix on your Dexcom sensor</string>
     <string name="scan_dexcom">Scan Dexcom</string>
-
     <!-- Accu-Chek Setup Wizard -->
     <string name="accuchek_setup_title">Accu-Chek Setup</string>
     <string name="accuchek_scan_instruction">Scan the data matrix on your Accu-Chek SmartGuide sensor</string>
     <string name="scan_accuchek">Scan Accu-Chek</string>
-
     <!-- CareSens Air Setup Wizard -->
     <string name="caresens_air_setup_title">CareSens Air Setup</string>
     <string name="caresens_air_scan_instruction">Scan the sensor code on your CareSens Air package</string>
     <string name="scan_caresens_air">Scan CareSens Air</string>
-
     <!-- Delete Sensor Strings -->
     <string name="delete_sensor">Delete Sensor</string>
     <string name="delete_sensor_desc">This will remove the sensor and all its data. This cannot be undone.</string>
-    <string name="delete_confirm">Delete</string>
-
+    <string name="delete_confirm">Устгах</string>
     <string name="general_settings">General Settings</string>
     <string name="notifications">Alerts and notifications</string>
-
     <!-- Expressive Settings Strings -->
     <string name="data_management">Data Management</string>
     <string name="export_data">Export Data</string>
@@ -728,7 +675,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="patient_id_label">Patient ID</string>
     <string name="patient_dob_label">Date of birth</string>
     <string name="patient_clinician_label">Care team</string>
-    
     <string name="danger_zone">Danger Zone</string>
     <string name="clear_history">Clear History</string>
     <string name="clear_history_desc_long">Remove all glucose readings. Cannot be undone.</string>
@@ -741,7 +687,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="factory_reset_confirm">Factory Reset?</string>
     <string name="clean_history_confirm">Clear History?</string>
     <string name="clean_data_confirm">Clear App Data?</string>
-    
     <string name="turbo_title">Turbo (high priority)</string>
     <string name="turbo_desc">Requests high connection priority</string>
     <string name="autoconnect_title">AutoConnect</string>
@@ -756,9 +701,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="graph_smoothing_7_minutes">7 minutes</string>
     <string name="data_smoothing_window_title">Smoothing window</string>
     <string name="data_smoothing_graph_only_title">Smooth only graph</string>
-    <string name="data_smoothing_graph_only_desc">Keep current glucose, widgets and alerts unsmoothed; exchange outputs follow the setting below</string>
-    <string name="data_smoothing_exchange_only_title">Smooth only exchange outputs</string>
-    <string name="data_smoothing_exchange_only_desc">Apply smoothing and chunk filtering only to broadcasts and outbound API payloads; chart, current glucose, widgets and alerts stay unchanged</string>
+    <string name="data_smoothing_graph_only_desc">Keep current glucose, widgets, alerts and broadcasts unsmoothed</string>
     <string name="data_smoothing_collapse_title">Collapse into chunks</string>
     <string name="data_smoothing_collapse_desc">Keep one smoothed point per interval and filter out points in between</string>
     <string name="data_smoothing_collapse_desc_match">Keep one smoothed point every %1$d minutes</string>
@@ -768,16 +711,13 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="preview_window_desc">Show a 24-hour mini navigator under the dashboard chart without changing the main chart behavior</string>
     <string name="preview_window_expanded_only">Expanded view (default)</string>
     <string name="preview_window_always">Always</string>
-    <string name="preview_window_never">Never</string>
+    <string name="preview_window_never">Хэзээ ч үгүй</string>
     <string name="debug_logs_desc">View trace.log and logcat</string>
-
-    
     <string name="unit_mg">mg/dL</string>
     <string name="unit_mmol">mmol/L</string>
     <string name="alert_mode">Alert Mode</string>
     <string name="sound_vibrate">Sound &amp; Vibrate</string>
-    <string name="vibrate_only">Vibrate</string>
-
+    <string name="vibrate_only">Чичиргээ</string>
     <!-- Alert Types (Clean, no 'Glucose' suffix) -->
     <string name="alert_low">Low</string>
     <string name="alert_high">High</string>
@@ -793,7 +733,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="sensor_expiry_channel_description">Alerts when the current sensor is nearing expiry</string>
     <string name="alert_value_available">Value Available</string>
     <string name="alert_amount">Amount Alert</string>
-
     <!-- Hardcoded Strings Extracted -->
     <string name="import_history">Import History</string>
     <string name="import_history_desc">Import glucose data from a CSV file</string>
@@ -801,7 +740,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="select_sensor">Select Sensor Type</string>
     <string name="or_divider">"  or  "</string>
     <string name="no_sensors_connected">No sensors connected</string>
-    
     <string name="enter_sensor_codes">Enter Sensor Codes</string>
     <string name="enter_sensor_label_desc">Enter the codes printed on the sensor label</string>
     <string name="batch_code_label">Batch Code (10)</string>
@@ -809,22 +747,18 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="serial_number_label">Serial Number</string>
     <string name="serial_number_supporting">Second code (10-20 chars), e.g. %1$s</string>
     <string name="confirm">Confirm</string>
-    
     <string name="enter_transmitter_code">Enter Transmitter Code</string>
     <string name="enter_transmitter_desc">Enter the transmitter ID from the label</string>
     <string name="transmitter_id_label">Transmitter ID</string>
     <string name="transmitter_id_supporting">8-12 characters from transmitter label</string>
-    
     <string name="scan_sensor_title">Scan QR Code</string>
     <string name="scan_sensor_instruction">Scan the QR code on your generic Sibionics sensor box.</string>
     <string name="scan_qr_button">Scan QR Code</string>
     <string name="select_gallery_button">Select from Gallery</string>
     <string name="skip_fake_sensor">Skip (Use Fake Sensor)</string>
     <string name="enter_code_manually">Enter Code Manually</string>
-    
     <string name="choose_sibionics_variant">Choose your Sibionics sensor variant</string>
     <string name="continue_action">Continue</string>
-    
     <string name="sensor_init_failed">Sensor initialization failed</string>
     <string name="sensor_lost_restart">Error: Sensor lost. Please restart setup.</string>
     <string name="invalid_device_name">"Invalid device name: "</string>
@@ -832,7 +766,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="sensor_not_init">Sensor not initialized. Use \'Scan Sensor\' first.</string>
     <string name="invalid_code_format">Invalid code format. Please try again.</string>
     <string name="no_qr_found">No QR code found in image</string>
-    
     <!-- ComposeHost Strings -->
     <string name="go">Go</string>
     <string name="filter_by_date">Filter by date</string>
@@ -841,18 +774,16 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="csv_desc">Best for Excel/Analysis</string>
     <string name="text_file">Readable Text (.txt)</string>
     <string name="text_desc">Best for sharing/printing</string>
-    <string name="export_button">Export</string>
+    <string name="export_button">Экспортлох</string>
     <string name="export_history_title">Export History</string>
     <string name="export_history_sub">Save glucose readings to CSV or text file</string>
     <string name="import_history_title">Import History</string>
     <string name="import_history_sub">Restore glucose readings from CSV file</string>
-    
     <string name="clear_history_title">Clear History?</string>
     <string name="clear_history_confirmation">This will remove all glucose readings from the database. This action cannot be undone.</string>
     <string name="delete_reading_title">Delete Reading?</string>
     <string name="delete_reading_confirmation">Remove this glucose reading from local history. This action cannot be undone.</string>
     <string name="clear_button">Clear</string>
-    
     <string name="clear_app_data_title">Clear App Data?</string>
     <string name="clear_app_data_intro">This will remove:</string>
     <string name="all_glucose_readings">• All glucose readings</string>
@@ -862,13 +793,11 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="settings_preserved">Settings will be preserved.</string>
     <string name="cannot_be_undone_warning">This action cannot be undone.</string>
     <string name="clear_data_button">Clear Data</string>
-    
     <string name="factory_reset_title">⚠️ Factory Reset?</string>
     <string name="factory_reset_intro">This will REMOVE EVERYTHING:</string>
     <string name="factory_reset_outcome">The app will return to first-run state.</string>
     <string name="cannot_be_undone_critical">THIS CANNOT BE UNDONE!</string>
     <string name="reset_everything_button">RESET EVERYTHING</string>
-    
     <string name="alert_sound">Alert Sound</string>
     <string name="about_text">GPL-3.0 • Fork of Juggluco</string>
     <string name="refreshing">Refreshing...</string>
@@ -877,14 +806,12 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="juggluco_native">Juggluco native</string>
     <string name="window_label">window</string>
     <string name="auto_restart_algorithm">Auto restart algorithm</string>
-    
     <string name="status_bluetooth_off">Bluetooth off</string>
     <string name="status_connection_failed">Connection failed</string>
     <string name="status_connected">Connected</string>
     <string name="status_disconnected">Disconnected</string>
     <string name="status_waiting_for_data">Connected, waiting for data...</string>
     <string name="status_raw_values_received">Connected, raw values received</string>
-    
     <string name="select_sensor_type">Select sensor type</string>
     <string name="choose_theme">Choose theme</string>
     <string name="sibionics_sensor">Sibionics</string>
@@ -905,7 +832,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="mq_sensor_desc">Pair a Glutec / MQ CGM transmitter via Bluetooth</string>
     <string name="anytime_sensor">Anytime / Yuwell 4 / 4H</string>
     <string name="anytime_sensor_desc">Pair an Anytime / Yuwell CT3 CGM transmitter via Bluetooth</string>
-
     <!-- Anytime/Yuwell Setup Wizard Strings -->
     <string name="anytime_setup_title">Anytime / Yuwell Setup</string>
     <string name="anytime_searching_sensors">Searching for Anytime / Yuwell transmitters…</string>
@@ -913,7 +839,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="anytime_detected_label">%1$s · Anytime CT3 family</string>
     <string name="anytime_selectable_unrecognized">%1$s · shown because \"See all devices\" is on</string>
     <string name="anytime_connecting_to">Pairing %1$s…</string>
-
     <!-- MQ/Glutec Setup Wizard Strings -->
     <string name="mq_setup_title">MQ / Glutec Setup</string>
     <string name="mq_searching_sensors">Searching for MQ / Glutec transmitters…</string>
@@ -933,7 +858,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="scan_transmitter_button">Scan Transmitter</string>
     <string name="connecting_to_sensor">Connecting to sensor...</string>
     <string name="connecting_to_sensor_wait">Please wait while we establish a connection.</string>
-
     <!-- AiDex Setup Wizard Strings -->
     <string name="aidex_setup_title">AiDex / LinX Setup</string>
     <string name="aidex_searching_sensors">Searching for sensors...</string>
@@ -946,9 +870,8 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="aidex_not_recognized">%1$s • not recognized as AiDex</string>
     <string name="aidex_selectable_unrecognized">%1$s • selectable AiDex-family device</string>
     <string name="aidex_detected_via_ff30">%1$s • selectable via FF30 detection</string>
-    
     <!-- Statistics Screen Strings -->
-    <string name="statistics_title">Statistics</string>
+    <string name="statistics_title">Статистик</string>
     <string name="statistics_subtitle">Your glucose analytics</string>
     <string name="time_in_range">Time in Range</string>
     <string name="average_glucose">Average</string>
@@ -979,14 +902,12 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="range">Range</string>
     <string name="start_tracking">Start tracking your glucose to see statistics</string>
     <string name="loading_data">Loading...</string>
-    
     <!-- Variability Labels -->
     <string name="variability_excellent">Excellent</string>
     <string name="variability_very_good">Very Good</string>
     <string name="variability_good">Good</string>
     <string name="variability_moderate">Moderate</string>
     <string name="variability_high">High</string>
-    
     <!-- Insight Messages -->
     <string name="insight_excellent_control">Excellent Control!</string>
     <string name="insight_excellent_control_desc">You\'re spending %1$d%% in range - above the 70%% target!</string>
@@ -1002,7 +923,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="insight_great_a1c_desc">Estimated A1C (GMI): %1$.1f%% - within target range!</string>
     <string name="insight_a1c_estimate">A1C Estimate</string>
     <string name="insight_a1c_estimate_desc">GMI: %1$.1f%%. Slightly above the 7%% target.</string>
-    
     <!-- GVI and PSG (xDrip-style metrics) -->
     <string name="gvi_title">Glucose Variability Index</string>
     <string name="gvi_description">Measures glucose stability and variability patterns</string>
@@ -1017,7 +937,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="psg_elevated">Elevated Baseline</string>
     <string name="psg_low">Low Baseline</string>
     <string name="psg_unstable">Unstable Pattern</string>
-    
     <!-- Time Range Labels -->
     <string name="range_1d">1D</string>
     <string name="range_3d">3D</string>
@@ -1025,19 +944,16 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="range_14d">14D</string>
     <string name="range_30d">30D</string>
     <string name="range_90d">90D</string>
-    
     <string name="range_all">ALL</string>
     <!-- Time Labels -->
     <string name="time_12am">12 AM</string>
     <string name="time_6am">6 AM</string>
     <string name="time_12pm">12 PM</string>
     <string name="time_6pm">6 PM</string>
-    
     <!-- Detail Modal -->
     <string name="view_details">View Details</string>
     <string name="percentage_format">%1$d%%</string>
     <string name="value_with_unit">%1$s %2$s</string>
-    
     <!-- Additional Statistics Strings -->
     <string name="low">Low</string>
     <string name="high">High</string>
@@ -1054,14 +970,12 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="tir">TIR</string>
     <string name="total_readings">Total Readings</string>
     <string name="cv">CV</string>
-    
     <!-- Stats Screen Redesign -->
     <string name="lowest">Lowest</string>
     <string name="highest">Highest</string>
     <string name="typical">Typical</string>
     <string name="daily_pattern">Daily Pattern</string>
     <string name="detailed_stats">Detailed Statistics</string>
-
     <!-- Alert settings localization keys -->
     <string name="active_time_range_title">Active Time Range</string>
     <string name="add_high_alert">Add High Alert</string>
@@ -1109,7 +1023,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="threshold_label">Threshold</string>
     <string name="time_range_summary">%1$s - %2$s</string>
     <string name="volume_vibration_profile">Volume/Vibration Profile</string>
-
     <!-- Overlay/notification typography controls -->
     <string name="font_source">Font source</string>
     <string name="font_app_plex">App (IBM Plex)</string>
@@ -1126,7 +1039,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="IOBhelp">IOB Help</string>
     <string name="NightPost">Night Post</string>
     <string name="Nightscouthelp">Nightscout Help</string>
-    <string name="about">About</string>
+    <string name="about">Тухай</string>
     <string name="active_positions_randomized">Active positions (randomized)</string>
     <string name="active_time_range">Active time range</string>
     <string name="add_custom_sound">Add custom sound</string>
@@ -1217,7 +1130,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="garminconfig">Garmin Config</string>
     <string name="getaccountidhelp">Getaccountid Help</string>
     <string name="getlib">Getlib</string>
-    <string name="global_active">Active</string>
+    <string name="global_active">Идэвхтэй</string>
     <string name="global_all_alerts_disabled">All alerts disabled</string>
     <string name="glucose_with_unit">Glucose (%1$s)</string>
     <string name="hardware_reset">Hardware reset</string>
@@ -1260,7 +1173,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="nightscout_upload_active">Uploading in background</string>
     <string name="nightscout_upload_paused">Uploads paused</string>
     <string name="nightscout_upload_options_title">Upload options</string>
-    <string name="nightscout_status_never">Never</string>
+    <string name="nightscout_status_never">Хэзээ ч үгүй</string>
     <string name="nightscout_status_paused">Uploader paused</string>
     <string name="nightscout_status_waiting">Waiting for next upload</string>
     <string name="nightscout_status_running">Uploader running</string>
@@ -1278,8 +1191,8 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="nightscout_follow_status_sync_failed">Nightscout sync failed</string>
     <string name="nightscout_status_response_404">Last response: HTTP 404, endpoint mismatch detected</string>
     <string name="nightscout_status_response_413">Last response: HTTP 413, payload too large</string>
-    <string name="nightscout_status_last_attempt">Last attempt: %1$s</string>
-    <string name="nightscout_status_last_success">Last success: %1$s</string>
+    <string name="nightscout_status_last_attempt">Сүүлийн оролдлого: %1$s</string>
+    <string name="nightscout_status_last_success">Сүүлийн амжилт: %1$s</string>
     <string name="nightscout_send_amounts_desc">Upload Insulin/Carbs (Treatments)</string>
     <string name="nightscout_settings_title">Nightscout Settings</string>
     <string name="nightscout_sync_actions_title">Sync actions</string>
@@ -1302,7 +1215,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="preview">Preview</string>
     <string name="previous_calibrations">Previous calibrations</string>
     <string name="reinit_progress">Re-initializing...</string>
-    <string name="reminders">Reminders</string>
+    <string name="reminders">Сануулга</string>
     <string name="requesting_account_id">Requesting account ID...</string>
     <string name="resend_data_reset">Resend Data (Reset)</string>
     <string name="resend_triggered">Resend triggered</string>
@@ -1312,7 +1225,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="restart_algorithm_to_apply">Restart algorithm to apply changes</string>
     <string name="restart_with_current_window">Restart with current window</string>
     <string name="restart_with_standard_algorithm">Restart with standard algorithm</string>
-    <string name="ringtone">Ringtone</string>
+    <string name="ringtone">Дуудлагын ая</string>
     <string name="schedulehelp">Schedule Help</string>
     <string name="searchhelp">Search Help</string>
     <string name="expand_action">Expand</string>
@@ -1362,9 +1275,6 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="wipe_sensor_data_desc">Delete sensor data from this device.</string>
     <string name="wipe_sensor_data_title">Wipe sensor data</string>
     <string name="manual_calibration">Manual calibarion</string>
-
-
-
     <!-- Report localization -->
     <string name="report_generated_page">Generated %1$s · Page %2$d</string>
     <string name="report_patient_information">Patient information</string>
@@ -1541,7 +1451,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="mq_account_section_session">Session</string>
     <string name="mq_account_section_sync">Cloud sync</string>
     <string name="mq_account_section_followers">Followers</string>
-    <string name="mq_account_section_advanced">Advanced</string>
+    <string name="mq_account_section_advanced">Нарийвчилсан</string>
     <string name="mq_follower_settings_title">Glutec follower</string>
     <string name="mq_follower_settings_subtitle">Follow another account · approve share requests</string>
     <string name="mq_followers_summary_off">Off</string>
@@ -1739,7 +1649,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="mirror_turn_server_desc">TURN relay for remote connections</string>
     <string name="mirror_connections">Connections</string>
     <string name="mirror_no_connections">No connections. Use Quick Pair or tap + to add.</string>
-    <string name="mirror_delete_connection_title">Delete connection?</string>
+    <string name="mirror_delete_connection_title">Холболтыг устгах уу?</string>
     <string name="mirror_delete_connection_message">%1$s will be removed permanently.</string>
     <string name="mirror_connection_type">Connection Type</string>
     <string name="mirror_type_local">Local</string>
@@ -1760,8 +1670,8 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="mirror_connection_label_desc">Human-readable name for this connection</string>
     <string name="mirror_direction">Direction</string>
     <string name="mirror_direction_passive">Passive</string>
-    <string name="mirror_direction_active">Active</string>
-    <string name="mirror_direction_both">Both</string>
+    <string name="mirror_direction_active">Идэвхтэй</string>
+    <string name="mirror_direction_both">Хоёулаа</string>
     <string name="mirror_direction_passive_hint">Only listen for incoming connections.</string>
     <string name="mirror_direction_active_hint">Only connect outbound to the other device.</string>
     <string name="mirror_direction_both_hint">Both listen and connect outbound.</string>
@@ -1774,7 +1684,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="mirror_password_desc">Must match on both devices</string>
     <string name="alert_delivery_notification">Notification</string>
     <string name="alert_delivery_alarm">Alarm</string>
-    <string name="alert_delivery_both">Both</string>
+    <string name="alert_delivery_both">Хоёулаа</string>
     <string name="volume_profile_high">High</string>
     <string name="volume_profile_medium">Medium</string>
     <string name="volume_profile_ascending">Ascending</string>
@@ -1804,7 +1714,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="outbound_api_provider">Destination type</string>
     <string name="outbound_api_provider_webhook">Webhook JSON</string>
     <string name="outbound_api_provider_vk">VK bot</string>
-    <string name="outbound_api_connection">Connection</string>
+    <string name="outbound_api_connection">Холболт</string>
     <string name="outbound_api_delivery">Delivery</string>
     <string name="outbound_api_url_label">POST URL</string>
     <string name="outbound_api_vk_token">VK token</string>
@@ -1819,7 +1729,7 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="outbound_api_min_interval">Minimum interval (minutes)</string>
     <string name="outbound_api_min_interval_desc">0 sends every accepted live reading.</string>
     <string name="outbound_api_trigger">Trigger</string>
-    <string name="outbound_api_change_trigger">Change</string>
+    <string name="outbound_api_change_trigger">Өөрчлөх</string>
     <string name="outbound_api_trigger_always">Every accepted reading</string>
     <string name="outbound_api_trigger_always_desc">Use only duplicate and interval limits.</string>
     <string name="outbound_api_trigger_at_or_below">At or below low threshold</string>
@@ -1834,49 +1744,49 @@ Pressing OK will generate a connection on this phone and display a QR code that 
     <string name="outbound_api_trigger_summary_low">At or below %1$s %2$s</string>
     <string name="outbound_api_trigger_summary_high">At or above %1$s %2$s</string>
     <string name="outbound_api_trigger_summary_range">At or below %1$s or at or above %2$s %3$s</string>
-    <string name="outbound_api_send_test">Send test message</string>
-    <string name="outbound_api_test_queued">Test message queued</string>
-    <string name="outbound_api_no_current_reading">No current reading available</string>
-    <string name="outbound_api_not_configured">Complete destination settings first</string>
-    <string name="outbound_api_status_never">Never</string>
-    <string name="outbound_api_last_success_format">Last success: %1$s</string>
-    <string name="outbound_api_last_attempt_format">Last attempt: %1$s</string>
-    <string name="outbound_api_last_code_format">Response: %1$d</string>
-    <string name="outbound_api_last_error_format">Error: %1$s</string>
-    <string name="api_source_title">API source</string>
-    <string name="api_source_desc">Receive glucose from a preset or custom API</string>
-    <string name="api_source_settings_title">API source</string>
-    <string name="api_source_master_desc">Import glucose from a polling API as a read-only sensor</string>
-    <string name="api_source_url_required">Complete source settings first</string>
-    <string name="api_source_url_label">Source URL</string>
-    <string name="api_source_format">Format</string>
-    <string name="api_source_format_json">Glucose JSON</string>
+    <string name="outbound_api_send_test">Туршилтын мессеж илгээх</string>
+    <string name="outbound_api_test_queued">Туршилтын мессеж дараалалд орлоо</string>
+    <string name="outbound_api_no_current_reading">Одоогийн уншилт байхгүй</string>
+    <string name="outbound_api_not_configured">Эхлээд очих газрын тохиргоог бүрэн хийнэ үү</string>
+    <string name="outbound_api_status_never">Хэзээ ч үгүй</string>
+    <string name="outbound_api_last_success_format">Сүүлийн амжилт: %1$s</string>
+    <string name="outbound_api_last_attempt_format">Сүүлийн оролдлого: %1$s</string>
+    <string name="outbound_api_last_code_format">Хариу: %1$d</string>
+    <string name="outbound_api_last_error_format">Алдаа: %1$s</string>
+    <string name="api_source_title">API эх үүсвэр</string>
+    <string name="api_source_desc">Бэлэн тохиргоо эсвэл өөрийн API-аас глюкозын мэдээлэл хүлээн авах</string>
+    <string name="api_source_settings_title">API эх үүсвэр</string>
+    <string name="api_source_master_desc">Тогтмол шалгадаг API-аас глюкозын мэдээллийг зөвхөн унших мэдрэгч байдлаар импортлох</string>
+    <string name="api_source_url_required">Эхлээд эх үүсвэрийн тохиргоог бүрэн хийнэ үү</string>
+    <string name="api_source_url_label">Эх үүсвэрийн URL</string>
+    <string name="api_source_format">Формат</string>
+    <string name="api_source_format_json">Глюкоз JSON</string>
     <string name="api_source_format_gluco_watch">VK compact text</string>
-    <string name="api_source_poll_seconds">Poll interval (seconds)</string>
-    <string name="api_source_poll_seconds_desc">Minimum 30 seconds.</string>
-    <string name="api_source_status_idle">API source idle</string>
-    <string name="api_source_status_following">Following API source</string>
-    <string name="api_source_status_syncing">Refreshing API source</string>
-    <string name="api_source_status_paused">API source paused</string>
-    <string name="api_source_status_config_needed">Enter source URL</string>
-    <string name="api_source_status_no_readings">No API readings yet</string>
-    <string name="api_source_status_sync_failed">API source sync failed</string>
-    <string name="outbound_api_preset_sheet_title">Choose destination preset</string>
+    <string name="api_source_poll_seconds">Шалгах давтамж (секунд)</string>
+    <string name="api_source_poll_seconds_desc">Хамгийн багадаа 30 секунд.</string>
+    <string name="api_source_status_idle">API эх үүсвэр идэвхгүй байна</string>
+    <string name="api_source_status_following">API эх үүсвэрийг дагаж байна</string>
+    <string name="api_source_status_syncing">API эх үүсвэрийг шинэчилж байна</string>
+    <string name="api_source_status_paused">API эх үүсвэр түр зогссон</string>
+    <string name="api_source_status_config_needed">Эх үүсвэрийн URL оруулна уу</string>
+    <string name="api_source_status_no_readings">API уншилт хараахан алга</string>
+    <string name="api_source_status_sync_failed">API эх үүсвэрийн синк амжилтгүй</string>
+    <string name="outbound_api_preset_sheet_title">Очих газрын бэлэн тохиргоо сонгох</string>
     <string name="outbound_api_preset_custom_json_desc">POST normalized glucose JSON to any endpoint.</string>
     <string name="outbound_api_preset_telegram_desc">Send text with the Telegram Bot API. The URL can point to a relay.</string>
     <string name="outbound_api_preset_gluco_watch_vk_desc">Send compact GV text through VK community messages.</string>
     <string name="outbound_api_preset_vk_desc">Send readable glucose text through VK community messages.</string>
-    <string name="outbound_api_change_preset">Change</string>
+    <string name="outbound_api_change_preset">Өөрчлөх</string>
     <string name="outbound_api_telegram_recipient_help">Use a numeric chat ID or @channel username. A person must start the bot first.</string>
     <string name="outbound_api_vk_recipient_help">Use numeric VK user or peer IDs. Each recipient must message the community first.</string>
     <string name="outbound_api_url_template_help">Supports {token}; use a relay URL if api.telegram.org is unreachable.</string>
-    <string name="api_source_preset">Source preset</string>
-    <string name="api_source_preset_sheet_title">Choose source preset</string>
-    <string name="api_source_preset_custom_json">Custom JSON endpoint</string>
+    <string name="api_source_preset">Эх үүсвэрийн бэлэн тохиргоо</string>
+    <string name="api_source_preset_sheet_title">Эх үүсвэрийн бэлэн тохиргоо сонгох</string>
+    <string name="api_source_preset_custom_json">Өөрийн JSON endpoint</string>
     <string name="api_source_preset_custom_json_desc">Poll a URL that returns the normalized glucose JSON schema.</string>
     <string name="api_source_preset_vk_direct">VK direct message history</string>
     <string name="api_source_preset_vk_direct_desc">Poll VK messages and import compact GV readings.</string>
     <string name="api_source_vk_token">VK token</string>
-    <string name="api_source_vk_sender_id">Sender or peer ID</string>
+    <string name="api_source_vk_sender_id">Илгээгч эсвэл peer ID</string>
     <string name="api_source_vk_note">Uses compact VK messages. Messages older than 24 hours can disappear.</string>
 </resources>
