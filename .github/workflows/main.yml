@@ -91,6 +91,7 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: JugglucoNG Build #${{ github.run_number }}
           files: ${{ steps.apk.outputs.apk_path }}
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 # Trigger new build
