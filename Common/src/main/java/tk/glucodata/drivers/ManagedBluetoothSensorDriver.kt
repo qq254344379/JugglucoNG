@@ -6,6 +6,7 @@ data class ManagedSensorCurrentSnapshot(
     val timeMillis: Long,
     val glucoseValue: Float,
     val rawGlucoseValue: Float = Float.NaN,
+    val calibratedGlucoseValue: Float = Float.NaN,
     val rate: Float = Float.NaN,
     val sensorGen: Int = 0,
 )
@@ -18,7 +19,17 @@ data class ManagedSensorCalibrationRecord(
     val cf: Float,
     val offset: Float,
     val isValid: Boolean,
+    val source: ManagedSensorCalibrationSource = ManagedSensorCalibrationSource.GENERIC,
+    val appliedGlucoseId: Int = 0,
+    val appliedAtMs: Long = 0L,
+    val outputGlucoseMgDl: Int = 0,
 )
+
+enum class ManagedSensorCalibrationSource {
+    GENERIC,
+    AIDEX,
+    ANYTIME,
+}
 
 enum class ManagedSensorUiFamily {
     GENERIC,

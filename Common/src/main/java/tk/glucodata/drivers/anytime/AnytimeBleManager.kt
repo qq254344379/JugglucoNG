@@ -90,6 +90,12 @@ class AnytimeBleManager(
         /** How many empty pull responses in a row count as "caught up". */
         private const val HISTORY_EMPTY_RESPONSES_TO_STOP = 2
 
+        /** Avoid immediately re-pulling the same caught-up id after wake/reconnect churn. */
+        private const val HISTORY_CAUGHT_UP_COOLDOWN_MS = 2L * 60L * 1000L
+
+        /** Exact/near-exact Room timestamp guard for repeated provisional catch-up imports. */
+        private const val HISTORY_ROOM_IMPORT_NEAR_DUPLICATE_MS = 1L
+
         /** Reset → reconnect grace period. */
         private const val RESET_RECONNECT_DELAY_MS = 700L
 
@@ -107,6 +113,7 @@ class AnytimeBleManager(
 
         /** Keep the last calibration result visible in the Sensor card long enough to notice. */
         private const val CALIBRATION_STATUS_TTL_MS = 60L * 60L * 1000L
+        private const val MAX_REFERENCE_CALIBRATION_RECORDS = 12
 
         /**
          * Fresh installs should become useful quickly, then continue filling older
@@ -175,8 +182,10 @@ class AnytimeBleManager(
     @Volatile private var lastReferenceBgMgdlTimes10: Int = 0
     @Volatile private var lastReferenceBgGlucoseId: Int = 0
     @Volatile private var lastReferenceAppliedGlucoseId: Int = 0
+    @Volatile private var referenceCalibrationRecords: List<AnytimeReferenceCalibrationRecord> = emptyList()
     @Volatile private var calibrationStatusText: String = ""
     @Volatile private var calibrationStatusAtMs: Long = 0L
+    @Volatile private var calibrationStatusClearAfterGlucoseId: Int = 0
     @Volatile private var lastAlgorithmCalibrationStatus: Int =
         AnytimeCalibrationPolicy.CALIBRATION_STATUS_UNKNOWN
     @Volatile private var packetsSinceInit: Int = 0
@@ -226,6 +235,9 @@ class AnytimeBleManager(
     @Volatile private var legacySeriesHistorySupported: Boolean = true
     @Volatile private var historyStopBeforeId: Int = Int.MAX_VALUE
     @Volatile private var historyBackfillReason: String = ""
+    @Volatile private var historyBackfillStartedAfterGlucoseId: Int = -1
+    private val historyCaughtUpCooldown = AnytimeHistoryCaughtUpCooldown(HISTORY_CAUGHT_UP_COOLDOWN_MS)
+    private val historyRoomImportBuffer = AnytimeHistoryRoomImportBuffer()
 
     // If a long one-by-one history pull is interrupted by BLE loss, keep the
     // range and resume it after the next successful handshake/reset instead of
@@ -273,6 +285,8 @@ class AnytimeBleManager(
         bound = AnytimeRegistry.loadBound(context, id)
         lastReferenceBgMgdlTimes10 = AnytimeRegistry.loadReferenceBgMgdlTimes10(context, id)
         lastReferenceBgGlucoseId = AnytimeRegistry.loadReferenceBgGlucoseId(context, id)
+        lastReferenceAppliedGlucoseId = AnytimeRegistry.loadReferenceBgAppliedGlucoseId(context, id)
+        referenceCalibrationRecords = restoreReferenceCalibrationRecords(context, id)
         ct5CipherKey = AnytimeRegistry.loadCt5CipherKey(context, id)
         ct5RandomB = AnytimeRegistry.loadCt5RandomB(context, id)
         ct5TempId = AnytimeRegistry.loadCt5TempId(context, id)
@@ -346,6 +360,74 @@ class AnytimeBleManager(
             calibrationCount = 0,
         )
 
+    private fun restoreReferenceCalibrationRecords(
+        context: Context,
+        sensorId: String,
+    ): List<AnytimeReferenceCalibrationRecord> {
+        val persisted = AnytimeRegistry.loadReferenceBgHistory(context, sensorId)
+        if (persisted.isNotEmpty()) {
+            val latestApplied = persisted
+                .firstOrNull { it.targetGlucoseId == lastReferenceBgGlucoseId }
+                ?.appliedGlucoseId
+                ?: 0
+            if (latestApplied > lastReferenceAppliedGlucoseId) {
+                lastReferenceAppliedGlucoseId = latestApplied
+            }
+            return persisted
+        }
+        if (lastReferenceBgMgdlTimes10 <= 0 || lastReferenceBgGlucoseId <= 0) return emptyList()
+        return listOf(
+            AnytimeReferenceCalibrationRecord(
+                targetGlucoseId = lastReferenceBgGlucoseId,
+                referenceMgdlTimes10 = lastReferenceBgMgdlTimes10,
+                acceptedAtMs = 0L,
+                appliedGlucoseId = lastReferenceAppliedGlucoseId,
+            )
+        )
+    }
+
+    private fun upsertReferenceCalibrationRecord(record: AnytimeReferenceCalibrationRecord) {
+        if (record.targetGlucoseId <= 0 || record.referenceMgdlTimes10 <= 0) return
+        referenceCalibrationRecords = (listOf(record) + referenceCalibrationRecords)
+            .distinctBy { it.targetGlucoseId }
+            .sortedWith(compareByDescending<AnytimeReferenceCalibrationRecord> { it.acceptedAtMs }
+                .thenByDescending { it.targetGlucoseId })
+            .take(MAX_REFERENCE_CALIBRATION_RECORDS)
+    }
+
+    private fun markReferenceCalibrationApplied(
+        targetId: Int,
+        sampleMs: Long,
+        outputMgdlTimes10: Int,
+    ) {
+        if (targetId <= 0 || lastReferenceBgMgdlTimes10 <= 0) return
+        var matched = false
+        referenceCalibrationRecords = referenceCalibrationRecords.map { record ->
+            if (record.targetGlucoseId == targetId) {
+                matched = true
+                record.copy(
+                    appliedGlucoseId = targetId,
+                    appliedAtMs = sampleMs,
+                    outputMgdlTimes10 = outputMgdlTimes10,
+                )
+            } else {
+                record
+            }
+        }
+        if (!matched) {
+            upsertReferenceCalibrationRecord(
+                AnytimeReferenceCalibrationRecord(
+                    targetGlucoseId = targetId,
+                    referenceMgdlTimes10 = lastReferenceBgMgdlTimes10,
+                    acceptedAtMs = 0L,
+                    appliedGlucoseId = targetId,
+                    appliedAtMs = sampleMs,
+                    outputMgdlTimes10 = outputMgdlTimes10,
+                )
+            )
+        }
+    }
+
     private fun persistAlgorithmState() {
         val ctx = Applic.app ?: return
         val id = SerialNumber ?: return
@@ -363,6 +445,8 @@ class AnytimeBleManager(
         AnytimeRegistry.saveWarmupStartedAt(ctx, id, warmupStartedAtMs)
         AnytimeRegistry.saveReferenceBgMgdlTimes10(ctx, id, lastReferenceBgMgdlTimes10)
         AnytimeRegistry.saveReferenceBgGlucoseId(ctx, id, lastReferenceBgGlucoseId)
+        AnytimeRegistry.saveReferenceBgAppliedGlucoseId(ctx, id, lastReferenceAppliedGlucoseId)
+        AnytimeRegistry.saveReferenceBgHistory(ctx, id, referenceCalibrationRecords)
         saveCachedBatteryVolts(ctx, id, lastBatteryVolts)
         AnytimeRegistry.saveRawHistory(ctx, id, synchronized(rawAlgorithmWindow) { rawAlgorithmWindow.values.toList() })
         AnytimeRegistry.saveCt5CipherKey(ctx, id, ct5CipherKey)
@@ -442,6 +526,11 @@ class AnytimeBleManager(
         if (phase != Phase.STREAMING) return@Runnable
         if (historyPullInFlight) return@Runnable
         var nextId = nextBackfillIdSkippingCached((historyLastPulledId + 1).coerceAtLeast(0))
+        if (shouldSuppressCaughtUpBackfill(nextId, historyStopBeforeId, historyBackfillReason)) {
+            Log.d(TAG, "Backfill suppressed by caught-up cooldown ($historyBackfillReason, nextId=$nextId)")
+            finishHistoryBackfill()
+            return@Runnable
+        }
         if (nextId >= historyStopBeforeId) {
             Log.i(TAG, "Backfill range complete ($historyBackfillReason, nextId=$nextId stopBefore=$historyStopBeforeId)")
             finishHistoryBackfill()
@@ -531,6 +620,27 @@ class AnytimeBleManager(
         return id
     }
 
+    private fun markHistoryCaughtUp(nextRequestId: Int) {
+        historyCaughtUpCooldown.markCaughtUp(nextRequestId)
+    }
+
+    private fun clearCaughtUpCooldownIfNewerData(glucoseId: Int) {
+        historyCaughtUpCooldown.clearIfNewerData(glucoseId)
+    }
+
+    private fun shouldSuppressCaughtUpBackfill(
+        startId: Int,
+        stopBeforeId: Int,
+        reason: String,
+    ): Boolean {
+        return historyCaughtUpCooldown.shouldSuppressBackfill(
+            startId = startId,
+            stopBeforeId = stopBeforeId,
+            reason = reason,
+            lastGlucoseId = lastGlucoseId,
+        )
+    }
+
     /**
      * Start (or resume) the history backfill loop.
      * Clean/manual backfill can explicitly start from 0. Reconnect backfill must
@@ -549,6 +659,11 @@ class AnytimeBleManager(
         }
         val startId = fromId.coerceAtLeast(0)
         val stopId = stopBeforeId.coerceAtLeast(startId)
+        if (shouldSuppressCaughtUpBackfill(startId, stopId, reason)) {
+            Log.d(TAG, "Skipping backfill during caught-up cooldown ($reason, start=$startId)")
+            maybeStartPendingFreshOlderBackfill()
+            return
+        }
         if (startId >= stopId) {
             Log.i(TAG, "Skipping empty backfill range ($reason, start=$startId stopBefore=$stopId)")
             maybeStartPendingFreshOlderBackfill()
@@ -558,6 +673,7 @@ class AnytimeBleManager(
         historyBackfillActive = true
         historyBackfillReason = reason
         historyStopBeforeId = stopId
+        historyBackfillStartedAfterGlucoseId = lastGlucoseId
         historyEmptyResponsesInARow = 0
         historyLastPulledId = startId - 1
         historyPullInFlight = false
@@ -644,6 +760,16 @@ class AnytimeBleManager(
 
     private fun isFreshRecentBackfillReason(reason: String = historyBackfillReason): Boolean =
         reason.startsWith("post-live-anchor(recent)")
+
+    private fun isReconnectCatchupBackfillReason(reason: String = historyBackfillReason): Boolean =
+        reason.startsWith("post-reset(reconnect)") || reason.startsWith("interrupted")
+
+    private fun shouldSkipBackfillLiveRace(glucoseId: Int): Boolean {
+        if (!historyBackfillActive || !isReconnectCatchupBackfillReason()) return false
+        val startedAfter = historyBackfillStartedAfterGlucoseId
+        if (startedAfter < 0) return false
+        return glucoseId > startedAfter && glucoseId <= lastGlucoseId
+    }
 
     private fun hasContiguousRawHistoryThrough(targetId: Int): Boolean {
         return firstMissingRawHistoryIdThrough(targetId) == null
@@ -734,6 +860,7 @@ class AnytimeBleManager(
         historyPullInFlightWasLegacySeries = false
         historyStopBeforeId = Int.MAX_VALUE
         historyBackfillReason = ""
+        historyBackfillStartedAfterGlucoseId = -1
         clearHistoryPullTimeout()
         handler.removeCallbacks(historyBackfillRunnable)
     }
@@ -1564,11 +1691,19 @@ class AnytimeBleManager(
             lastReferenceBgMgdlTimes10 = pendingFingerstickMgdl * 10
             lastReferenceBgGlucoseId = pendingFingerstickTargetGlucoseId
             lastReferenceAppliedGlucoseId = 0
+            upsertReferenceCalibrationRecord(
+                AnytimeReferenceCalibrationRecord(
+                    targetGlucoseId = lastReferenceBgGlucoseId,
+                    referenceMgdlTimes10 = lastReferenceBgMgdlTimes10,
+                    acceptedAtMs = System.currentTimeMillis(),
+                )
+            )
             Log.i(TAG, "Fingerstick BG ${pendingFingerstickMgdl}mg/dL will calibrate glucose id=$lastReferenceBgGlucoseId")
             setCalibrationStatus(
                 resId = R.string.anytime_calibration_accepted_status,
                 fallback = "Calibration accepted; applies from reading #$lastReferenceBgGlucoseId",
                 lastReferenceBgGlucoseId,
+                clearAfterGlucoseId = lastReferenceBgGlucoseId + 1,
             )
         }
         pendingFingerstickMgdl = -1
@@ -1577,38 +1712,62 @@ class AnytimeBleManager(
         UiRefreshBus.requestStatusRefresh()
     }
 
-    private fun setCalibrationStatus(resId: Int, fallback: String, vararg args: Any) {
+    private fun setCalibrationStatus(
+        resId: Int,
+        fallback: String,
+        vararg args: Any,
+        clearAfterGlucoseId: Int = 0,
+    ) {
         val localized = Applic.app?.let { context ->
             runCatching { context.getString(resId, *args) }.getOrNull()
         }
         calibrationStatusText = localized ?: fallback
         calibrationStatusAtMs = System.currentTimeMillis()
+        calibrationStatusClearAfterGlucoseId = clearAfterGlucoseId
+        UiRefreshBus.requestStatusRefresh()
+    }
+
+    private fun clearCalibrationStatus() {
+        calibrationStatusText = ""
+        calibrationStatusAtMs = 0L
+        calibrationStatusClearAfterGlucoseId = 0
         UiRefreshBus.requestStatusRefresh()
     }
 
     private fun visibleCalibrationStatus(): String {
         val status = calibrationStatusText
         if (status.isBlank()) return ""
+        val clearAfter = calibrationStatusClearAfterGlucoseId
+        if (clearAfter > 0 && lastGlucoseId >= clearAfter) {
+            clearCalibrationStatus()
+            return ""
+        }
         val ageMs = System.currentTimeMillis() - calibrationStatusAtMs
         return if (ageMs <= CALIBRATION_STATUS_TTL_MS) status else ""
     }
 
-    private fun maybeMarkReferenceConsumed(result: AnytimeAlgorithm.Result) {
+    private fun maybeMarkReferenceConsumed(result: AnytimeAlgorithm.Result, sampleMs: Long) {
         val targetId = lastReferenceBgGlucoseId
         if (targetId <= 0 || result.glucoseId < targetId || lastReferenceAppliedGlucoseId >= targetId) return
         lastReferenceAppliedGlucoseId = targetId
+        markReferenceCalibrationApplied(
+            targetId = targetId,
+            sampleMs = sampleMs,
+            outputMgdlTimes10 = result.mgdlTimes10,
+        )
         val enteredMgdl = lastReferenceBgMgdlTimes10 / 10f
         Log.i(
             TAG,
             "Fingerstick BG reference ${"%.1f".format(enteredMgdl)}mg/dL consumed at " +
                     "glucose id=$targetId by ${result.source}; algorithm output=${"%.1f".format(result.mgdl)}mg/dL"
         )
-        setCalibrationStatus(
-            resId = R.string.anytime_calibration_used_status,
-            fallback = "Calibration used at reading #$targetId: ${"%.0f".format(result.mgdl)} mg/dL",
-            targetId,
-            result.mgdl,
-        )
+//        setCalibrationStatus(
+//            resId = R.string.anytime_calibration_used_status,
+//            fallback = "Calibration used at reading #$targetId: ${"%.0f".format(result.mgdl)} mg/dL",
+//            targetId,
+//            result.mgdl,
+//        )
+        persistAlgorithmState()
     }
 
     private fun handleUnbindAck() {
@@ -1783,6 +1942,8 @@ class AnytimeBleManager(
                 historyEmptyResponsesInARow++
                 if (historyEmptyResponsesInARow >= HISTORY_EMPTY_RESPONSES_TO_STOP) {
                     Log.i(TAG, "Backfill caught up at id=$lastGlucoseId after $historyEmptyResponsesInARow empty responses")
+                    markHistoryCaughtUp((historyLastPulledId + 1).coerceAtLeast(0))
+                    flushPendingHistoryRoomImports()
                     finishHistoryBackfill()
                 } else {
                     handler.postDelayed(historyBackfillRunnable, HISTORY_PULL_BATCH_DELAY_MS)
@@ -1802,15 +1963,27 @@ class AnytimeBleManager(
         val now = System.currentTimeMillis()
         val anchorId = records.maxOfOrNull { it.glucoseId } ?: -1
         val anchorMs = if (push && anchorId >= 0) now else 0L
+        if (anchorId >= 0) {
+            clearCaughtUpCooldownIfNewerData(anchorId)
+        }
         if (push && anchorMs > 0L && anchorId >= 0) {
             updateTimelineFromLiveGlucoseId(anchorId, anchorMs, intervalMs)
             maybeStartFreshPostLiveBackfill(anchorId)
         }
         for (rec in records) {
-            packetsSinceInit++
             synchronized(rawAlgorithmWindow) {
                 rawAlgorithmWindow[rec.glucoseId] = rec
             }
+            if (!push && shouldSkipBackfillLiveRace(rec.glucoseId)) {
+                Log.i(
+                    TAG,
+                    "Skipping duplicate backfill id=${rec.glucoseId}; live push already " +
+                            "processed during $historyBackfillReason"
+                )
+                synchronized(pendingNativeRecomputeIds) { pendingNativeRecomputeIds.remove(rec.glucoseId) }
+                continue
+            }
+            packetsSinceInit++
             lastIwNa = rec.iwNa
             lastIbNa = rec.ibNa
             lastTemperatureC = rec.temperatureC
@@ -1850,7 +2023,7 @@ class AnytimeBleManager(
                 skipHistoryImport = skipHistoryImport,
             )
             if (committed) {
-                maybeMarkReferenceConsumed(result)
+                maybeMarkReferenceConsumed(result, sampleMs)
             }
             trackNativeRecomputeNeed(result)
             if (rec.glucoseId > lastGlucoseId) lastGlucoseId = rec.glucoseId
@@ -1861,6 +2034,7 @@ class AnytimeBleManager(
         if (!push && !isFreshRecentBackfillReason() && !historyBackfillReason.startsWith("post-live-anchor(older-background)")) {
             recomputePendingNativeReadings(context, intervalMs)
         }
+        flushPendingHistoryRoomImports()
         persistAlgorithmState()
         armNoDataWatchdog()
         armPullFallback()
@@ -1963,6 +2137,7 @@ class AnytimeBleManager(
             commitReading(result, sampleMs, context, live = false, history = true)
             synchronized(pendingNativeRecomputeIds) { pendingNativeRecomputeIds.remove(id) }
         }
+        flushPendingHistoryRoomImports()
     }
 
     private fun handleComputedGlucose(data: ByteArray) {
@@ -2006,6 +2181,7 @@ class AnytimeBleManager(
         val intervalMs = profile.readingIntervalMinutes * 60L * 1000L
         val now = System.currentTimeMillis()
         updateTimelineFromLiveGlucoseId(rec.glucoseId, now, intervalMs)
+        clearCaughtUpCooldownIfNewerData(rec.glucoseId)
         maybeStartFreshPostLiveBackfill(rec.glucoseId)
         val sampleMs = if (glucoseTimelineStartAtMs > 0L) {
             glucoseTimelineStartAtMs + rec.glucoseId.toLong() * intervalMs
@@ -2050,6 +2226,8 @@ class AnytimeBleManager(
                 historyEmptyResponsesInARow++
                 if (historyEmptyResponsesInARow >= HISTORY_EMPTY_RESPONSES_TO_STOP) {
                     Log.i(TAG, "CT5 backfill caught up at id=$lastGlucoseId")
+                    markHistoryCaughtUp((historyLastPulledId + 1).coerceAtLeast(0))
+                    flushPendingHistoryRoomImports()
                     finishHistoryBackfill()
                 } else {
                     handler.postDelayed(historyBackfillRunnable, HISTORY_PULL_BATCH_DELAY_MS)
@@ -2061,6 +2239,7 @@ class AnytimeBleManager(
         historyEmptyResponsesInARow = 0
         records.maxOfOrNull { it.glucoseId }?.let { maxId ->
             if (maxId > historyLastPulledId) historyLastPulledId = maxId
+            clearCaughtUpCooldownIfNewerData(maxId)
         }
         val intervalMs = profile.readingIntervalMinutes * 60L * 1000L
         val now = System.currentTimeMillis()
@@ -2076,9 +2255,18 @@ class AnytimeBleManager(
             }
             anchorSensorTimelineIfNeeded(rec.glucoseId, sampleMs, intervalMs)
             val result = AnytimeAlgorithm.fromComputedRecord(rec, qr, familyEntry)
+            if (shouldSkipBackfillLiveRace(rec.glucoseId)) {
+                Log.i(
+                    TAG,
+                    "Skipping duplicate CT5 backfill id=${rec.glucoseId}; live push already " +
+                            "processed during $historyBackfillReason"
+                )
+                continue
+            }
             commitReading(result, sampleMs, Applic.app, live = false, history = true)
             if (rec.glucoseId > lastGlucoseId) lastGlucoseId = rec.glucoseId
         }
+        flushPendingHistoryRoomImports()
         persistAlgorithmState()
         armNoDataWatchdog()
         armPullFallback()
@@ -2187,7 +2375,11 @@ class AnytimeBleManager(
         // and was producing duplicate phantom rows such as 25.9 (mmol*10) beside
         // the Room-managed 2.59 mmol/L point.
         if (!skipHistoryImport) {
-            mirrorReadingIntoRoom(sampleMs, result)
+            if (history && !live) {
+                queueHistoryReadingForRoom(sampleMs, result)
+            } else {
+                mirrorReadingIntoRoom(sampleMs, result)
+            }
         } else {
             Log.d(TAG, "Skipping startup provisional Room import id=${result.glucoseId} source=${result.source}")
         }
@@ -2213,6 +2405,47 @@ class AnytimeBleManager(
     // Intentionally unused: managed Anytime history must not be mirrored into
     // native SensorGlucoseData. Current/live updates go through emitGlucose();
     // history rows go through VirtualGlucoseSensorBridge.importHistory().
+
+    private fun queueHistoryReadingForRoom(sampleMs: Long, result: AnytimeAlgorithm.Result) {
+        if (!historyRoomImportBuffer.queue(sampleMs, result)) {
+            Log.d(
+                TAG,
+                "Skipping duplicate Anytime ${result.source} history import id=${result.glucoseId} " +
+                        "sample=$sampleMs"
+            )
+        }
+    }
+
+    private fun flushPendingHistoryRoomImports() {
+        val name = SerialNumber ?: return
+        val pending = historyRoomImportBuffer.drain()
+        if (pending.isEmpty()) return
+        pending.groupBy { it.source }.forEach { (source, imports) ->
+            runCatching {
+                val imported = VirtualGlucoseSensorBridge.importHistory(
+                    sensorSerial = name,
+                    readings = imports.map { it.reading },
+                    logLabel = "Anytime $source",
+                    nearDuplicateWindowMs = if (source == AnytimeAlgorithm.Source.LINEAR) {
+                        HISTORY_ROOM_IMPORT_NEAR_DUPLICATE_MS
+                    } else {
+                        0L
+                    },
+                )
+                if (imported > 0) {
+                    val firstId = imports.firstOrNull()?.glucoseId
+                    val lastId = imports.lastOrNull()?.glucoseId
+                    val raw = imports.lastOrNull()?.rawMgdl ?: Float.NaN
+                    Log.i(
+                        TAG,
+                        "Imported $imported Anytime $source history points into Room " +
+                                "(ids=$firstId..$lastId rawLast=${"%.1f".format(raw)} mg/dL)"
+                    )
+                    historyRoomImportBuffer.markImported(imports)
+                }
+            }.onFailure { Log.stack(TAG, "flushPendingHistoryRoomImports", it) }
+        }
+    }
 
     private fun mirrorReadingIntoRoom(sampleMs: Long, result: AnytimeAlgorithm.Result) {
         val name = SerialNumber ?: return
@@ -2328,7 +2561,15 @@ class AnytimeBleManager(
     }
 
     override fun pushReferenceBg(mgdl: Int): Boolean {
-        if (mgdl <= 0 || lastGlucoseId < 0) return false
+        if (mgdl <= 0) return false
+        if (lastGlucoseId < 0) {
+            Log.w(TAG, "pushReferenceBg($mgdl) rejected — waiting for first glucose id")
+            setCalibrationStatus(
+                resId = R.string.anytime_calibration_waiting_for_reading_status,
+                fallback = "Calibration unavailable; waiting for first reading",
+            )
+            return false
+        }
         val ageHours = getSensorAgeHours()
         if (!AnytimeCalibrationPolicy.canAcceptManualCalibration(ageHours)) {
             val ageLabel = if (ageHours >= 0) "${ageHours}h" else "unknown"
@@ -2337,6 +2578,10 @@ class AnytimeBleManager(
                 "pushReferenceBg($mgdl) rejected — manual calibration unavailable before " +
                         "${AnytimeCalibrationPolicy.MANUAL_CALIBRATION_MIN_AGE_HOURS}h (age=$ageLabel)"
             )
+            setCalibrationStatus(
+                resId = R.string.anytime_calibration_after_24h_status,
+                fallback = "Calibration unavailable before 24h",
+            )
             return false
         }
         if (!AnytimeCalibrationPolicy.canAcceptAlgorithmCalibrationStatus(lastAlgorithmCalibrationStatus)) {
@@ -2344,6 +2589,10 @@ class AnytimeBleManager(
                 TAG,
                 "pushReferenceBg($mgdl) rejected — native calibration status is " +
                         AnytimeCalibrationPolicy.calibrationStatusName(lastAlgorithmCalibrationStatus)
+            )
+            setCalibrationStatus(
+                resId = R.string.anytime_calibration_not_allowed_status,
+                fallback = "Calibration not allowed by sensor right now",
             )
             return false
         }
@@ -2371,9 +2620,16 @@ class AnytimeBleManager(
             Log.w(TAG, "pushReferenceBg($mgdl) deferred — not streaming (phase=$phase)")
             pendingFingerstickMgdl = -1
             pendingFingerstickTargetGlucoseId = -1
+            setCalibrationStatus(
+                resId = R.string.anytime_calibration_not_streaming_status,
+                fallback = "Calibration unavailable while sensor is not streaming",
+            )
             false
         }
     }
+
+    override fun getReferenceCalibrationRecords(): List<AnytimeReferenceCalibrationRecord> =
+        referenceCalibrationRecords
 
 
     override fun softDisconnect() {
@@ -2495,7 +2751,7 @@ class AnytimeBleManager(
     override fun getStartTimeMs(): Long = sensorStartAtMs
     override fun getOfficialEndMs(): Long =
         if (sensorStartAtMs <= 0L) 0L else sensorStartAtMs + profile.ratedLifetimeMs()
-    override fun getExpectedEndMs(): Long = getOfficialEndMs()
+    override fun getExpectedEndMs(): Long = 0L
     override fun isSensorExpired(): Boolean {
         val end = getOfficialEndMs()
         return end > 0L && System.currentTimeMillis() > end
