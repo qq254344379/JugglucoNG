@@ -27,8 +27,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    outputs:
-      short_sha: ${{ steps.sha.outputs.SHORT_SHA }}
     
     steps:
       - name: Checkout code
@@ -36,10 +34,6 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-
-      - name: Get short SHA
-        id: sha
-        run: echo "SHORT_SHA=${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -94,8 +88,8 @@ jobs:
       - name: Upload APK to Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk-${{ needs.build.outputs.short_sha }}
-          name: JugglucoNG Build ${{ needs.build.outputs.short_sha }}
+          tag_name: build-${{ github.run_number }}
+          name: JugglucoNG Build ${{ github.run_number }}
           files: ${{ steps.apk.outputs.apk_path }}
           overwrite: true
         env:
