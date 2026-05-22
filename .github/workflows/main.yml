@@ -93,3 +93,4 @@ jobs:
           files: ${{ steps.apk.outputs.apk_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# Trigger new build
