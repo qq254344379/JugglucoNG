@@ -5,29 +5,26 @@
 // This factory lives in tk.glucodata.drivers.aidex (Java-accessible) and
 // delegates to classes in tk.glucodata.drivers.aidex.native.ble (Kotlin-only).
 //
-// SensorBluetooth.java uses this to conditionally create AiDexBleManager
-// instead of the vendor-lib-based AiDexSensor.
+// SensorBluetooth.java uses this to create AiDexBleManager without importing
+// from a Java-reserved package name.
 
 package tk.glucodata.drivers.aidex
 
-import android.content.Context
 import tk.glucodata.Log
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.drivers.aidex.native.ble.AiDexBleManager
 import tk.glucodata.drivers.aidex.native.protocol.AiDexDpCatalogProvider
+import tk.glucodata.drivers.aidex.native.protocol.AiDexPairingMaterialRegistry
 
 /**
  * Factory bridge that SensorBluetooth.java can call without importing from
  * the `native` package (which Java cannot do).
  *
- * Most UI code now uses `instanceof AiDexDriver` (the shared interface) to
- * detect either driver implementation. These factory helpers remain for:
+ * UI code uses `instanceof AiDexDriver` while these helpers remain for:
  * - Creating native driver instances (createBleManager)
- * - Checking native mode preference (isNativeModeEnabled)
  * - Specifically identifying the native driver (isNativeAiDex)
  *
  * Usage from Java:
- *   AiDexNativeFactory.INSTANCE.isNativeModeEnabled(context)
  *   AiDexNativeFactory.INSTANCE.createBleManager(serial, dataptr)
  *   AiDexNativeFactory.INSTANCE.isNativeAiDex(callback)
  */
@@ -36,15 +33,9 @@ object AiDexNativeFactory {
     private const val TAG = "AiDexNativeFactory"
 
     /**
-     * Native Kotlin driver is always enabled — it replaces the vendor native lib.
-     */
-    @JvmStatic
-    fun isNativeModeEnabled(context: Context? = null): Boolean = true
-
-    /**
      * Create an [AiDexBleManager] (native Kotlin driver) as a [SuperGattCallback].
      *
-     * Drop-in replacement for `new AiDexSensor(context, serial, dataptr)`.
+     * The sole AiDex driver implementation after removal of the vendor-library driver.
      * The sensorGen is set to 0 (conventional value for AiDex).
      *
      * @param serial Sensor serial number (with or without "X-" prefix)
@@ -58,10 +49,29 @@ object AiDexNativeFactory {
     }
 
     /**
+     * Install already-decoded, sensor-specific pairing material for subsequent AiDex key
+     * exchanges in this process. Persistence, when desired, is handled by
+     * [AiDexProvisioningStore]. Callers must supply exactly two decoded 16-byte values. Their
+     * contents are never logged.
+     */
+    @JvmStatic
+    fun installProvisionedPairingMaterial(
+        serial: String,
+        secret: ByteArray,
+        iv: ByteArray,
+    ): Boolean = AiDexPairingMaterialRegistry.install(serial, secret, iv)
+
+    /** Remove process-local provisioned pairing material for a sensor. */
+    @JvmStatic
+    fun clearProvisionedPairingMaterial(serial: String) {
+        AiDexPairingMaterialRegistry.remove(serial)
+    }
+
+    /**
      * Check whether a [SuperGattCallback] is an instance of our native [AiDexBleManager].
      *
-     * Java code can use `instanceof AiDexDriver` to check for *any* AiDex driver,
-     * but this method specifically identifies the native Kotlin driver (vs vendor-lib).
+     * Java code can use `instanceof AiDexDriver` for the shared contract; this
+     * method specifically identifies the concrete native manager.
      */
     @JvmStatic
     fun isNativeAiDex(callback: SuperGattCallback?): Boolean {

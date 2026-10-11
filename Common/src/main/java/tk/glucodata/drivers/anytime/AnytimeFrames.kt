@@ -11,6 +11,8 @@
 //   AnytimeFrames.parseRawRecords(bytes)     — 9-byte or 11-byte raw records
 //   AnytimeFrames.parseWideRawSeriesRecords  — 0x22 CT2.5/CT3A/CT4 history batches
 //   AnytimeFrames.parseComputedRecord(bytes) — 19-byte computed glucose record
+//   AnytimeFrames.parseCt5CurrentRecord      — CT5 0x35 live push (see hasGlucose)
+//   AnytimeFrames.parseCt5SeriesRecords      — CT5 0x37 history batch (see hasGlucose)
 //   AnytimeFrames.parseCheckResponse(bytes)  — 0x05 health response
 //   AnytimeFrames.parseResetResponse(bytes)  — 0x11 reset response
 
@@ -29,7 +31,17 @@ data class AnytimeRawRecord(
     val recordBytes: ByteArray,
 )
 
-/** 19-byte computed-glucose record (CT5 push, CT3 on demand). */
+/**
+ * 19-byte computed-glucose record (CT5 push, CT3 on demand).
+ *
+ * A CT5 frame has three possible outcomes, and they must stay distinguishable:
+ *   1. malformed          — parser returns null
+ *   2. valid, no glucose  — [hasGlucose] false; warm-up telemetry, no reading
+ *   3. valid with glucose — [hasGlucose] true
+ *
+ * Collapsing (2) into (1) is what used to make every warm-up push look like a
+ * "bad frame" and left a fresh sensor effectively unknown until first glucose.
+ */
 data class AnytimeComputedRecord(
     val glucoseId: Int,
     val hypoEarlyWarnMinutes: Int,
@@ -42,9 +54,34 @@ data class AnytimeComputedRecord(
     val errorCode: Int,
     val trend: Int,
     val warnCode: Int,
+    /** False for a protocol-valid record the sensor has not computed glucose for yet. */
+    val hasGlucose: Boolean = true,
+    /**
+     * Electrode potentials, present only in the 15-byte "voltage" chunk. BE/WE/RE are the
+     * potentiostat's own setpoints and hold constant on healthy hardware, so their value is
+     * that a *change* means the front end has lost control. CE is the potential needed to
+     * sustain the working current: mostly a function of Iw, with a slow residual that tracks
+     * electrode ageing. [Int.MIN_VALUE] when the chunk does not carry them.
+     */
+    val beVoltageMv: Int = Int.MIN_VALUE,
+    val weVoltageMv: Int = Int.MIN_VALUE,
+    val reVoltageMv: Int = Int.MIN_VALUE,
+    val ceVoltageMv: Int = Int.MIN_VALUE,
+    /**
+     * Transmitter supply reading, raw. The vendor app forwards this to its server without
+     * scaling or displaying it, and no CT5 check frame has ever answered on this hardware,
+     * so the unit is unverified — it is NOT fed to the battery-percentage path, where a
+     * wrong scale would raise a false low-battery alarm.
+     */
+    val batteryRaw: Int = Int.MIN_VALUE,
 ) {
     val gluMgdl: Int get() = (gluMmol * 18.0f + 0.5f).toInt()
 }
+
+data class AnytimeCt5CipherCandidate(
+    val cipherKey: Int,
+    val record: AnytimeComputedRecord,
+)
 
 /** 0x05 check-response — battery, sensor age, IW. */
 data class AnytimeCheckStatus(
@@ -62,6 +99,21 @@ data class AnytimeCheckStatus(
 /** 0x11 reset response. byte 2 != 0 ⇒ device was bound. */
 data class AnytimeResetStatus(val isBound: Boolean)
 
+/**
+ * Strict 0x11 bind-state answer, mirroring the vendor SDK's `TransmitterReset`:
+ * it demands 14 bytes before it will read [isBound] at all, and only reads the
+ * unbind reason out of byte 8 when the tip byte 12 is 0x22.
+ *
+ * The transmitter is the only witness to whether an unbind actually landed, so
+ * an under-validated answer here is worse than none — hence the separate,
+ * stricter parse rather than reusing [AnytimeResetStatus].
+ */
+data class AnytimeCt5BindState(
+    val isBound: Boolean,
+    /** `UNBIND_CHARGE`(1) / `UNBIND_OTHER`(0), or -1 when the transmitter did not say. */
+    val unbindReason: Int,
+)
+
 /** Generic frame parsed from a notification. */
 data class AnytimeFrame(
     val opcode: Byte,
@@ -70,6 +122,39 @@ data class AnytimeFrame(
 ) {
     val opcodeUnsigned: Int get() = opcode.toInt() and 0xFF
 }
+
+/**
+ * One CT2 glucose record, shared by the live push (0x44) and the pull response
+ * (0x47). Both opcodes use the identical 15-byte layout; only byte 13 differs in
+ * semantics (real battery on push, 0xFF sentinel on historical pull).
+ */
+data class Ct2GlucoseFrame(
+    val record: AnytimeRawRecord,
+    val isHistorical: Boolean,
+    val batteryPercent: Int?,
+    /**
+     * True when this pull response (0x47) is the transmitter's own end-of-history
+     * marker rather than a real record: `id == 0xFFFF`. Mirrors the original
+     * POCTech xDrip driver (`x3/t.java`, method `R()`), which reads the id as a
+     * signed 16-bit short — any id with the top bit set (>= 0x8000) sign-extends
+     * negative there. Real CT2 ids never approach that range (a few thousand over
+     * a 14-day life), so any out-of-range id is unambiguously the sentinel, not
+     * corrupted data. `record` is still populated (Ib/Iw/T decode fine) but must
+     * not be treated as a real reading when this is true.
+     */
+    val isEndOfHistory: Boolean = false,
+)
+
+/** CT2 self-test (0x43) response. */
+data class Ct2CheckResult(
+    val iwNa: Float,
+    val ibNa: Float,
+    val temperatureC: Float,
+    /** byte 6 — used by the vendor SDK as a power gate; scale not confirmed live. */
+    val powerByte: Int,
+    /** temp < 50 && powerByte >= 50 — vendor logic, kept verbatim (see plan §3.3). */
+    val passed: Boolean,
+)
 
 object AnytimeFrames {
 
@@ -155,6 +240,15 @@ object AnytimeFrames {
         /** {0x0A, 0x55, 0xAA, sum} — CT2.5/CT3A/CT4 unbind. */
         @JvmStatic
         fun unbindSummed(): ByteArray = withSum(0x0A, 0x55, 0xAA)
+
+        /**
+         * `{0x58, 0x55, 0xAA, 0x57}` — the vendor SDK's family-less
+         * `ProtocolToolsHolder.unBindRequest()`, reached by every device whose
+         * `EGattMessage` has no branch of its own. Not the CT5 call path, but
+         * the firmware may still answer it.
+         */
+        @JvmStatic
+        fun unbindGeneric(): ByteArray = withSum(0x58, 0x55, 0xAA)
 
         /** {0x03, year-1900, mon+1, day, hour, min, sec}. */
         @JvmStatic
@@ -357,6 +451,15 @@ object AnytimeFrames {
         @JvmStatic
         fun ct5PushAck(): ByteArray = withSum(AnytimeConstants.TX_CT5_PUSH_ACK.toInt() and 0xFF, 0x55, 0xAA)
 
+        /**
+         * CT5 bind-state query — `{0x11, 0x55, 0xAA, 0x10}`. CT5 shares the
+         * CT2.5 frame here (`ProtocolTools.reset_request` routes CT5 to
+         * `resetRequest_CT2_5`); it reads the transmitter's bind flag and does
+         * not change it. Answer parsed by [parseCt5BindState].
+         */
+        @JvmStatic
+        fun ct5BindStateQuery(): ByteArray = withSum(AnytimeConstants.TX_RESET.toInt() and 0xFF, 0x55, 0xAA)
+
         /** CT5 series-history pull. */
         @JvmStatic
         @JvmOverloads
@@ -375,11 +478,18 @@ object AnytimeFrames {
         fun ct5InputBgMg(mgdl: Int): ByteArray =
             withSum(0x09, (mgdl ushr 8) and 0xFF, mgdl and 0xFF)
 
-        /** CT5 unbind needs the same four-character temp id used during setup. */
+        /** CT5 end-cycle frame: opcode 0x0A + the authenticated four-byte temporary id. */
         @JvmStatic
-        fun ct5Unbind(tempId: String): ByteArray {
-            val bytes = tempId.take(4).padStart(4, '0').toByteArray(Charsets.US_ASCII)
-            return withSum(0x0A, bytes[0].toInt(), bytes[1].toInt(), bytes[2].toInt(), bytes[3].toInt())
+        fun ct5EndCycle(tempId: String): ByteArray {
+            val id = tempId.toByteArray(Charsets.US_ASCII)
+            require(tempId.length == 4 && id.size == 4) { "CT5 temporary id must be four ASCII bytes" }
+            return withSum(
+                AnytimeConstants.TX_CT5_END_CYCLE.toInt() and 0xFF,
+                id[0].toInt() and 0xFF,
+                id[1].toInt() and 0xFF,
+                id[2].toInt() and 0xFF,
+                id[3].toInt() and 0xFF,
+            )
         }
 
         /** CT5 encrypted K/R + temporary id setup. */
@@ -403,6 +513,76 @@ object AnytimeFrames {
             encrypted.copyInto(frame, destinationOffset = 1)
             frame[13] = sum(frame, 0, 12)
             return frame
+        }
+
+        /** CT2 version request: {0x03}. */
+        @JvmStatic
+        fun ct2Version(): ByteArray = byteArrayOf(AnytimeConstants.TX_CT2_VERSION)
+
+        /** CT2 handshake: {0x48, ASCII(deviceName), sum}. */
+        @JvmStatic
+        fun ct2Handshake(deviceName: String): ByteArray {
+            val name = deviceName.toByteArray(Charsets.US_ASCII)
+            val frame = ByteArray(2 + name.size)
+            frame[0] = AnytimeConstants.TX_CT2_HANDSHAKE
+            name.copyInto(frame, destinationOffset = 1)
+            frame[frame.lastIndex] = sum(frame, 0, frame.lastIndex - 1)
+            return frame
+        }
+
+        /**
+         * CT2 setDate: {0x54, yearHi, yearLo, month, day, hour, minute, second, sum}.
+         * Year is encoded WITHOUT subtracting 2000 (unlike the RX record where
+         * year = byte + 2000).
+         */
+        @JvmStatic
+        @JvmOverloads
+        fun ct2SetDate(calendar: Calendar = Calendar.getInstance()): ByteArray {
+            val year = calendar.get(Calendar.YEAR) and 0xFFFF
+            return withSum(
+                AnytimeConstants.TX_CT2_SET_DATE.toInt() and 0xFF,
+                (year ushr 8) and 0xFF,
+                year and 0xFF,
+                calendar.get(Calendar.MONTH) + 1,
+                calendar.get(Calendar.DAY_OF_MONTH),
+                calendar.get(Calendar.HOUR_OF_DAY),
+                calendar.get(Calendar.MINUTE),
+                calendar.get(Calendar.SECOND),
+            )
+        }
+
+        @JvmStatic
+        fun ct2Init(): ByteArray = byteArrayOf(0x53, 0x55, 0xAA.toByte(), 0x52)
+
+        @JvmStatic
+        fun ct2Check(): ByteArray = byteArrayOf(0x43, 0x55, 0xAA.toByte(), 0x42)
+
+        @JvmStatic
+        fun ct2LowPower(): ByteArray = byteArrayOf(0x57, 0x55, 0xAA.toByte(), 0x56)
+
+        @JvmStatic
+        fun ct2Unbind(): ByteArray = byteArrayOf(0x58, 0x55, 0xAA.toByte(), 0x57)
+
+        /** CT2 pull one record by id: {0x55, idHi, idLo, sum}. */
+        @JvmStatic
+        fun ct2PullGlucose(id: Int): ByteArray {
+            val v = id and 0xFFFF
+            return withSum(
+                AnytimeConstants.TX_CT2_PULL_GLUCOSE.toInt() and 0xFF,
+                (v ushr 8) and 0xFF,
+                v and 0xFF,
+            )
+        }
+
+        /** CT2 fingerstick reference BG, mg/dL big-endian: {0x08, mgdlHi, mgdlLo, sum}. */
+        @JvmStatic
+        fun ct2InputBgMg(mgdl: Int): ByteArray {
+            val v = mgdl and 0xFFFF
+            return withSum(
+                AnytimeConstants.TX_CT2_INPUT_BG_MG.toInt() and 0xFF,
+                (v ushr 8) and 0xFF,
+                v and 0xFF,
+            )
         }
 
         private fun withSum(vararg values: Int): ByteArray {
@@ -510,6 +690,32 @@ object AnytimeFrames {
 
     @JvmStatic
     @JvmOverloads
+    fun inferCt5CipherFromCurrentRecord(
+        bytes: ByteArray,
+        maxGlucoseId: Int = Int.MAX_VALUE,
+    ): AnytimeCt5CipherCandidate? {
+        val voltage = bytes.size == 19
+        val expected = if (voltage) 19 else 15
+        if (bytes.size != expected || bytes[0] != AnytimeConstants.RX_CT5_PUSH_GLUCOSE) return null
+        if (!verifySum(bytes)) return null
+
+        val candidates = ArrayList<AnytimeCt5CipherCandidate>()
+        for (key in 0..255) {
+            val record = parseCt5CurrentRecord(bytes, key) ?: continue
+            if (!looksLikeCt5LiveRecord(record, maxGlucoseId)) continue
+            candidates.add(AnytimeCt5CipherCandidate(key, record))
+        }
+        if (candidates.isEmpty()) return null
+
+        // The CT5 bit transform leaves one trailing payload bit ambiguous, so
+        // complementary keys can decode to identical clinical fields. Accept
+        // only one clinical interpretation, then persist either matching key.
+        val signatures = candidates.map { ct5RecordSignature(it.record) }.distinct()
+        return if (signatures.size == 1) candidates.first() else null
+    }
+
+    @JvmStatic
+    @JvmOverloads
     fun parseCt5SeriesRecords(bytes: ByteArray, cipherKey: Int, voltage: Boolean = false): List<AnytimeComputedRecord> {
         val chunkSize = if (voltage) AnytimeConstants.CT5_VOLTAGE_CHUNK_SIZE else AnytimeConstants.CT5_RAW_CHUNK_SIZE
         if (bytes.isEmpty() || bytes[0] != AnytimeConstants.RX_CT5_SERIES || cipherKey !in 0..255) return emptyList()
@@ -530,6 +736,29 @@ object AnytimeFrames {
         }
         return out
     }
+
+    // A warm-up record (no glucose) is still a plausible live record. Without the
+    // ~10 bits of glucose entropy far more of the 256 keys survive this filter, so
+    // in practice the ambiguity check below rejects rather than guessing — which is
+    // the safe outcome. A fresh activation establishes the cipher through setID.
+    private fun looksLikeCt5LiveRecord(record: AnytimeComputedRecord, maxGlucoseId: Int): Boolean =
+        record.glucoseId in 0..maxGlucoseId &&
+                record.errorCode == 0 &&
+                (!record.hasGlucose || record.gluMgdl in 20..600) &&
+                record.temperatureC in 15f..45f &&
+                record.ibNa in 0f..100f &&
+                record.iwNa in 0f..100f &&
+                record.trend in 0..10
+
+    private fun ct5RecordSignature(record: AnytimeComputedRecord): String =
+        listOf(
+            record.glucoseId,
+            record.hasGlucose,
+            record.gluMgdl,
+            (record.temperatureC * 10f).roundToInt(),
+            record.trend,
+            record.errorCode,
+        ).joinToString(":")
 
     private fun decryptCt5PayloadFrame(bytes: ByteArray, cipherKey: Int): ByteArray {
         val payload = if (bytes.size > 4) bytes.copyOfRange(3, bytes.size - 1) else ByteArray(0)
@@ -580,7 +809,11 @@ object AnytimeFrames {
         val trend = (trendAndHigh ushr 4) and 0x0F
         val glucoseMgdl = ((trendAndHigh and 0x0F) shl 8) or (decoded[offset + 7].toInt() and 0xFF)
         val error = decoded[offset + 8].toInt() and 0xFF
-        if (glucoseMgdl <= 0) return null
+        // glucoseMgdl == 0 is a valid warm-up/status record, not a malformed frame.
+        // Callers use hasGlucose to decide whether a reading may be stored.
+        val hasGlucose = glucoseMgdl > 0
+        // The voltage chunk carries six more bytes the parser used to drop on the floor.
+        val hasVoltages = chunkSize >= AnytimeConstants.CT5_VOLTAGE_CHUNK_SIZE
         return AnytimeComputedRecord(
             glucoseId = glucoseId,
             hypoEarlyWarnMinutes = 0,
@@ -588,11 +821,17 @@ object AnytimeFrames {
             ibNa = ibRaw / 100f,
             iwNa = iwRaw / 100f,
             temperatureC = temperature,
-            gluMmol = glucoseMgdl / 18f,
+            gluMmol = if (hasGlucose) glucoseMgdl / 18f else 0f,
             referenceBgMmol = 0f,
             errorCode = error,
             trend = trend,
             warnCode = 0,
+            hasGlucose = hasGlucose,
+            beVoltageMv = if (hasVoltages) (decoded[offset + 9].toInt() and 0xFF) * 6 else Int.MIN_VALUE,
+            weVoltageMv = if (hasVoltages) (decoded[offset + 10].toInt() and 0xFF) * 6 else Int.MIN_VALUE,
+            reVoltageMv = if (hasVoltages) (decoded[offset + 11].toInt() and 0xFF) * 6 else Int.MIN_VALUE,
+            ceVoltageMv = if (hasVoltages) (decoded[offset + 12].toInt() and 0xFF) * 6 else Int.MIN_VALUE,
+            batteryRaw = if (hasVoltages) u16(decoded[offset + 13], decoded[offset + 14]) else Int.MIN_VALUE,
         )
     }
 
@@ -702,11 +941,18 @@ object AnytimeFrames {
      * Parse `pullGlucoseRequest_series_CT2_5(id, count)` responses:
      * `{0x22, startIdLo, startIdHi, N * [ibHi, ibLo, iwHi, iwLo, t+40, tFrac], sum}`.
      * Official parser accepts both 0x22 variable-length frames and a 244-byte 0x0D
-     * legacy dump; this driver requests only the explicit 0x22 counted form.
+     * legacy dump; this driver requests only the explicit 0x22 counted form, but
+     * CT4 transmitters can still push 0x0D dumps unsolicited after a live record.
      */
     @JvmStatic
     fun parseWideRawSeriesRecords(bytes: ByteArray): List<AnytimeRawRecord> {
-        if (bytes.size < 4 || bytes[0] != AnytimeConstants.RX_SERIES || !verifySum(bytes)) return emptyList()
+        val opcode = bytes.firstOrNull()
+        if (bytes.size < 4 ||
+            (opcode != AnytimeConstants.RX_SERIES && opcode != AnytimeConstants.RX_LEGACY_RAW_DUMP) ||
+            !verifySum(bytes)
+        ) {
+            return emptyList()
+        }
         val startId = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)
         val payloadEndExclusive = bytes.size - 1
         if (payloadEndExclusive <= 3) return emptyList()
@@ -811,6 +1057,7 @@ object AnytimeFrames {
             errorCode = err,
             trend = trend,
             warnCode = warn,
+            hasGlucose = (gluInt != 0 || gluFrac != 0),
         )
     }
 
@@ -850,7 +1097,7 @@ object AnytimeFrames {
             sensorAgeReadings = sensorAge,
             workingElectrodeCurrentNa = iw,
             batteryVolts = volts,
-            isHealthy = failure == null,
+            isHealthy = failure == null || failure == AnytimeCheckStatus.CheckFailure.LOW_BATTERY,
             failure = failure,
         )
     }
@@ -864,8 +1111,99 @@ object AnytimeFrames {
         return AnytimeResetStatus(isBound = isBound)
     }
 
-    /** Extract version string from 0x20 formal-version response (best-effort). */
+    /**
+     * Parse a CT5 0x11 answer the way the vendor's `TransmitterReset` does:
+     * opcode, a valid checksum and a full 14 bytes are all required, because
+     * `isBind()` there throws below that length rather than guessing.
+     */
     @JvmStatic
+    fun parseCt5BindState(bytes: ByteArray): AnytimeCt5BindState? {
+        if (bytes.size < 14) return null
+        if (bytes[0] != AnytimeConstants.RX_RESET) return null
+        if (!verifySum(bytes)) return null
+        val isBound = (bytes[2].toInt() and 0xFF) != 0
+        // Vendor: the reason byte is only meaningful when the tip byte says 0x22,
+        // and only 0/1 are defined there.
+        val reason = if (!isBound && (bytes[12].toInt() and 0xFF) == 0x22) {
+            (bytes[8].toInt() and 0xFF).takeIf { it == 0 || it == 1 } ?: -1
+        } else {
+            -1
+        }
+        return AnytimeCt5BindState(isBound = isBound, unbindReason = reason)
+    }
+
+    /**
+     * Parse a 15-byte CT2 glucose record (live push 0x44 or pull response 0x47).
+     * Layout: opcode, id(b1-2, BE), year-2000, month, day, hour, minute,
+     * Iw(b8-9, BE /10), Ib(b10-11, BE /10), temperature, battery/sentinel, sum.
+     * Iw precedes Ib in CT2 — the reverse of CT3/CT2.5. Field order is asserted
+     * by a dedicated test (see docs/ct-driver-plan.md §B1).
+     */
+    @JvmStatic
+    fun parseCt2GlucoseRecord(bytes: ByteArray): Ct2GlucoseFrame? {
+        if (bytes.size != 15) return null
+        if (!verifySum(bytes)) return null
+        val opcode = bytes[0]
+        val isHistorical = when (opcode) {
+            AnytimeConstants.RX_CT2_PUSH_GLUCOSE -> false
+            AnytimeConstants.RX_CT2_PULL_RESPONSE -> true
+            else -> return null
+        }
+        val id = u16(bytes[1], bytes[2])
+        val iw = u16(bytes[8], bytes[9]) / 10f
+        val ib = u16(bytes[10], bytes[11]) / 10f
+        val temperature = decodeCt2Temperature(bytes[12])
+        val batteryByte = bytes[13].toInt() and 0xFF
+        return Ct2GlucoseFrame(
+            record = AnytimeRawRecord(
+                indexInPacket = 0,
+                glucoseId = id,
+                ibNa = ib,
+                iwNa = iw,
+                temperatureC = temperature,
+                recordBytes = bytes,
+            ),
+            isHistorical = isHistorical,
+            batteryPercent = if (isHistorical) null else batteryByte,
+            // u16() already clamps to 0..65535, so the sentinel check collapses to
+            // one equality (see Ct2GlucoseFrame kdoc for the signed-short origin).
+            isEndOfHistory = isHistorical && id == 0xFFFF,
+        )
+    }
+
+    /** CT2 temperature byte: bit 7 set → (b − 128) + 0.5, else b. */
+    @JvmStatic
+    fun decodeCt2Temperature(b: Byte): Float {
+        val v = b.toInt() and 0xFF
+        return if (v and 0x80 != 0) ((v - 128) and 0xFF) + 0.5f else v.toFloat()
+    }
+
+    /**
+     * Parse a CT2 self-test (0x43) response: Iw(b1-2, /10), Ib(b3-4, /10),
+     * temperature(b5), power byte(b6), sum(b7). The power<50 gate is the
+     * decompiled vendor `checkResponse()` constant, not observed live on the
+     * failure branch (open question #7 in ct-driver-plan.md).
+     */
+    @JvmStatic
+    fun parseCt2CheckResponse(bytes: ByteArray): Ct2CheckResult? {
+        if (bytes.size < 8) return null
+        if (!verifySum(bytes)) return null
+        val iw = u16(bytes[1], bytes[2]) / 10f
+        val ib = u16(bytes[3], bytes[4]) / 10f
+        val temperature = decodeCt2Temperature(bytes[5])
+        val power = bytes[6].toInt() and 0xFF
+        val tempFail = temperature >= 50f
+        val powerFail = power < 50
+        return Ct2CheckResult(
+            iwNa = iw,
+            ibNa = ib,
+            temperatureC = temperature,
+            powerByte = power,
+            passed = !tempFail && !powerFail,
+        )
+    }
+
+    /** Extract version string from 0x20 formal-version response (best-effort). */    @JvmStatic
     fun parseFormalVersion(bytes: ByteArray): String {
         if (bytes.size < 2 || bytes[0] != AnytimeConstants.RX_TRANSMITTER_FORMAL) return ""
         val end = bytes.indexOfFirst { it == 0.toByte() }.let { if (it <= 1) bytes.size else it }

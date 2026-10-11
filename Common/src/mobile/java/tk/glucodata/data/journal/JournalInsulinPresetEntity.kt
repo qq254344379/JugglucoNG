@@ -1,5 +1,6 @@
 package tk.glucodata.data.journal
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -19,5 +20,12 @@ data class JournalInsulinPresetEntity(
     val isBuiltIn: Boolean,
     val isArchived: Boolean,
     val countsTowardIob: Boolean,
-    val sortOrder: Int
+    val sortOrder: Int,
+    @ColumnInfo(defaultValue = "1")
+    val useForCalculation: Boolean = true,
+    val curveProfileId: String? = null,
+    @ColumnInfo(defaultValue = "0")
+    val curveModelVersion: Int = 0,
+    @ColumnInfo(defaultValue = "'unverified'")
+    val curveEvidence: String = JournalCurveEvidence.UNVERIFIED.storageValue
 )

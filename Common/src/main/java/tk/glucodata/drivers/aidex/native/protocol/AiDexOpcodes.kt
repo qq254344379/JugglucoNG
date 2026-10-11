@@ -110,13 +110,13 @@ object AiDexOpcodes {
     /** Delete vendor bond (clears sensor's internal bond state) */
     const val DELETE_BOND: Int = 0xF2
 
-    /** Reset sensor */
+    /** Separate hardware-maintenance reset; do not chain after lifecycle clear */
     const val RESET: Int = 0xF0
 
     /** Put sensor into shelf/shipping mode */
     const val SHELF_MODE: Int = 0xF1
 
-    /** Clear sensor's stored history data */
+    /** Clear sensor storage and restart its lifecycle */
     const val CLEAR_STORAGE: Int = 0xF3
 
     // -- F003 Frame Constants --
@@ -171,7 +171,7 @@ object AiDexOpcodes {
     const val COMPANY_ID: Int = 0x0059
 
     /** Known AiDex device name prefixes */
-    val KNOWN_NAME_PREFIXES: List<String> = listOf("AiDex", "AiDEX", "AIDEX", "Linx", "LINX", "CGM")
+    val KNOWN_NAME_PREFIXES: List<String> = listOf("AiDex", "AiDEX", "AIDEX", "Linx", "LINX", "CGM", "Smart-")
 
     /** Check if a device name looks like an AiDex sensor */
     fun isAiDexDevice(name: String?): Boolean {

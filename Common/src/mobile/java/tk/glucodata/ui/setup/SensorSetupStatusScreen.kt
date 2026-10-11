@@ -36,7 +36,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import tk.glucodata.R
@@ -150,6 +149,7 @@ private fun SensorSetupStatusScreen(
         SensorSetupStatusTone.Connecting -> MaterialTheme.colorScheme.primary
         SensorSetupStatusTone.Success -> MaterialTheme.colorScheme.tertiary
     }
+    // ui-guardrails: allow offscale_radius - a deliberately uneven organic shape, not a corner radius
     val heroShape = RoundedCornerShape(
         topStart = if (ui.compact) 30.dp else 36.dp,
         topEnd = if (ui.compact) 22.dp else 28.dp,
@@ -233,11 +233,11 @@ private fun SensorSetupStatusScreen(
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                 contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                shape = RoundedCornerShape(999.dp)
+                shape = CircleShape
             ) {
                 Text(
                     text = sensorLabel,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     style = MaterialTheme.typography.labelLarge,
                     maxLines = 1
                 )
@@ -248,8 +248,7 @@ private fun SensorSetupStatusScreen(
 
         Text(
             text = title,
-            style = if (ui.compact) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.headlineLarge,
-            fontWeight = FontWeight.SemiBold,
+            style = if (ui.compact) MaterialTheme.typography.headlineMediumEmphasized else MaterialTheme.typography.headlineLargeEmphasized,
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurface
         )
@@ -273,7 +272,7 @@ private fun SensorSetupStatusScreen(
                 modifier = Modifier
                     .fillMaxWidth(0.42f)
                     .height(6.dp)
-                    .clip(RoundedCornerShape(999.dp)),
+                    .clip(CircleShape),
                 color = accentColor,
                 trackColor = accentColor.copy(alpha = 0.18f)
             )
@@ -282,7 +281,7 @@ private fun SensorSetupStatusScreen(
                 modifier = Modifier
                     .fillMaxWidth(0.42f)
                     .height(6.dp)
-                    .clip(RoundedCornerShape(999.dp)),
+                    .clip(CircleShape),
                 color = accentColor,
                 trackColor = accentColor.copy(alpha = 0.18f)
             )

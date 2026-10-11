@@ -2,6 +2,7 @@ package tk.glucodata.drivers.anytime
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -39,6 +40,72 @@ class AnytimeFramesTests {
         assertEquals(1380, status.sensorAgeReadings)
         assertEquals(13.8f, status.workingElectrodeCurrentNa, 0.001f)
         assertEquals(4.27f, status.batteryVolts, 0.001f)
+    }
+
+    @Test
+    fun ct4CheckDoesNotTreat398VoltsAsLowBattery() {
+        val status = AnytimeFrames.parseCheckResponse(
+            byteArrayOf(
+                0x05,
+                0x12,
+                0x02,
+                0x78,
+                0x00,
+                0x01,
+                0x42,
+                0x49,
+                0x0B,
+                0x03,
+                0x62,
+                0x06,
+                0xD1.toByte(),
+                0x06,
+                0xD1.toByte(),
+                0x05,
+                0x18,
+                0x00,
+                0x00,
+                0x58,
+            ),
+            AnytimeConstants.BATTERY_LOW_VOLTS_CT4,
+        )
+
+        assertTrue(status.isHealthy)
+        assertNull(status.failure)
+        assertEquals(3.98f, status.batteryVolts, 0.001f)
+        assertEquals(82, AnytimeFrames.batteryPercent(status.batteryVolts, AnytimeConstants.BATTERY_LOW_VOLTS_CT4))
+    }
+
+    @Test
+    fun lowBatteryCheckIsAdvisoryNotSessionBlocking() {
+        val status = AnytimeFrames.parseCheckResponse(
+            byteArrayOf(
+                0x05,
+                0x12,
+                0x02,
+                0x78,
+                0x00,
+                0x01,
+                0x42,
+                0x49,
+                0x0B,
+                0x03,
+                0x62,
+                0x06,
+                0xD1.toByte(),
+                0x06,
+                0xD1.toByte(),
+                0x05,
+                0x18,
+                0x00,
+                0x00,
+                0x58,
+            ),
+            AnytimeConstants.BATTERY_LOW_VOLTS_CT3,
+        )
+
+        assertTrue(status.isHealthy)
+        assertEquals(AnytimeCheckStatus.CheckFailure.LOW_BATTERY, status.failure)
     }
 
     @Test
@@ -123,6 +190,41 @@ class AnytimeFramesTests {
     }
 
     @Test
+    fun parseWideRawSeriesRecordsAcceptsLegacyRawDumpOpcode() {
+        val frame = byteArrayOf(
+            0x0D,
+            0x93.toByte(),
+            0x00,
+            0x01,
+            0xB7.toByte(),
+            0x05,
+            0x5E,
+            0x49,
+            0x0A,
+            0x01,
+            0xC2.toByte(),
+            0x05,
+            0x64,
+            0x49,
+            0x19,
+            0x00,
+        )
+        frame[frame.lastIndex] = AnytimeFrames.sum(frame, 0, frame.lastIndex - 1)
+
+        val records = AnytimeFrames.parseWideRawSeriesRecords(frame)
+
+        assertEquals(2, records.size)
+        assertEquals(147, records[0].glucoseId)
+        assertEquals(4.39f, records[0].ibNa, 0.001f)
+        assertEquals(13.74f, records[0].iwNa, 0.001f)
+        assertEquals(33.10f, records[0].temperatureC, 0.001f)
+        assertEquals(148, records[1].glucoseId)
+        assertEquals(4.50f, records[1].ibNa, 0.001f)
+        assertEquals(13.80f, records[1].iwNa, 0.001f)
+        assertEquals(33.25f, records[1].temperatureC, 0.001f)
+    }
+
+    @Test
     fun inputBgRoundsToOfficialOneDecimalMmol() {
         assertEquals(
             listOf(0x09, 0x05, 0x06),
@@ -139,6 +241,14 @@ class AnytimeFramesTests {
         assertEquals(
             listOf(0x09, 0x00, 0x64, 0x6D),
             AnytimeFrames.Builders.ct5InputBgMg(100).map { it.toInt() and 0xFF },
+        )
+    }
+
+    @Test
+    fun ct5EndCycleBuildsOfficialAppFrame() {
+        assertEquals(
+            listOf(0x0A, 0x31, 0x32, 0x33, 0x34, 0xD4),
+            AnytimeFrames.Builders.ct5EndCycle("1234").map { it.toInt() and 0xFF },
         )
     }
 
@@ -188,5 +298,62 @@ class AnytimeFramesTests {
         assertEquals(123, rec.gluMgdl)
         assertEquals(5, rec.trend)
         assertEquals(0, rec.errorCode)
+    }
+
+    @Test
+    fun inferCt5CipherFromObservedUsedSensorLivePush() {
+        val frame = byteArrayOf(
+            0x35,
+            0xE7.toByte(),
+            0x00,
+            0xD8.toByte(),
+            0xD8.toByte(),
+            0xD9.toByte(),
+            0xD6.toByte(),
+            0x1E,
+            0xC8.toByte(),
+            0xE7.toByte(),
+            0x14,
+            0x27,
+            0x25,
+            0x31,
+            0xD9.toByte(),
+        )
+
+        val candidate = AnytimeFrames.inferCt5CipherFromCurrentRecord(frame)
+
+        assertNotNull(candidate)
+        candidate!!
+        assertTrue(candidate.cipherKey in 0..255)
+        assertEquals(231, candidate.record.glucoseId)
+        assertEquals(0.0f, candidate.record.ibNa, 0.001f)
+        assertEquals(7.87f, candidate.record.iwNa, 0.001f)
+        assertEquals(34.48f, candidate.record.temperatureC, 0.001f)
+        assertEquals(85, candidate.record.gluMgdl)
+        assertEquals(4, candidate.record.trend)
+        assertEquals(0, candidate.record.errorCode)
+    }
+
+    @Test
+    fun inferCt5CipherRejectsBadChecksum() {
+        val frame = byteArrayOf(
+            0x35,
+            0xE7.toByte(),
+            0x00,
+            0xD8.toByte(),
+            0xD8.toByte(),
+            0xD9.toByte(),
+            0xD6.toByte(),
+            0x1E,
+            0xC8.toByte(),
+            0xE7.toByte(),
+            0x14,
+            0x27,
+            0x25,
+            0x31,
+            0x00,
+        )
+
+        assertNull(AnytimeFrames.inferCt5CipherFromCurrentRecord(frame))
     }
 }

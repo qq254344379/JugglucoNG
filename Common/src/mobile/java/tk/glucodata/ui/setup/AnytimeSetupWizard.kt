@@ -25,13 +25,16 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -39,7 +42,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
@@ -48,11 +50,11 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -65,7 +67,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.Log
 import tk.glucodata.R
 import tk.glucodata.drivers.anytime.AnytimeAlgorithm
@@ -136,13 +141,10 @@ fun AnytimeSetupWizard(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.anytime_setup_title)) },
-                navigationIcon = {
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.cancel))
-                    }
-                }
+            AppTopBar(
+                title = stringResource(R.string.anytime_setup_title),
+                onNavigateBack = onDismiss,
+                navigationContentDescription = stringResource(R.string.cancel),
             )
         }
     ) { padding ->
@@ -159,6 +161,15 @@ fun AnytimeSetupWizard(
                     onNavigateToReadiness = onNavigateToReadiness,
                     onQrCodeChanged = { qrCodeContent = normalizeAnytimeQrCode(it) },
                     onShowManualQrEntry = { showManualQrEntry = true },
+                    onCredentialsImported = { record ->
+                        selectedLabel = record.displayName.ifBlank { record.sensorId }
+                        currentStep = AnytimeSetupStep.CONNECTING
+                        scope.launch {
+                            AnytimeRegistry.reconnectAfterCt5CredentialImport(context, record.sensorId)
+                            delay(2000)
+                            currentStep = AnytimeSetupStep.SUCCESS
+                        }
+                    },
                     onDeviceSelected = { candidate ->
                         if (!qrValidation.isAllowed) {
                             Toast.makeText(
@@ -236,6 +247,7 @@ private fun AnytimeScanStep(
     onNavigateToReadiness: () -> Unit,
     onQrCodeChanged: (String) -> Unit,
     onShowManualQrEntry: () -> Unit,
+    onCredentialsImported: (AnytimeRegistry.SensorRecord) -> Unit,
     onDeviceSelected: (AnytimeScanCandidate) -> Unit,
 ) {
     val context = LocalContext.current
@@ -306,7 +318,11 @@ private fun AnytimeScanStep(
                 val nameCandidates = listOfNotNull(scanName, record?.deviceName)
                     .mapNotNull { it.trim().takeIf(String::isNotBlank) }
 
-                val bestName = nameCandidates.firstOrNull().orEmpty()
+                // Prefer the candidate that classifies as an Anytime family over a generic
+                // advert, so the persisted device name is the SN## one.
+                val bestName = nameCandidates.firstOrNull {
+                    AnytimeConstants.resolveFamily(it).family != AnytimeConstants.Family.UNKNOWN
+                } ?: nameCandidates.firstOrNull().orEmpty()
                 val advertisesPrimary =
                     record?.serviceUuids?.any {
                         it.uuid == AnytimeConstants.SERVICE_PRIMARY ||
@@ -377,10 +393,10 @@ private fun AnytimeScanStep(
                 if (!showAllDevices && !device.isLikelyAnytime) return@items
                 val title = device.displayName.ifBlank { stringResource(R.string.unknown) }
                 val supporting = when {
-                    device.advertisesPrimaryService ->
-                        stringResource(R.string.anytime_detected_label, device.address)
-                    device.isLikelyAnytime ->
+                    device.familyEntry.family != AnytimeConstants.Family.UNKNOWN ->
                         "${device.familyEntry.family.displayName} · ${device.address}"
+                    device.isLikelyAnytime ->
+                        stringResource(R.string.anytime_detected_label, device.address)
                     else -> stringResource(R.string.anytime_selectable_unrecognized, device.address)
                 }
                 ListItem(
@@ -390,6 +406,9 @@ private fun AnytimeScanStep(
                     modifier = Modifier.clickable { onDeviceSelected(device) }
                 )
                 HorizontalDivider()
+            }
+            item {
+                AnytimeCt5CredentialsCard(onImported = onCredentialsImported)
             }
             item {
                 Card(
@@ -404,7 +423,10 @@ private fun AnytimeScanStep(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(220.dp),
-                            onScanResult = onQrCodeChanged,
+                            onScanResult = { raw ->
+                                onQrCodeChanged(raw)
+                                true
+                            },
                         )
                         Spacer(Modifier.height(8.dp))
                         if (qrCodeContent.isNotBlank()) {
@@ -458,6 +480,139 @@ private fun AnytimeScanStep(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnytimeCt5CredentialsCard(
+    onImported: (AnytimeRegistry.SensorRecord) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var refreshKey by remember { mutableIntStateOf(0) }
+    var exportRecord by remember { mutableStateOf<AnytimeRegistry.SensorRecord?>(null) }
+    var status by remember { mutableStateOf("") }
+    var statusIsError by remember { mutableStateOf(false) }
+
+    LaunchedEffect(refreshKey) {
+        exportRecord = withContext(Dispatchers.IO) {
+            AnytimeRegistry.persistedRecords(context).firstOrNull { record ->
+                AnytimeRegistry.exportCt5Credentials(context, record.sensorId) != null
+            }
+        }
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        val record = exportRecord
+        if (uri != null && record != null) scope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                val json = AnytimeRegistry.exportCt5Credentials(context, record.sensorId)
+                    ?: return@withContext false
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { stream ->
+                        stream.write(json.toByteArray(Charsets.UTF_8))
+                    } != null
+                }.getOrDefault(false)
+            }
+            statusIsError = !saved
+            status = context.getString(
+                if (saved) R.string.export_successful else R.string.export_failed,
+            )
+        }
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) scope.launch {
+            val imported = withContext(Dispatchers.IO) {
+                val json = runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
+                }.getOrNull() ?: return@withContext null
+                AnytimeRegistry.importCt5Credentials(context, json)
+            }
+            if (imported != null) {
+                refreshKey += 1
+                statusIsError = false
+                status = context.getString(R.string.saved)
+                onImported(imported)
+            } else {
+                statusIsError = true
+                status = context.getString(R.string.error)
+            }
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            // ui-guardrails: allow text_literal - CT5 is the product name
+            Text(
+                text = "CT5 · ${stringResource(R.string.ottai_saved_credentials_title)}",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            exportRecord?.let { record ->
+                Text(
+                    text = record.displayName.ifBlank { record.sensorId },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (exportRecord != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = {
+                            exportLauncher.launch("anytime_ct5_${exportRecord?.sensorId.orEmpty()}.json")
+                        },
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    ) {
+                        Icon(Icons.Default.FileUpload, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.export))
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            importLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+                        },
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    ) {
+                        Icon(Icons.Default.FileDownload, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.ottai_credentials_replace))
+                    }
+                }
+            } else {
+                OutlinedButton(
+                    onClick = {
+                        importLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+                    },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Default.FileDownload, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.ottai_credentials_import))
+                }
+            }
+            if (status.isNotBlank()) {
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (statusIsError) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.primary,
+                )
             }
         }
     }

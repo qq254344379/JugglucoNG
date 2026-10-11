@@ -252,6 +252,7 @@ object MQRegistry {
             connectSensor(context, sensorId)
         }
         ManagedSensorUiSignals.markDeviceListDirty()
+        tk.glucodata.UiRefreshBus.requestStatusRefresh()
         return sensorId
     }
 
@@ -377,10 +378,11 @@ object MQRegistry {
             .remove("${MQConstants.PREF_LAST_PACKET_INDEX_PREFIX}$canonical")
             .remove("${MQConstants.PREF_LAST_CLOUD_REPORTED_PACKET_PREFIX}$canonical")
             .remove("${MQConstants.PREF_SNAPSHOT_ID_PREFIX}$canonical")
-            .remove("${MQConstants.PREF_LOCAL_RESET_PENDING_PREFIX}$canonical")
+            // Keep the reset marker: re-adding this transmitter must not revive its old cloud session.
             .remove("${MQConstants.PREF_QR_CONTENT_PREFIX}$canonical")
             .commit()
         ManagedSensorUiSignals.markDeviceListDirty()
+        tk.glucodata.UiRefreshBus.requestStatusRefresh()
     }
 
     // ---- Per-sensor config accessors (used by MQBleManager) ----
@@ -763,7 +765,10 @@ object MQRegistry {
     }
 
     @JvmStatic
-    fun applyBootstrapConfig(context: Context, sensorId: String, config: MQBootstrapConfig) {
+    fun applyBootstrapConfig(context: Context, sensorId: String, fetchedConfig: MQBootstrapConfig) {
+        val config = if (loadLocalResetPending(context, sensorId)) {
+            MQSessionRestorePolicy.withoutSession(fetchedConfig)
+        } else fetchedConfig
         editBlocking(context) {
             config.protocolType?.let { putInt("${MQConstants.PREF_PROTOCOL_TYPE_PREFIX}$sensorId", it) }
             config.deviation?.let { putInt("${MQConstants.PREF_DEVIATION_PREFIX}$sensorId", it) }

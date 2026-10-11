@@ -1,6 +1,8 @@
 package tk.glucodata.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.app.WallpaperManager
+import android.app.WallpaperColors
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -9,6 +11,8 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -33,6 +37,7 @@ import tk.glucodata.GlucosePoint
 import tk.glucodata.Natives
 import tk.glucodata.NotificationHistorySource
 import tk.glucodata.NotificationChartDrawer
+import tk.glucodata.NotificationMultiSensorSource
 import tk.glucodata.Notify
 import tk.glucodata.R
 import tk.glucodata.SensorBluetooth
@@ -44,7 +49,22 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
     companion object {
         private const val PERIODIC_REFRESH_MS = 60_000L
         private const val BROADCAST_FOLLOW_UP_MS = 750L
+        /** Two periodic drivers feed one refresh; anything sooner than this is the other one. */
+        private const val PERIODIC_MIN_INTERVAL_MS = 30_000L
         const val ACTION_IMMEDIATE_REFRESH = "tk.glucodata.action.AOD_IMMEDIATE_REFRESH"
+        /** Whether the overlay is also shown while the screen is on and locked. */
+        const val PREF_SHOW_ON_LOCKSCREEN = "aod_show_on_lockscreen"
+        const val DEFAULT_SHOW_ON_LOCKSCREEN = true
+
+        /**
+         * A slow ellipse for burn-in, in dp. Consecutive entries always differ, so every
+         * tick produces a window layout the compositor has to act on — content-only
+         * invalidates can be swallowed by panels that self-refresh in ambient mode.
+         */
+        private val BURN_IN_STEPS_DP = arrayOf(
+            0 to 0, 3 to -2, 4 to 0, 3 to 2,
+            0 to 3, -3 to 2, -4 to 0, -3 to -2,
+        )
     }
 
     private var windowManager: WindowManager? = null
@@ -64,7 +84,10 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
     // Keep lock-screen position stable for the whole visible session.
     private var xOffset = 0
     private var yOffset = 0
+    private var burnInStep = 0
+    private var lastPeriodicRefreshElapsed = 0L
     private var currentOverlayPosition = "TOP"
+    private var currentChartAnchorFraction = 0.5f
 
     private val broadcastFollowUpRunnable = Runnable {
         if (overlayView?.visibility == View.VISIBLE) {
@@ -102,12 +125,12 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
                         }
                     }
                 }
+                Intent.ACTION_TIME_TICK -> refreshPeriodic("aod.overlay.refresh.tick")
                 Intent.ACTION_SCREEN_OFF -> {
                     isScreenOn = false
-                    updateVisibility()
+                    showOverlay()
                 }
                 Intent.ACTION_SCREEN_ON -> {
-                    isScreenOn = true
                     // Immediately check keyguard state - faster than waiting for USER_PRESENT
                     checkAndUpdateLockState()
                     // Also schedule quick rechecks to catch unlock faster
@@ -153,20 +176,35 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         return keyguardManager.isDeviceLocked || keyguardManager.isKeyguardLocked
     }
 
+    private fun resolveScreenOn(): Boolean =
+        (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+
     private fun checkAndUpdateLockState() {
         isLocked = resolveDeviceLocked()
         updateVisibility()
     }
 
-    private val updateRunnable = object : Runnable {
-        override fun run() {
-            if (overlayView?.visibility == View.VISIBLE) {
-                BatteryTrace.bump("aod.overlay.refresh.periodic", logEvery = 20L)
-                updateOverlayContent()
-                applyBurnInProtection()
-                handler.postDelayed(this, PERIODIC_REFRESH_MS)
-            }
+    private val updateRunnable = Runnable { refreshPeriodic("aod.overlay.refresh.periodic") }
+
+    /**
+     * The handler leg runs on the uptime clock, which stops advancing while the SoC is
+     * suspended, so on its own it can stall for the whole ambient session. ACTION_TIME_TICK
+     * gives us a wall-clock minute the system delivers instead. Whichever arrives first wins
+     * and re-arms the other.
+     */
+    private fun refreshPeriodic(trace: String) {
+        if (overlayView?.visibility != View.VISIBLE) return
+        val now = SystemClock.elapsedRealtime()
+        if (lastPeriodicRefreshElapsed == 0L ||
+            now - lastPeriodicRefreshElapsed >= PERIODIC_MIN_INTERVAL_MS
+        ) {
+            lastPeriodicRefreshElapsed = now
+            BatteryTrace.bump(trace, logEvery = 20L)
+            advanceBurnInOffset()
+            updateOverlayContent()
         }
+        handler.removeCallbacks(updateRunnable)
+        handler.postDelayed(updateRunnable, PERIODIC_REFRESH_MS)
     }
 
     override fun onServiceConnected() {
@@ -178,6 +216,7 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_TIME_TICK)
             addAction(ACTION_IMMEDIATE_REFRESH)
             addAction("tk.glucodata.action.GLUCOSE_UPDATE")
         }
@@ -194,6 +233,7 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
             }
         }
         
+        isScreenOn = resolveScreenOn()
         isLocked = resolveDeviceLocked()
         updateVisibility()
     }
@@ -202,17 +242,48 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         // View creation is handled by showOverlay() when needed.
     }
 
+    private fun showOnLockscreen(): Boolean =
+        getSharedPreferences("tk.glucodata_preferences", Context.MODE_PRIVATE)
+            .getBoolean(PREF_SHOW_ON_LOCKSCREEN, DEFAULT_SHOW_ON_LOCKSCREEN)
+
     private fun updateVisibility() {
-        // Timeout-driven AOD can arrive before the full keyguard UI is considered "showing".
-        // Keep the historical screen-off behavior so ambient mode still appears, and rely on
-        // the unlock/window-state path to hide again as soon as the user returns to an app.
-        val shouldShow = isLocked || !isScreenOn
-        
+        // SCREEN_ON can also be sent while entering ambient mode on some devices.
+        // isInteractive distinguishes that non-interactive AOD state from the lock screen.
+        isScreenOn = resolveScreenOn()
+        // Ambient mode always shows. The interactive lock screen is opt-out, because the
+        // overlay sits on top of the keyguard's own notification UI there.
+        val shouldShow = !isScreenOn || (isLocked && showOnLockscreen())
         if (shouldShow) {
             showOverlay()
         } else {
             hideOverlay()
         }
+    }
+
+    /**
+     * The palette the overlay draws with. Ambient mode is black, so it is always light there.
+     * On the interactive lock screen the overlay sits on the wallpaper instead, so it asks
+     * Android what that wallpaper wants — the same signal that decides the keyguard clock.
+     */
+    private fun resolveUsesLightPalette(): Boolean {
+        if (!isScreenOn) return true
+        var supportsDarkText: Boolean? = null
+        var primaryColor: Int? = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            try {
+                val colors = (getSystemService(Context.WALLPAPER_SERVICE) as? WallpaperManager)
+                    ?.getWallpaperColors(WallpaperManager.FLAG_LOCK)
+                if (colors != null) {
+                    primaryColor = colors.primaryColor.toArgb()
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        supportsDarkText =
+                            (colors.colorHints and WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        }
+        return AodPalette.usesLightPalette(isScreenOn, supportsDarkText, primaryColor)
     }
     
 
@@ -258,6 +329,13 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
             val inflater = LayoutInflater.from(this)
             overlayView = inflater.inflate(R.layout.aod_overlay, null)
             overlayView?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            // The overlay always draws a light-on-transparent palette, so an
+            // automatic dark conversion (platform force-dark, or a vendor
+            // "expanded dark mode") only inverts the value into black on the
+            // always-on display. Opt the whole hierarchy out of it.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                overlayView?.isForceDarkAllowed = false
+            }
             
             params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -280,6 +358,7 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         cachedBaseOpacity = prefs.getFloat("aod_opacity", 1.0f)
         updateOverlayContent()
         applyBurnInProtection(force = true)
+        lastPeriodicRefreshElapsed = SystemClock.elapsedRealtime()
         handler.removeCallbacks(updateRunnable)
         handler.postDelayed(updateRunnable, PERIODIC_REFRESH_MS)
 
@@ -299,7 +378,8 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         sensorManager?.unregisterListener(this)
         handler.removeCallbacks(updateRunnable)
         handler.removeCallbacks(broadcastFollowUpRunnable)
-        
+        lastPeriodicRefreshElapsed = 0L
+
         // Remove the view entirely - instant disappearance like xDrip
         val view = overlayView
         if (view != null) {
@@ -317,8 +397,21 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         val positions = prefs.getStringSet("aod_positions", setOf("TOP")) ?: setOf("TOP")
         val activePositions = if (positions.isNotEmpty()) positions.toList() else listOf("TOP")
         currentOverlayPosition = activePositions.random()
-        xOffset = 0
-        yOffset = 0
+        burnInStep = 0
+        applyBurnInOffset()
+    }
+
+    /** Walk one step around the burn-in ellipse. Called once per periodic refresh. */
+    private fun advanceBurnInOffset() {
+        burnInStep = (burnInStep + 1) % BURN_IN_STEPS_DP.size
+        applyBurnInOffset()
+    }
+
+    private fun applyBurnInOffset() {
+        val (dx, dy) = BURN_IN_STEPS_DP[burnInStep]
+        val density = resources.displayMetrics.density
+        xOffset = (dx * density).toInt()
+        yOffset = (dy * density).toInt()
     }
     
     // Polling removed as requested
@@ -336,6 +429,7 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         // Default to TOP if empty or missing
         // Alignment logic
         val alignment = prefs.getString("aod_alignment", "CENTER") ?: "CENTER"
+        val showChart = prefs.getBoolean("aod_show_chart", true)
         
         // Apply Opacity (combined with light sensor)
         updateAlpha()
@@ -358,7 +452,16 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         val rootLayout = view.findViewById<android.widget.LinearLayout>(R.id.aod_root)
         val textContainer = view.findViewById<android.widget.LinearLayout>(R.id.aod_text_container)
         var alignGravity = Gravity.CENTER_HORIZONTAL
-        when(alignment) {
+        val effectiveAlignment = if (showChart && alignment == "CENTER") {
+            when {
+                currentChartAnchorFraction < 0.38f -> "LEFT"
+                currentChartAnchorFraction > 0.62f -> "RIGHT"
+                else -> "CENTER"
+            }
+        } else {
+            alignment
+        }
+        when(effectiveAlignment) {
             "LEFT" -> alignGravity = Gravity.START
             "CENTER" -> alignGravity = Gravity.CENTER_HORIZONTAL
             "RIGHT" -> alignGravity = Gravity.END
@@ -400,6 +503,7 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
 
     private fun updateOverlayContent() {
         val view = overlayView ?: return
+        NotificationChartDrawer.setAodUsesLightPalette(resolveUsesLightPalette())
 
         // 1. Fetch Data
         val endT = System.currentTimeMillis()
@@ -448,6 +552,7 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
             viewMode = resolvedDisplay.viewMode
         }
         val overlayChartPoints = DisplayTrendSource.augmentHistory(chartPoints, resolvedDisplay, activeSensorSerial, startT)
+        currentChartAnchorFraction = estimateChartAnchorFraction(overlayChartPoints, startT, endT)
         val hasCalibration = tk.glucodata.NightscoutCalibration.hasCalibrationForViewMode(activeSensorSerial, viewMode)
 
         if (resolvedDisplay != null) {
@@ -464,6 +569,21 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         val displayRate = DisplayTrendSource.resolveArrowRate(overlayChartPoints, resolvedDisplay, viewMode, isMmol)
 
         val glucoseColor = NotificationChartDrawer.getGlucoseColor(this, glvalue, isMmol)
+        val peerCurrents = NotificationMultiSensorSource.peerCurrents(
+            tk.glucodata.Notify.glucosetimeout,
+            activeSensorSerial
+        )
+        val peerValueItems = NotificationMultiSensorSource.valueItems(peerCurrents)
+        // Match the dashboard: tint the primary value/arrow with its identity color.
+        val primaryDisplayColor = if (peerValueItems.isNotEmpty()) {
+            tk.glucodata.SensorVisuals.blendArgb(
+                glucoseColor,
+                tk.glucodata.SensorVisuals.colorArgb(activeSensorSerial),
+                tk.glucodata.SensorVisuals.PRIMARY_TEXT_BLEND
+            )
+        } else {
+            glucoseColor
+        }
 
         // Draw Components
         val fontSource = prefs.getString("aod_font_source", "APP") ?: "APP"
@@ -475,15 +595,29 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
         // Arrow Settings
         val showArrow = prefs.getBoolean("aod_show_arrow", true)
         val arrowScale = prefs.getFloat("aod_arrow_scale", 2.0f)
+        // Multi-sensor: arrows render inline next to each value; the external
+        // arrow view would visually attach to the last peer value otherwise.
+        val inlineMultiArrows = showArrow && peerValueItems.isNotEmpty()
 
         // Use textScale here for high-res bitmap generation
-        val textBitmap = NotificationChartDrawer.drawGlucoseText(this, valStr, glucoseColor, textScale, fontWeight, useSystemFont)
+        val textBitmap = NotificationChartDrawer.drawMultiGlucoseText(
+            this,
+            valStr,
+            primaryDisplayColor,
+            peerValueItems,
+            textScale,
+            fontWeight,
+            useSystemFont,
+            if (inlineMultiArrows) displayRate else Float.NaN,
+            isMmol,
+            1.0f
+        )
         val textImg = view.findViewById<ImageView>(R.id.notification_glucose)
         textImg?.setImageBitmap(textBitmap)
 
         // Pass combined scale to arrow
         val arrowImg = view.findViewById<ImageView>(R.id.notification_arrow)
-        if (showArrow) {
+        if (showArrow && !inlineMultiArrows) {
             val arrowBitmap = NotificationChartDrawer.drawArrow(
                 this,
                 displayRate,
@@ -507,8 +641,15 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
             val baseChartHeightPx = (200 * dm.density).toInt()
             val renderWidth = (dm.widthPixels * 1.5f).toInt()
             val renderHeight = (baseChartHeightPx * 1.5f).toInt()
+            val peerChartSeries = NotificationMultiSensorSource.peerSeries(peerCurrents, startT, isMmol)
+            // The same resolved model as the notification and the dashboard —
+            // values, ownership, lanes decided once — so the always-on display
+            // cannot disagree with them about a minute already shown.
+            val chartModel = tk.glucodata.NotificationChartModelSource.build(
+                this, overlayChartPoints, activeSensorSerial, viewMode, hasCalibration, peerChartSeries, startT
+            )
 
-            val chartBitmap = NotificationChartDrawer.drawChart(
+            val chartBitmap = NotificationChartDrawer.drawChartWithPrediction(
                 this,
                 overlayChartPoints,
                 renderWidth,
@@ -517,7 +658,10 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
                 viewMode,
                 true,
                 hasCalibration,
-                activeSensorSerial
+                false,
+                activeSensorSerial,
+                peerChartSeries,
+                chartModel
             )
             if (chartImg != null) {
                 chartImg.layoutParams = chartImg.layoutParams?.also { params ->
@@ -542,6 +686,15 @@ class AODOverlayService : AccessibilityService(), SensorEventListener {
                 statusView.visibility = View.GONE
             }
         }
+        applyBurnInProtection()
+    }
+
+    private fun estimateChartAnchorFraction(points: List<GlucosePoint>, startT: Long, endT: Long): Float {
+        if (points.isEmpty() || endT <= startT) {
+            return 0.5f
+        }
+        val latestTimestamp = points.maxOf { it.timestamp }
+        return ((latestTimestamp - startT).toFloat() / (endT - startT).toFloat()).coerceIn(0f, 1f)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {

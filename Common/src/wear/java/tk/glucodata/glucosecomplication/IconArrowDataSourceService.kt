@@ -42,7 +42,20 @@ import tk.glucodata.R
 import java.lang.Math.min
 
 class IconArrowDataSourceService: SuspendingComplicationDataSourceService()  {
-private var glview: GlucoseValue? =null
+    /**
+     * Arrow plus the reading's time, drawn by ComplicationRenderer so the angle
+     * and colour match the app rather than the legacy geometry.
+     */
+    private fun arrowTimeBitmap(rate: Float, timeMillis: Long): android.graphics.Bitmap =
+        // Drawn as a mask: the watch face tints an ICON, so a range colour here
+        // came out off-tone beside every other complication on the face.
+        ComplicationRenderer.arrowWithTimeBitmap(
+            ICON_PX, rate, timeMillis, ComplicationRenderer.ICON_TINT,
+        )
+
+    private val ICON_PX = 256
+
+private var glview: WearComplicationValue? =null
 
     override fun onComplicationActivated( complicationInstanceId: Int, type: ComplicationType) {
         Log.d(LOG_ID, "onComplicationActivated(): $complicationInstanceId")
@@ -50,13 +63,13 @@ private var glview: GlucoseValue? =null
     override fun onComplicationDeactivated(complicationInstanceId: Int) {
         Log.d(LOG_ID, "onComplicationDeactivated(): $complicationInstanceId")
     }
-fun getview(type: ComplicationType):GlucoseValue {
+fun getview(type: ComplicationType):WearComplicationValue {
      if(glview==null) {
         val width:Int = 150
         val height:Int = 150
-         glview= GlucoseValue(width,height)
+         glview= WearComplicationValue(width,height)
          }
-      return glview as GlucoseValue;
+      return glview as WearComplicationValue;
       }
     override fun getPreviewData(type: ComplicationType): ComplicationData {
       val glucose=CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout)
@@ -73,10 +86,10 @@ fun getview(type: ComplicationType):GlucoseValue {
                 }
       return MonochromaticImageComplicationData.Builder(
 //          MonochromaticImage.Builder( Icon.createWithBitmap(getview(type).getArrowBitmap(rate))).build(),
-          MonochromaticImage.Builder( Icon.createWithBitmap(getview(type).getArrowTimeBitmap(time,rate))).build(),
+          MonochromaticImage.Builder( Icon.createWithBitmap(arrowTimeBitmap(rate, time))).build(),
 
             contentDescription = PlainComplicationText.Builder(text = "Glucose Arrow").build() )
-            .setTapAction(null)
+            .setTapAction(GlucoseComplicationData.tapAction())
             .build()
     }
 
@@ -92,10 +105,10 @@ fun getview(type: ComplicationType):GlucoseValue {
                  } else {
                      Log.i(LOG_ID,"MonochromaticImage rate: ${glucose.rate}")
 //                    getview(type).getArrowBitmap(glucose.rate)
-                      getview(type).getArrowTimeBitmap(glucose.timeMillis,glucose.rate);
+                      arrowTimeBitmap(glucose.rate, glucose.timeMillis);
                      }
              val image=Icon.createWithBitmap(bitmap)
-             val complicationPendingIntent = Notify.mkpending()
+             val complicationPendingIntent = GlucoseComplicationData.tapAction()
             return MonochromaticImageComplicationData.Builder(
                     MonochromaticImage.Builder(image).build(), contentDescription = PlainComplicationText.Builder("Glucose Arrow").build()).setTapAction(complicationPendingIntent).build()
             } 

@@ -8,10 +8,12 @@
    <locale android:name="pl"/>
    <locale android:name="pt"/>
    <locale android:name="ru"/>
+   <locale android:name="so"/>
    <locale android:name="be"/>
    <locale android:name="uk"/>
    <locale android:name="zh"/>
    <locale android:name="sv"/>
    <locale android:name="tr"/>
    <locale android:name="mn"/>
+   <locale android:name="hu"/>
 </locale-config>

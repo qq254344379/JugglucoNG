@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <climits>
+#include <cmath>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -43,6 +46,8 @@ jstring jnightuploadEntriesurl=nullptr;
 jstring jnightuploadEntries3url=nullptr;
 jstring jnightuploadTreatmentsurl=nullptr;
 jstring jnightuploadTreatments3url=nullptr;
+jstring jnightuploadDevicestatusurl=nullptr;
+jstring jnightuploadDevicestatus3url=nullptr;
 jstring jnightuploadsecret= nullptr;
 jclass nightscoutcalibrationclass=nullptr;
 static int lastNightUploadCode = 0;
@@ -135,6 +140,11 @@ static bool makeuploadurls(JNIEnv *env) {
     const bool entriesv3=makeuploadurl(env,R"(/api/v3/entries)",jnightuploadEntries3url);
     const bool treatmentsv1=makeuploadurl(env,R"(/api/v1/treatments)",jnightuploadTreatmentsurl);
     const bool treatmentsv3=makeuploadurl(env,R"(/api/v3/treatments)",jnightuploadTreatments3url);
+    //devicestatus carries the uploader battery and the journal IOB. A failure here must not hold
+    //back glucose, so both forms are built but deliberately left out of the readiness check: they
+    //can only fail on the same base URL that entries and treatments already gate on.
+    makeuploadurl(env,R"(/api/v1/devicestatus)",jnightuploadDevicestatusurl);
+    makeuploadurl(env,R"(/api/v3/devicestatus)",jnightuploadDevicestatus3url);
     return entriesv1&&entriesv3&&treatmentsv1&&treatmentsv3;
     }
 
@@ -156,7 +166,7 @@ static bool ensureNightscoutBaseUrl() {
     return true;
     }
 
-extern std::string sha1encode(const char *secret, int len);
+#include "datestring.hpp"
 static void makeuploadsecret(JNIEnv *env) {
         const bool useV3=settings->data()->nightscoutV3;
         if(useV3) {
@@ -172,8 +182,16 @@ static void makeuploadsecret(JNIEnv *env) {
             jnightuploadsecret=  (jstring)env->NewGlobalRef(local);
             }
         }
+//Live managed readings wake the uploader from their own BLE driver threads, while the settings
+//screen and MainActivity wake it from the UI thread. Both reach inituploader() whenever the
+//uploader thread is not running yet, and makeuploadsecret()/makeuploadurl() replace shared
+//global refs with DeleteGlobalRef+NewGlobalRef. Serialize the whole init so no caller can be
+//left holding a freed global ref.
+static std::mutex inituploadermutex;
+
 bool inituploader(JNIEnv *env) {
-    if(!settings->data()->nightuploadon)  
+    std::lock_guard<std::mutex> initlock(inituploadermutex);
+    if(!settings->data()->nightuploadon)
         return false;
     if(!ensureNightscoutBaseUrl()) {
         lastNightUploadCode = -2;
@@ -214,8 +232,9 @@ bool inituploader(JNIEnv *env) {
         LOGSTRING("Nightscout uploader disabled until URL is valid\n");
         return false;
         }
-    extern void startuploaderthread();
-    startuploaderthread();
+    extern bool startuploaderthread();
+    if(!startuploaderthread())
+        return false;
     LOGAR("end inituploader");
     return true;
        }
@@ -301,6 +320,23 @@ static bool isRecentNightUploadCovered(const int sensorid,const uint32_t tim) {
     return range->start && tim>=range->start && tim<=range->end;
     }
 
+static uint16_t loadNightiter(const SensorGlucoseData *sens) {
+    const auto *info=sens?sens->getinfo():nullptr;
+    return info?__atomic_load_n(&info->nightiter,__ATOMIC_RELAXED):0;
+    }
+
+static void advanceNightiter(SensorGlucoseData *sens,const int target) {
+    auto *info=sens?sens->getinfo():nullptr;
+    if(!info)
+        return;
+    const auto bounded=static_cast<uint16_t>(
+        std::clamp(target,0,static_cast<int>(std::numeric_limits<uint16_t>::max())));
+    uint16_t current=__atomic_load_n(&info->nightiter,__ATOMIC_RELAXED);
+    while(current<bounded&&!__atomic_compare_exchange_n(
+              &info->nightiter,&current,bounded,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {
+        }
+    }
+
 
 //static boolean upload(String httpurl,byte[] postdata,String secret) ;
 extern vector<Numdata*> numdatas;
@@ -312,7 +348,7 @@ static void reset() {
         range={};
     for(int sensorid=0;sensorid<=last;sensorid++) {
         if(SensorGlucoseData *sens=sensors->getSensorData(sensorid)) {
-            sens->getinfo()->nightiter=0;
+            __atomic_store_n(&sens->getinfo()->nightiter,0,__ATOMIC_RELAXED);
             }
         }
     for(auto *numdata:numdatas)
@@ -325,7 +361,8 @@ static int nightupload(jstring jnightuploadurl,const char *data,int len,bool put
         lastNightUploadConfigError = true;
         return -2;
         }
-    const static jmethodID  upload=getenv()->GetStaticMethodID(nightpostclass,"upload","(Ljava/lang/String;[BLjava/lang/String;Z)I");
+    const static jmethodID upload=getenv()->GetStaticMethodID(
+        nightpostclass,"uploadNative","(Ljava/lang/String;[BLjava/lang/String;Z)I");
     auto env=getenv();
     jbyteArray uit=env->NewByteArray(len);
         env->SetByteArrayRegion(uit, 0, len,(const jbyte *)data);
@@ -355,36 +392,311 @@ int nightuploadTreatments(const char *data,int len) {
 int nightuploadTreatments3(const char *data,int len) {
     return nightupload(jnightuploadTreatments3url,data,len,false);
     }
+//The endpoint follows the configured API version, like entries and treatments do. v1 and v3
+//disagree on more than the path: v3 takes a single document rather than an array and rejects one
+//without an "app" field, so the callers build the matching shape for devicestatusIsV3().
+static bool devicestatusIsV3() {
+    return settings->data()->nightscoutV3 && jnightuploadDevicestatus3url!=nullptr;
+    }
+
+static bool queueNightuploadDevicestatus(const char *data,int len) {
+    jstring url=devicestatusIsV3()?jnightuploadDevicestatus3url:jnightuploadDevicestatusurl;
+    if(url==nullptr || nightpostclass==nullptr)
+        return false;
+    auto env=getenv();
+    if(env==nullptr)
+        return false;
+    const static jmethodID uploadAsync=env->GetStaticMethodID(
+        nightpostclass,
+        "uploadDeviceStatusAsync",
+        "(Ljava/lang/String;[BLjava/lang/String;Z)Z"
+    );
+    if(uploadAsync==nullptr) {
+        if(env->ExceptionCheck())
+            env->ExceptionClear();
+        LOGSTRING("Nightscout device-status async method unavailable\n");
+        return false;
+        }
+    jbyteArray payload=env->NewByteArray(len);
+    if(payload==nullptr)
+        return false;
+    env->SetByteArrayRegion(payload,0,len,reinterpret_cast<const jbyte *>(data));
+    if(env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(payload);
+        return false;
+        }
+    const jboolean queued=env->CallStaticBooleanMethod(
+        nightpostclass,
+        uploadAsync,
+        url,
+        payload,
+        jnightuploadsecret,
+        JNI_FALSE
+    );
+    env->DeleteLocalRef(payload);
+    if(env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return false;
+        }
+    return queued==JNI_TRUE;
+    }
+
+//Phone battery percentage via NightPost.batteryPercent(), or -1 when unavailable.
+static int getUploaderBatteryPercent() {
+    if(nightpostclass==nullptr)
+        return -1;
+    auto env=getenv();
+    if(env==nullptr)
+        return -1;
+    const static jmethodID mid=env->GetStaticMethodID(nightpostclass,"batteryPercent","()I");
+    if(mid==nullptr) {
+        if(env->ExceptionCheck())
+            env->ExceptionClear();
+        return -1;
+        }
+    const jint res=env->CallStaticIntMethod(nightpostclass,mid);
+    if(env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return -1;
+        }
+    return res;
+    }
+
+//Nightscout reads its uploader-battery pill from devicestatus[].uploader.battery. Matches the
+//shape xDrip+ posts, so existing Nightscout installs pick it up with no configuration. Issue #113.
+static time_t lastdevicestatusattempt=0;
+//The uploader wakes on every new reading, which is once a minute for some sensors. Battery does
+//not move that fast and a devicestatus attempt per minute would waste power when the endpoint is
+//unsupported. Throttle attempts rather than only successes so failures remain best-effort.
+static constexpr const int devicestatusintervalsecs=15*60;
+
+static bool uploadDeviceStatus() {
+    if(jnightuploadDevicestatusurl==nullptr)
+        return true;
+    const time_t nu=time(nullptr);
+    if(lastdevicestatusattempt && (nu-lastdevicestatusattempt)<devicestatusintervalsecs)
+        return true;
+    lastdevicestatusattempt=nu;
+    const int battery=getUploaderBatteryPercent();
+    if(battery<0||battery>100)
+        return true;
+    char buf[256];
+    char *ptr=buf;
+    const bool v3=devicestatusIsV3();
+    //Same battery document either way; only the wrapper differs. v3 takes the document on its
+    //own and refuses one without "app" ("Bad or missing app field"), where v1 takes an array
+    //and ignores the field.
+    if(v3) {
+        addar(ptr,R"({"app":"JugglucoNG","device":"JugglucoNG","date":)");
+        addjsonint(ptr,(long long)nu*1000LL);
+        addar(ptr,R"(,"utcOffset":0,"created_at":")");
+        }
+    else {
+        addar(ptr,R"([{"device":"JugglucoNG","created_at":")");
+        }
+    addNightscoutDateStringGMT(ptr,time(nullptr));
+    addar(ptr,R"(","uploader":{"battery":)");
+    addjsonint(ptr,battery);
+    //addar takes the literal by array reference, so the two shapes cannot share one call.
+    if(v3)
+        addar(ptr,R"(,"type":"PHONE"}})");
+    else
+        addar(ptr,R"(,"type":"PHONE"}}])");
+    *ptr='\0';
+    const bool queued=queueNightuploadDevicestatus(buf,ptr-buf);
+    LOGGER("Nightscout device-status battery=%d queued=%d\n",battery,queued);
+    return queued;
+    }
+
+//Journal IOB/eIOB/COB devicestatus. Setting check, cadence and payload live on
+//the Java side (NightPost/NightscoutIobDeviceStatus) where the journal is
+//reachable and unit-testable; this just hands over the endpoint. Same
+//best-effort contract as the battery devicestatus above: never blocks the
+//serialized upload loop.
+static void uploadIobDeviceStatus() {
+    if(nightpostclass==nullptr || jnightuploadDevicestatusurl==nullptr)
+        return;
+    auto env=getenv();
+    if(env==nullptr)
+        return;
+    const static jmethodID mid=env->GetStaticMethodID(
+        nightpostclass,
+        "maybeUploadIobDeviceStatus",
+        "(Ljava/lang/String;Ljava/lang/String;)Z"
+    );
+    if(mid==nullptr) {
+        if(env->ExceptionCheck())
+            env->ExceptionClear();
+        return;
+        }
+    env->CallStaticBooleanMethod(nightpostclass,mid,jnightuploadDevicestatusurl,jnightuploadsecret);
+    if(env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        }
+    }
 
 
 extern double     calibrateONEtest(const SensorGlucoseData *sens,const ScanData &value);
-//extern int Tdatestring(time_t tim,char *buf) ;
-#include "datestring.hpp"
 extern double getdelta(float change);
 extern std::string_view getdeltaname(float change);
-extern int mkv1streamid(char *outiter,const sensorname_t *name,int num);
-template <class T> int mkuploaditem(SensorGlucoseData *sens,char *buf,const sensorname_t *sensorname,const T &item,const bool includeId=false,const bool trailingComma=true) {
+
+//Every other exchange output gets data smoothing applied in Java, by
+//CurrentDisplaySource.resolveCurrentForExchange. The Nightscout uploader builds its
+//entries here, straight from the stored polls, so it has to run the same filter
+//itself or Nightscout stays the one destination carrying unsmoothed values.
+//Read/written by the uploader thread only, refreshed once per upload pass so a
+//120-item backfill chunk does not cross into Java per sample.
+static int uploadSmoothingSeconds=0;
+
+//Mirrors GlucoseSmoothing.smoothLane: complete windows use their centred mean;
+//when a series boundary clips the window, a degree-1 time regression is evaluated
+//at the sample timestamp and clamped to the measured range. Returns 0 (meaning
+//"keep the stored value") when smoothing is off or fewer than two valid samples
+//fall in the window. Polls are time-ordered, so an empty slot or a sample past the
+//window ends the walk.
+template <class Getvalue>
+static int smoothPollWindow(std::span<const ScanData> gdata,const int pos,Getvalue getvalue) {
+    if(uploadSmoothingSeconds<=0||pos<0||pos>=(int)gdata.size())
+        return 0;
+    const uint32_t tim=gdata[pos].gettime();
+    const uint32_t half=(uint32_t)uploadSmoothingSeconds/2;
+    if(!tim||!half||getvalue(pos)<=0)
+        return 0;
+    const uint64_t minTime=tim>=half?tim-half:0;
+    const uint64_t maxTime=(uint64_t)tim+half;
+    double sumX=0.0;
+    double sumY=0.0;
+    double sumXX=0.0;
+    double sumXY=0.0;
+    int count=0;
+    int measuredMin=INT_MAX;
+    int measuredMax=INT_MIN;
+    bool leftClipped=false;
+    bool rightClipped=false;
+    int i=pos;
+    for(;i>=0;--i) {
+        const uint32_t eltime=gdata[i].gettime();
+        if(!eltime) {
+            leftClipped=true;
+            break;
+            }
+        if(eltime<minTime)
+            break;
+        if(const int val=getvalue(i);val>0) {
+            const double x=(double)((int64_t)eltime-(int64_t)tim);
+            sumX+=x;
+            sumY+=val;
+            sumXX+=x*x;
+            sumXY+=x*val;
+            measuredMin=std::min(measuredMin,val);
+            measuredMax=std::max(measuredMax,val);
+            ++count;
+            }
+        }
+    if(i<0)
+        leftClipped=gdata.empty()||gdata.front().gettime()>minTime;
+    i=pos+1;
+    for(;i<(int)gdata.size();++i) {
+        const uint32_t eltime=gdata[i].gettime();
+        if(!eltime) {
+            rightClipped=true;
+            break;
+            }
+        if(eltime>maxTime)
+            break;
+        if(const int val=getvalue(i);val>0) {
+            const double x=(double)((int64_t)eltime-(int64_t)tim);
+            sumX+=x;
+            sumY+=val;
+            sumXX+=x*x;
+            sumXY+=x*val;
+            measuredMin=std::min(measuredMin,val);
+            measuredMax=std::max(measuredMax,val);
+            ++count;
+            }
+        }
+    if(i>=(int)gdata.size())
+        rightClipped=gdata.empty()||gdata.back().gettime()<maxTime;
+    if(count<=1)
+        return 0;
+    if(!leftClipped&&!rightClipped)
+        return (int)lround(sumY/count);
+
+    const double denominator=count*sumXX-sumX*sumX;
+    if(denominator<=1e-12)
+        return (int)lround(sumY/count);
+    const double slope=(count*sumXY-sumX*sumY)/denominator;
+    const double fitted=(sumY-slope*sumX)/count;
+    if(!std::isfinite(fitted))
+        return (int)lround(sumY/count);
+    return (int)lround(std::clamp(fitted,(double)measuredMin,(double)measuredMax));
+    }
+
+//Deliberately never calls ScanData::valid(): that patches a zero timestamp from the
+//preceding entry as a side effect, which a read-only averaging pass must not do.
+static int smoothedUploadMgdl(std::span<const ScanData> gdata,const int pos) {
+    return smoothPollWindow(gdata,pos,[gdata](const int i) {
+        const int g=gdata[i].getmgdL();
+        return (g>0&&g<552)?g:0;
+        });
+    }
+
+//getRawForPoll indexes by pointer offset into the polls array, which is exactly what
+//gdata spans here, so neighbouring raw values line up with their auto counterparts.
+static int smoothedUploadRaw(const SensorGlucoseData *sens,std::span<const ScanData> gdata,const int pos) {
+    return smoothPollWindow(gdata,pos,[sens,gdata](const int i) {
+        return (int)sens->getRawForPoll(&gdata[i]);
+        });
+    }
+
+//gdata/pos locate item inside the poll series so a rate can be derived when the driver reported
+//none (AiDex, Libre 3 backfill). Without it those sensors upload direction:"" and delta:0 forever.
+template <class T> int mkuploaditem(SensorGlucoseData *sens,char *buf,const sensorname_t *sensorname,const T &item,std::span<const ScanData> gdata,const int pos,const bool trailingComma=true) {
     const time_t tim=item.gettime();
-    const char *sensornameStr=sensorname->data();
-    const int rawCurrent=sens->getRawForPoll(&item);
-    int autoMgdl=item.getmgdL();
-    if(double calibrated=calibrateONEtest(sens,item);!isnan(calibrated))
+    const std::string_view sensornameView=fixedsensorview(sensorname);
+    char sensornameStr[64];
+    copyfixedsensorname(sensornameStr,sizeof(sensornameStr),sensorname);
+    const int rawSmoothed=smoothedUploadRaw(sens,gdata,pos);
+    const int rawCurrent=rawSmoothed>0?rawSmoothed:sens->getRawForPoll(&item);
+    //Average before calibrating, not after: calibrateONE is affine in the value, so
+    //this yields the same series the app's own smoothed display and broadcasts carry.
+    ScanData smoothed=item;
+    if(const int avg=smoothedUploadMgdl(gdata,pos);avg>0)
+        smoothed.g=avg;
+    int autoMgdl=smoothed.getmgdL();
+    if(double calibrated=calibrateONEtest(sens,smoothed);!isnan(calibrated))
         autoMgdl=(int)round(calibrated);
     int mgdL=getNightscoutCalibrationOverrideForItem(sens,sensornameStr,autoMgdl,rawCurrent,tim*1000LL);
     if(mgdL<=0)
         mgdL=autoMgdl;
-    float change= item.getchange();
-    const char * directionlabel=getdeltaname(change).data();
+    const float change=effectivechange(gdata,pos,item);
+    const std::string_view directionlabel=getdeltaname(change);
     double delta=getdelta(change);
-    char timestr[50];
-    Tdatestring(tim,timestr);
     char *out=buf;
-    out+=sprintf(out,R"({"type":"sgv","device":"%s","dateString":"%s","date":%lld,"sgv":%d,"delta":%.3f,"direction":"%s","noise":1,"filtered":%d,"unfiltered":%d,"rssi":100)",sensornameStr,timestr,tim*1000LL,mgdL,delta,directionlabel,mgdL*1000,mgdL*1000);
-    if(includeId) {
-        addar(out,R"(,"_id":")");
-        out+=mkv1streamid(out,sensorname,item.getid());
-        addar(out,R"(")");
-        }
+    addar(out,R"({"type":"sgv","device":")");
+    addjsonescaped(out,sensornameView);
+    addar(out,R"(","dateString":")");
+    addNightscoutDateString(out,tim);
+    addar(out,R"(","date":)");
+    addjsonint(out,tim*1000LL);
+    addar(out,R"(,"sgv":)");
+    addjsonint(out,mgdL);
+    addar(out,R"(,"delta":)");
+    addjsonfixed3(out,delta);
+    addar(out,R"(,"direction":")");
+    addjsonescaped(out,directionlabel);
+    addar(out,R"(","noise":1,"filtered":)");
+    addjsonint(out,mgdL*1000LL);
+    addar(out,R"(,"unfiltered":)");
+    addjsonint(out,mgdL*1000LL);
+    addar(out,R"(,"rssi":100)");
+    addar(out,R"(,"identifier":")");
+    out+=mksgvidentifier(out,sens->sensid(),tim);
+    addar(out,R"(")");
     if(trailingComma)
         addar(out,R"(},)");
     else
@@ -425,7 +737,7 @@ static bool uploadRecentV1(const int sensorid,SensorGlucoseData *sens,const sens
         char buf[512];
         char *ptr=buf;
         *ptr++='[';
-        ptr+=mkuploaditem(sens,ptr,sensorname,el,true,false);
+        ptr+=mkuploaditem(sens,ptr,sensorname,el,gdata,iter,false);
         *ptr++=']';
         *ptr='\0';
         const int res=nightuploadEntries(buf,ptr-buf);
@@ -451,7 +763,7 @@ static bool uploadV1ChunkIndividually(const int sensorid,SensorGlucoseData *sens
         char buf[512];
         char *ptr=buf;
         *ptr++='[';
-        ptr+=mkuploaditem(sens,ptr,sensorname,el,true,false);
+        ptr+=mkuploaditem(sens,ptr,sensorname,el,gdata,iter,false);
         *ptr++=']';
         *ptr='\0';
         const int res=nightuploadEntries(buf,ptr-buf);
@@ -461,29 +773,36 @@ static bool uploadV1ChunkIndividually(const int sensorid,SensorGlucoseData *sens
     return true;
     }
 
-static const char *writeNightscoutV3UploadEntry(char *buf,SensorGlucoseData *sens,const sensorname_t *sensorname,const ScanData *el) {
-extern char * writev3entry(char *outin,const ScanData *val, const sensorname_t *sensorname,bool server=true);
-    int autoMgdl=el->getmgdL();
-    if(double calibrated=calibrateONEtest(sens,*el);!isnan(calibrated))
+static const char *writeNightscoutV3UploadEntry(char *buf,SensorGlucoseData *sens,const sensorname_t *sensorname,const ScanData *el,std::span<const ScanData> gdata,const int pos) {
+extern char * writev3entry(char *outin,const ScanData *val, const sensorname_t *sensorname,bool server=true,
+	const std::string_view &uploadid={});
+    char sensornameStr[64];
+    copyfixedsensorname(sensornameStr,sizeof(sensornameStr),sensorname);
+    //Average before calibrating, not after: calibrateONE is affine in the value, so
+    //this yields the same series the app's own smoothed display and broadcasts carry.
+    ScanData smoothed=*el;
+    if(const int avg=smoothedUploadMgdl(gdata,pos);avg>0)
+        smoothed.g=avg;
+    int autoMgdl=smoothed.getmgdL();
+    if(double calibrated=calibrateONEtest(sens,smoothed);!isnan(calibrated))
         autoMgdl=(int)round(calibrated);
+    //getRawForPoll indexes by pointer offset from the polls base, so it must see the original el,
+    //never the patched copy above or below.
+    const int rawSmoothed=smoothedUploadRaw(sens,gdata,pos);
     const int overrideValue=getNightscoutCalibrationOverrideForItem(
         sens,
-        sensorname->data(),
+        sensornameStr,
         autoMgdl,
-        sens->getRawForPoll(el),
+        rawSmoothed>0?rawSmoothed:sens->getRawForPoll(el),
         el->gettime()*1000LL
     );
-    if(overrideValue>0) {
-        ScanData newel=*el;
-        newel.g=overrideValue;
-        return writev3entry(buf,&newel,sensorname,false);
-        }
-    if(autoMgdl!=el->getmgdL()) {
-        ScanData newel=*el;
-        newel.g=autoMgdl;
-        return writev3entry(buf,&newel,sensorname,false);
-        }
-    return writev3entry(buf,el,sensorname,false);
+    ScanData outel=*el;
+    if(overrideValue>0)
+        outel.g=overrideValue;
+    else
+        outel.g=autoMgdl;
+    outel.ch=effectivechange(gdata,pos,*el);
+    return writev3entry(buf,&outel,sensorname,false,sens->sensid());
     }
 
 static bool uploadRecentV3(const int sensorid,SensorGlucoseData *sens,const sensorname_t *sensorname,std::span<const ScanData> gdata,const uint32_t mintime) {
@@ -497,7 +816,7 @@ static bool uploadRecentV3(const int sensorid,SensorGlucoseData *sens,const sens
         if(isRecentNightUploadCovered(sensorid,el.gettime()))
             return true;
         char buf[320];
-        const char *ptr=writeNightscoutV3UploadEntry(buf,sens,sensorname,&el);
+        const char *ptr=writeNightscoutV3UploadEntry(buf,sens,sensorname,&el,gdata,iter);
         const int res=nightuploadEntries3(buf,ptr-buf);
         if(!isNightUploadAccepted(res))
             return false;
@@ -510,8 +829,27 @@ static bool uploadRecentV3(const int sensorid,SensorGlucoseData *sens,const sens
     return true;
     }
 
+//nightsensor persists across restarts and sensor rotations. An index cached for a
+//removed sensor stays past sensors->last() indefinitely, and the upload loops below
+//then visit zero sensors while reporting success: glucose silently stops reaching
+//Nightscout while device-status and treatments keep working, and an ordinary Resend
+//(wakeall) never clears the stale value. Re-seed whenever the cached index is unset
+//or out of range so a pass always covers the live sensor list.
+static int resolveNightStartSensor(const int last,const uint32_t mintime) {
+    const int cached=settings->data()->nightsensor;
+    if(!cached||cached>last) {
+        const int reseeded=sensors->firstafter(mintime);
+        if(reseeded!=cached)
+            LOGGER("nightsensor %d out of range (last=%d), reseeding to %d\n",cached,last,reseeded);
+        settings->data()->nightsensor=reseeded;
+        return reseeded;
+        }
+    return cached;
+    }
+
 static bool uploadCGM3(const bool prioritizeRecent=false) {
     LOGSTRING("upload\n");
+    uploadSmoothingSeconds=getExchangeSmoothingSeconds();
     int last=sensors->last();
     if(last<0) {
         LOGAR("No sensors");
@@ -519,9 +857,7 @@ static bool uploadCGM3(const bool prioritizeRecent=false) {
         }
     time_t nu=time(nullptr);
     uint32_t mintime=nu-nighttimeback;
-    if(!settings->data()->nightsensor)
-        settings->data()->nightsensor=sensors->firstafter(mintime);
-    int startsensor= settings->data()->nightsensor;
+    int startsensor=resolveNightStartSensor(last,mintime);
 
 /*    constexpr const auto twoweeks=15*24*60*60;
     time_t old=nu-twoweeks; */
@@ -532,7 +868,7 @@ static bool uploadCGM3(const bool prioritizeRecent=false) {
             std::span<const ScanData> gdata=sens->getPolldata();
             const sensorname_t *sensorname=sens->shortsensorname();
             int len=gdata.size();
-            int positer=sens->getinfo()->nightiter;
+            int positer=loadNightiter(sens);
             LOGGER("%d: positer=%d\n",sensorid,positer);
             int left=len-positer;
             bool send=false;
@@ -544,21 +880,26 @@ static bool uploadCGM3(const bool prioritizeRecent=false) {
                         }
                     }
                 for(;positer<len;positer++) { //Geen overlappende data?
+                    const int persisted=loadNightiter(sens);
+                    if(persisted>positer) {
+                        positer=persisted-1;
+                        continue;
+                        }
                     const ScanData *el= &gdata[positer];
                     if(el->valid(positer)&&el->gettime()>mintime) {
                         pruneRecentNightUpload(sensorid,el->gettime());
                         if(isRecentNightUploadCovered(sensorid,el->gettime())) {
-                            sens->getinfo()->nightiter=positer+1;
+                            advanceNightiter(sens,positer+1);
                             continue;
                             }
                         constexpr const int max3entry=320;
                         char buf[max3entry];
-                        const char *ptr=writeNightscoutV3UploadEntry(buf,sens,sensorname,el);
+                        const char *ptr=writeNightscoutV3UploadEntry(buf,sens,sensorname,el,gdata,positer);
                         const int buflen=ptr-buf;
                         logwriter(buf,buflen);
                         auto res=nightuploadEntries3(buf,buflen);
                         if(isNightUploadAccepted(res)) {
-                            sens->getinfo()->nightiter=positer+1;
+                            advanceNightiter(sens,positer+1);
                             send=true;
                             }
                         else {
@@ -586,6 +927,7 @@ static bool uploadCGM3(const bool prioritizeRecent=false) {
     }
 static bool uploadCGM(const bool prioritizeRecent=false) {
     LOGSTRING("upload\n");
+    uploadSmoothingSeconds=getExchangeSmoothingSeconds();
     int last=sensors->last();
     if(last<0) {
         LOGAR("No sensors");
@@ -593,10 +935,8 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
         }
     time_t nu=time(nullptr);
     uint32_t mintime=nu-nighttimeback;
-    if(!settings->data()->nightsensor)
-        settings->data()->nightsensor=sensors->firstafter(mintime);
-    int startsensor= settings->data()->nightsensor;
-    constexpr const int itemsize=420;
+    int startsensor=resolveNightStartSensor(last,mintime);
+    constexpr const int itemsize=512;
 /*
     constexpr const auto twoweeks=15*24*60*60;
     time_t old=nu-twoweeks; */
@@ -608,7 +948,7 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
             std::span<const ScanData> gdata=sens->getPolldata();
             const sensorname_t *sensorname=sens->shortsensorname();
             const int totallen=gdata.size();
-            int positer=sens->getinfo()->nightiter;
+            int positer=loadNightiter(sens);
             LOGGER("%d: positer=%d\n",sensorid,positer);
             int left=totallen-positer;
             if(left>=0) {
@@ -619,6 +959,9 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
                         }
                     }
                 while(positer<totallen) {
+                    positer=std::max(positer,static_cast<int>(loadNightiter(sens)));
+                    if(positer>=totallen)
+                        break;
                     const int chunklimit=positer<120?40:maxuploaditems;
                     const int chunkend=std::min(totallen,positer+chunklimit);
                     const int chunkitems=chunkend-positer;
@@ -639,7 +982,7 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
                             if(isRecentNightUploadCovered(sensorid,el.gettime())) {
                                 continue;
                                 }
-                            ptr+=mkuploaditem(sens,ptr,sensorname,el,false,true);
+                            ptr+=mkuploaditem(sens,ptr,sensorname,el,gdata,iter,true);
                             }
                         }
                     LOGGER("%d new positer=%d\n",sensorid,chunkend);
@@ -651,7 +994,7 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
                         LOGGERN(start,datalen);
                         const int res = nightuploadEntries(start,datalen);
                         if(isNightUploadSuccess(res)) {
-                            sens->getinfo()->nightiter=chunkend;
+                            advanceNightiter(sens,chunkend);
                             positer=chunkend;
                             LOGGER("%d nightupload Success\n",sensorid);
                             LOGGER("%d saved nightiter=%d\n", sensorid,chunkend);
@@ -660,7 +1003,7 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
                             continue;
                             }
                         if(res==HTTP_CONFLICT && uploadV1ChunkIndividually(sensorid,sens,sensorname,gdata,positer,chunkend,mintime)) {
-                            sens->getinfo()->nightiter=chunkend;
+                            advanceNightiter(sens,chunkend);
                             positer=chunkend;
                             LOGGER("%d nightupload conflict resolved individually\n",sensorid);
                             LOGGER("%d saved nightiter=%d\n", sensorid,chunkend);
@@ -676,7 +1019,7 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
                         }
                     else  {
                         LOGGER("ADDED nothing %d new positer=%d\n",sensorid,chunkend);
-                        sens->getinfo()->nightiter=chunkend;
+                        advanceNightiter(sens,chunkend);
                         positer=chunkend;
                         }
                     }
@@ -693,7 +1036,8 @@ static bool uploadCGM(const bool prioritizeRecent=false) {
 
 #include "datbackup.hpp"
 Backup::condvar_t  uploadercondition;
-bool uploaderrunning=false;
+static std::atomic<bool> uploaderrunning{false};
+static std::atomic<bool> uploaderthreadstarted{false};
 
 extern bool networkpresent;
 
@@ -718,8 +1062,20 @@ static bool uploadJournalTreatmentsViaJava(bool useV3) {
         }
     return res==JNI_TRUE;
     }
+/* What a failed pass wants tried again, how long the treatments branch waits before it does,
+   and when that wait is up. The wait needs its own clock: waitmin only applies when this
+   thread actually sleeps, and with a sensor streaming it is woken every minute, so a backoff
+   expressed as a sleep would throttle nothing at all. Only the uploader thread touches these. */
+static uintptr_t retrypending=0;
+static int treatmentbackoffmin=0;
+static std::chrono::steady_clock::time_point treatmentnextattempt{};
+
 static void uploaderthread() {
     int waitmin=0;
+    bool glucosefailed=false;
+    retrypending=0;
+    treatmentbackoffmin=0;
+    treatmentnextattempt=std::chrono::steady_clock::time_point{};
     uploaderrunning=true;
     lastNightUploadWaitMinutes = waitmin;
     const char view[]{"UPLOADER"};
@@ -736,21 +1092,43 @@ static void uploaderthread() {
                 std::unique_lock<std::mutex> lck(uploadercondition.backupmutex);
             LOGGER("UPLOADER before lock waitmin=%d\n",waitmin);
              auto now = std::chrono::system_clock::now();
+            /* The mask is asked about again here, holding the lock. It was read without it
+               above, so a wake landing in between set its bit, called notify_one with nobody
+               waiting yet, and was then slept through for as long as the wait lasts. That is
+               a request to send now, answered hours later or not at all. */
             #ifndef NOLOG
             auto status=
             #endif
-                        uploadercondition.backupcond.wait_until(lck, now + std::chrono::minutes(waitmin));
-            LOGGER("UPLOADER after lock %stimeout\n",(status==std::cv_status::no_timeout)?"no-":"");
+                        uploadercondition.backupcond.wait_until(lck, now + std::chrono::minutes(waitmin),
+                                [](){ return uploadercondition.dobackup!=0; });
+            LOGGER("UPLOADER after lock %stimeout\n",status?"no-":"");
             }
         if(uploadercondition.dobackup&Backup::wakeend) {
             uploadercondition.dobackup=0;
             uploaderrunning=false;
+            uploaderthreadstarted=false;
             LOGSTRING("end uploaderthread\n");
             return;
             }
-        const auto current=uploadercondition.dobackup;
-        uploadercondition.dobackup=0;
+        /* What was asked for, plus what the last pass could not deliver. Clearing dobackup
+           used to be the whole of a failed attempt: the branch set waitmin and continued,
+           and the pass that woke a quarter of an hour later found the mask empty and did
+           nothing at all. The reading stream hides that for glucose by raising wakestream
+           every minute; treatments have no such heartbeat, so a backlog sat there until
+           something unrelated came along.
+
+           Read and cleared under the same lock the raising side takes: a wake landing
+           between the read and the clear would otherwise be wiped out by the clear, and
+           since its branch never ran, nothing would carry it forward either. */
+        uintptr_t current;
+            {
+            std::lock_guard<std::mutex> lck(uploadercondition.backupmutex);
+            current=(uploadercondition.dobackup|retrypending);
+            uploadercondition.dobackup=0;
+            }
+        retrypending=0;
         bool useV3=settings->data()->nightscoutV3;
+        glucosefailed=false;
         const bool prioritizeRecent=(current&Backup::wakestream);
         if(current&(Backup::wakestream|Backup::wakeall)) {
             bool uploaded = useV3?uploadCGM3(prioritizeRecent):uploadCGM(prioritizeRecent);
@@ -765,12 +1143,21 @@ static void uploaderthread() {
                 uploaded = uploadCGM3(prioritizeRecent);
             }
             if(!uploaded) {
-                waitmin=lastNightUploadConfigError?0:15;
-                lastNightUploadWaitMinutes = waitmin;
-                continue;
+                glucosefailed=true;
+                retrypending|=(current&(Backup::wakestream|Backup::wakeall));
                 }
             }
-        if(current&(Backup::wakenums|Backup::wakeall)) {
+        const auto nowsteady=std::chrono::steady_clock::now();
+        const bool treatmentsdue=(nowsteady>=treatmentnextattempt);
+        /* Treatments are attempted even when the glucose upload has just failed. They are
+           separate endpoints failing for separate reasons, and returning here meant one bad
+           reading upload also swallowed the wake a journal entry had raised. */
+        if((current&(Backup::wakenums|Backup::wakeall|Backup::waketreatments))&&!treatmentsdue) {
+            /* Still holding off after a refusal. Keep the reason so it is asked again once
+               the hold is up, rather than losing it to this pass. */
+            retrypending|=Backup::waketreatments;
+            }
+        else if(current&(Backup::wakenums|Backup::wakeall|Backup::waketreatments)) {
             bool treatmentsOk = uploadJournalTreatmentsViaJava(useV3);
             if(!treatmentsOk && !useV3 && lastNightUploadCode==404) {
                 LOGSTRING("Nightscout v1 treatments endpoint returned 404, retrying with v3\n");
@@ -783,37 +1170,114 @@ static void uploaderthread() {
                 treatmentsOk = uploadJournalTreatmentsViaJava(true);
             }
             if(!treatmentsOk) {
-                waitmin=lastNightUploadConfigError?0:15;
-                lastNightUploadWaitMinutes = waitmin;
-                continue;
+                /* Ask again without waiting for anything else to happen, and more slowly
+                   each time: an entry the server will never accept must not be retried
+                   every quarter of an hour for the rest of the day. */
+                retrypending|=Backup::waketreatments;
+                treatmentbackoffmin=treatmentbackoffmin?(treatmentbackoffmin<120?treatmentbackoffmin*2:240):15;
+                treatmentnextattempt=nowsteady+std::chrono::minutes(treatmentbackoffmin);
+                }
+            else {
+                treatmentbackoffmin=0;
+                treatmentnextattempt=std::chrono::steady_clock::time_point{};
                 }
             }
-        waitmin=5*60;
+        /* Device status is not the treatments endpoint and does not fail with it. Skipping it
+           while a treatment is being refused would stop reporting IOB for as long as that
+           lasts, which can be indefinitely. A failed reading upload still skips it, as it
+           always has: that one shares its endpoint and its answer. */
+        if(!glucosefailed) {
+            //Best effort: Java posts this on a bounded, dedicated executor. Its endpoint status never
+            //overwrites the primary glucose uploader status or blocks this serialized upload loop.
+            uploadDeviceStatus();
+            uploadIobDeviceStatus();
+            }
+        if(glucosefailed)
+            waitmin=lastNightUploadConfigError?1:15;
+        else if(retrypending&Backup::waketreatments)
+            /* Never zero while something is carried forward: a wait of nothing with work
+               pending is a loop that never sleeps. */
+            waitmin=treatmentbackoffmin?treatmentbackoffmin:15;
+        else
+            waitmin=5*60;
         lastNightUploadWaitMinutes = waitmin;
         }
     }
 
-void startuploaderthread();
+bool startuploaderthread();
 void wakeuploader() {
-    if(!uploaderrunning && settings->data()->nightuploadon) {
+    bool ready=uploaderrunning.load();
+    if(!ready && settings->data()->nightuploadon) {
         auto env=getenv();
         if(env && inituploader(env)) {
             lastNightUploadConfigError = false;
+            ready=true;
             }
     }
-    if(uploaderrunning) {
+    if(ready) {
         lastNightUploadWaitMinutes = 0;
         uploadercondition.wakebackup(Backup::wakeall);
+        LOGSTRING("Nightscout wake source=full mask=all\n");
     }
     }
-void wakestreamuploader() {
-    if(uploaderrunning) 
+
+/* A journal entry was written, changed or deleted. Its own reason, so treatments no longer
+   depend on a number path raising wakenums for reasons of its own. */
+void waketreatmentsuploader() {
+    bool ready=uploaderrunning.load();
+    if(!ready && settings->data()->nightuploadon) {
+        auto env=getenv();
+        if(env && inituploader(env)) {
+            lastNightUploadConfigError = false;
+            ready=true;
+            }
+    }
+    if(ready) {
+        lastNightUploadWaitMinutes = 0;
+        uploadercondition.wakebackup(Backup::waketreatments);
+        LOGSTRING("Nightscout wake source=journal mask=treatments\n");
+    }
+    }
+
+static bool wakestreamuploader(JNIEnv *env,const char *source,const long long timestampMillis) {
+    if(!settings->data()->nightuploadon)
+        return false;
+    bool ready=uploaderrunning.load();
+    if(!ready && env && inituploader(env)) {
+        lastNightUploadConfigError=false;
+        ready=true;
+        }
+    if(ready) {
+        lastNightUploadWaitMinutes=0;
         uploadercondition.wakebackup(Backup::wakestream);
+        LOGGER(
+            "Nightscout wake source=%.48s timestamp=%lld mask=stream running=%d\n",
+            source?source:"native",
+            timestampMillis,
+            uploaderrunning.load()
+        );
+        }
+    return ready;
+    }
+
+void wakestreamuploader() {
+    wakestreamuploader(getenv(),"native",0);
     }
 #include "fromjava.h"    
 extern "C" JNIEXPORT void JNICALL fromjava(wakeuploader) (JNIEnv *env, jclass clazz) {
     wakeuploader();
     } 
+extern "C" JNIEXPORT void JNICALL fromjava(waketreatments) (JNIEnv *env, jclass clazz) {
+    waketreatmentsuploader();
+    } 
+extern "C" JNIEXPORT jboolean JNICALL fromjava(wakeNightscoutForLiveReading)
+    (JNIEnv *env,jclass clazz,jstring jsource,jlong timestampMillis) {
+    const char *source=jsource?env->GetStringUTFChars(jsource,nullptr):nullptr;
+    const bool ready=wakestreamuploader(env,source,timestampMillis);
+    if(source)
+        env->ReleaseStringUTFChars(jsource,source);
+    return ready?JNI_TRUE:JNI_FALSE;
+    }
 extern "C" JNIEXPORT void JNICALL fromjava(resetuploader) (JNIEnv *env, jclass clazz) {
     reset();
     wakeuploader();
@@ -832,18 +1296,27 @@ extern "C" JNIEXPORT jint JNICALL fromjava(getnightscoutretryminutes) (JNIEnv *e
     return lastNightUploadWaitMinutes.load();
     }
 extern "C" JNIEXPORT jboolean JNICALL fromjava(getnightscoutuploaderrunning) (JNIEnv *env, jclass clazz) {
-    return uploaderrunning;
+    return uploaderrunning.load()?JNI_TRUE:JNI_FALSE;
     }
 
 void enduploaderthread() {
-    if(uploaderrunning) {
+    if(uploaderthreadstarted.load()) {
         uploadercondition.wakebackup(Backup::wakeend);
         }
     }
-void startuploaderthread() {
-    if(!uploaderrunning) {
-        std::thread libre(uploaderthread);
-        libre.detach();
-        } 
+bool startuploaderthread() {
+    bool expected=false;
+    if(uploaderthreadstarted.compare_exchange_strong(expected,true)) {
+        try {
+            std::thread libre(uploaderthread);
+            libre.detach();
+            }
+        catch(...) {
+            uploaderthreadstarted=false;
+            LOGSTRING("Nightscout uploader thread failed to start\n");
+            return false;
+            }
+        }
+    return true;
     }
 #endif

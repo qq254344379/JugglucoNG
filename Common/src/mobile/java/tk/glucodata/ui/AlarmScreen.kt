@@ -53,13 +53,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 import tk.glucodata.Natives
 import tk.glucodata.R
@@ -69,6 +72,8 @@ import tk.glucodata.ui.theme.AppTypography
 import tk.glucodata.ui.util.rememberAdaptiveWindowMetrics
 
 enum class AlarmSeverity { LOW, HIGH, NEUTRAL }
+
+private const val ALARM_MOTION_ACTIVE_MS = 8_000L
 
 private enum class TrendDirection { UP, DOWN, FLAT, UNKNOWN }
 
@@ -104,6 +109,7 @@ fun AlarmScreen(
         PixelAlarmContent(
             primaryGlucose = primaryGlucose,
             alarmLabel = alarmLabel,
+            supportingText = supportingText,
             trend = trend,
             trendResult = trendResult,
             typographyChoice = typographyChoice,
@@ -117,6 +123,7 @@ fun AlarmScreen(
 private fun PixelAlarmContent(
     primaryGlucose: String,
     alarmLabel: String,
+    supportingText: String,
     trend: Trend,
     trendResult: TrendEngine.TrendResult,
     typographyChoice: AlarmTypographyChoice,
@@ -126,19 +133,31 @@ private fun PixelAlarmContent(
     BackHandler(enabled = true) {}
 
     var visible by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { visible = true }
+    var motionActive by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        visible = true
+        // This activity can sit on the lockscreen; keep frame-producing motion finite.
+        delay(ALARM_MOTION_ACTIVE_MS)
+        motionActive = false
+    }
 
     val compact = rememberAdaptiveWindowMetrics().isCompact
-    val infiniteTransition = rememberInfiniteTransition(label = "alarm-motion")
-    val arrowScale by infiniteTransition.animateFloat(
-        initialValue = if (compact) 4.6f else 5.6f,
-        targetValue = if (compact) 4.85f else 5.9f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1900),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "alarm-arrow-scale"
-    )
+    val settledArrowScale = if (compact) 4.72f else 5.72f
+    val arrowScale = if (motionActive) {
+        val infiniteTransition = rememberInfiniteTransition(label = "alarm-motion")
+        val animatedArrowScale by infiniteTransition.animateFloat(
+            initialValue = if (compact) 4.6f else 5.6f,
+            targetValue = if (compact) 4.85f else 5.9f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 1900),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "alarm-arrow-scale"
+        )
+        animatedArrowScale
+    } else {
+        settledArrowScale
+    }
     val heroOffsetY by animateFloatAsState(
         targetValue = if (visible) 0f else (-trend.verticalSign * 72f),
         animationSpec = spring(dampingRatio = 0.78f, stiffness = 210f),
@@ -172,6 +191,7 @@ private fun PixelAlarmContent(
             ) {
                 AlarmHeader(
                     alarmLabel = alarmLabel,
+                    supportingText = supportingText,
                     compact = compact,
                     fontFamily = typographyChoice.fontFamily,
                     modifier = Modifier.padding(top = if (compact) 28.dp else 40.dp)
@@ -191,6 +211,7 @@ private fun PixelAlarmContent(
                     trendResult = trendResult,
                     compact = compact,
                     typographyChoice = typographyChoice,
+                    motionActive = motionActive,
                     arrowScale = arrowScale,
                     modifier = Modifier.offset { IntOffset(0, heroOffsetY.roundToInt()) }
                 )
@@ -217,6 +238,7 @@ private fun PixelAlarmContent(
 @Composable
 private fun AlarmHeader(
     alarmLabel: String,
+    supportingText: String,
     compact: Boolean,
     fontFamily: FontFamily,
     modifier: Modifier = Modifier
@@ -248,6 +270,21 @@ private fun AlarmHeader(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
+            // What the alert actually says beyond its type name: expiry lead
+            // time, missed-reading duration, forecast horizon.
+            if (supportingText.isNotBlank()) {
+                Text(
+                    text = supportingText,
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontFamily = fontFamily,
+                        fontWeight = FontWeight.W300,
+                        letterSpacing = 0.sp
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -259,19 +296,25 @@ private fun HeroBlock(
     trendResult: TrendEngine.TrendResult,
     compact: Boolean,
     typographyChoice: AlarmTypographyChoice,
+    motionActive: Boolean,
     arrowScale: Float,
     modifier: Modifier = Modifier
 ) {
-    val motionTransition = rememberInfiniteTransition(label = "alarm-trend-motion")
-    val motionPhase by motionTransition.animateFloat(
-        initialValue = -1f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1450),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "alarm-trend-phase"
-    )
+    val motionPhase = if (motionActive) {
+        val motionTransition = rememberInfiniteTransition(label = "alarm-trend-motion")
+        val animatedMotionPhase by motionTransition.animateFloat(
+            initialValue = -1f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 1450),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "alarm-trend-phase"
+        )
+        animatedMotionPhase
+    } else {
+        0f
+    }
     val arrowOffsetX = when (trend.direction) {
         TrendDirection.FLAT -> motionPhase * if (compact) 6f else 8f
         TrendDirection.UNKNOWN -> 0f
@@ -287,20 +330,48 @@ private fun HeroBlock(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            text = primaryGlucose,
-            style = MaterialTheme.typography.displayLarge.copy(
+        BoxWithConstraints(modifier = Modifier.weight(1f)) {
+            val textMeasurer = rememberTextMeasurer()
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            val availableWidthPx = with(density) { maxWidth.roundToPx() }
+            val candidateSizes = remember(compact) {
+                if (compact) {
+                    listOf(120.sp, 112.sp, 104.sp, 96.sp, 88.sp, 80.sp, 72.sp, 64.sp, 56.sp, 48.sp, 40.sp, 32.sp)
+                } else {
+                    listOf(146.sp, 136.sp, 126.sp, 116.sp, 106.sp, 96.sp, 86.sp, 76.sp, 66.sp, 56.sp, 48.sp, 40.sp, 32.sp)
+                }
+            }
+            val baseStyle = MaterialTheme.typography.displayLarge.copy(
                 fontFamily = typographyChoice.fontFamily,
-                fontSize = if (compact) 120.sp else 146.sp,
-                lineHeight = if (compact) 122.sp else 146.sp,
                 fontWeight = typographyChoice.fontWeight,
-                letterSpacing = (-3.0).sp
-            ),
-            color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f)
-        )
+                letterSpacing = 0.sp,
+                fontFeatureSettings = "tnum"
+            )
+            val valueFontSize = remember(primaryGlucose, availableWidthPx, candidateSizes, baseStyle) {
+                candidateSizes.firstOrNull { size ->
+                    textMeasurer.measure(
+                        text = AnnotatedString(primaryGlucose),
+                        style = baseStyle.copy(
+                            fontSize = size,
+                            lineHeight = (size.value + 2f).sp
+                        ),
+                        maxLines = 1
+                    ).size.width <= availableWidthPx
+                } ?: candidateSizes.last()
+            }
+
+            Text(
+                text = primaryGlucose,
+                style = baseStyle.copy(
+                    fontSize = valueFontSize,
+                    lineHeight = (valueFontSize.value + 2f).sp
+                ),
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Clip,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
 
         Box(
             modifier = Modifier
@@ -329,7 +400,7 @@ private fun ActionDock(
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(36.dp),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(32.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         tonalElevation = 6.dp
     ) {
@@ -337,7 +408,7 @@ private fun ActionDock(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -348,7 +419,7 @@ private fun ActionDock(
                     modifier = Modifier
                         .fillMaxWidth(if (compact) 0.42f else 0.36f)
                         .height(if (compact) 58.dp else 62.dp),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(22.dp),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
                     contentPadding = PaddingValues(horizontal = 24.dp),
                     colors = ButtonDefaults.filledTonalButtonColors(
                         containerColor = MaterialTheme.colorScheme.surfaceVariant,
@@ -378,7 +449,6 @@ private fun ActionDock(
                 Text(
                     text = stringResource(R.string.stop),
                     style = MaterialTheme.typography.headlineSmall.copy(
-                        fontWeight = FontWeight.Medium,
                         letterSpacing = (-0.1).sp
                     )
                 )

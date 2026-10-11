@@ -2,14 +2,43 @@ package tk.glucodata
 
 import java.util.LinkedHashSet
 import java.util.concurrent.ConcurrentHashMap
+import tk.glucodata.drivers.ManagedBluetoothSensorDriver
 import tk.glucodata.drivers.ManagedSensorIdentityRegistry
+import tk.glucodata.drivers.ManagedSensorRuntime
 
 object SensorIdentity {
     private const val NULL_SENTINEL = "\u0000"
+    private const val UNKNOWN_SENSOR_SENTINEL = "?"
     private val nativeCanonicalCache = ConcurrentHashMap<String, String>()
+    // raw id -> resolved app (canonical) sensor id. resolveAppSensorId iterates every driver's
+    // identity adapter (each hitting SharedPreferences + regex), so it is far too costly to run
+    // per glucose point per frame — which the calibrated-chart draw path does. The mapping only
+    // changes when the sensor set / auth material changes, so memoize it and clear on those events.
+    private val appSensorIdCache = ConcurrentHashMap<String, String>()
+    // normalized "candidate\u0000expected" -> matches() result. The same reasoning as
+    // appSensorIdCache above, for the one path it did not cover: managedMatches asks
+    // every driver adapter to match live, and those adapters run regexes and registry
+    // lookups. matches() is called per reading per sensor, from resolveAvailableMainSensor,
+    // from dowithglucose, from resolveUiSnapshot and from the notification build, so the
+    // matcher itself has to be memoized, not just the canonical-id lookup underneath it.
+    private val matchCache = ConcurrentHashMap<String, Boolean>()
+    // Ids arrive from many sources (native short names, MACs, advertised names, aliases),
+    // so bound the key space rather than assume it stays as small as the sensor count.
+    private const val MATCH_CACHE_MAX_ENTRIES = 4096
 
     private fun normalized(sensorId: String?): String? {
-        return sensorId?.trim()?.takeIf { it.isNotEmpty() }
+        return sensorId
+            ?.trim()
+            ?.takeIf { isUsableSensorId(it) }
+    }
+
+    /** Reject native/UI placeholders before they can participate in sensor selection. */
+    @JvmStatic
+    fun isUsableSensorId(sensorId: String?): Boolean {
+        val value = sensorId?.trim() ?: return false
+        return value.isNotEmpty() &&
+            value != UNKNOWN_SENSOR_SENTINEL &&
+            value.none { it.isISOControl() }
     }
 
     private fun managedMatches(left: String?, right: String?): Boolean {
@@ -56,16 +85,39 @@ object SensorIdentity {
     @JvmStatic
     fun invalidateCaches() {
         nativeCanonicalCache.clear()
+        appSensorIdCache.clear()
+        matchCache.clear()
+        ManagedSensorRuntime.clearCaches()
     }
 
     @JvmStatic
     fun resolveAppSensorId(sensorId: String?): String? {
         val raw = normalized(sensorId) ?: return null
-        return ManagedSensorIdentityRegistry.all
+        appSensorIdCache[raw]?.let { return it }
+        val resolved = ManagedSensorIdentityRegistry.all
             .asSequence()
             .mapNotNull { it.resolveCanonicalSensorId(raw) }
             .firstOrNull { it.isNotBlank() }
             ?: raw
+        appSensorIdCache[raw] = resolved
+        return resolved
+    }
+
+    /**
+     * One logical id for protocol/state keys.
+     *
+     * Managed records resolve vendor aliases, while native storage resolves its
+     * short names back to the full sensor name. Running both here prevents a
+     * handoff from changing identity merely because one side learned more about
+     * the sensor than the other.
+     */
+    @JvmStatic
+    fun canonicalSensorId(sensorId: String?): String? {
+        val raw = normalized(sensorId) ?: return null
+        val managed = resolveAppSensorId(raw) ?: raw
+        val native = resolveNativeBackedCanonicalSensorId(managed)
+            ?: resolveNativeBackedCanonicalSensorId(raw)
+        return native?.let { resolveAppSensorId(it) ?: it } ?: managed
     }
 
     @JvmStatic
@@ -141,10 +193,34 @@ object SensorIdentity {
     @JvmStatic
     fun shouldUseNativeHistorySync(sensorId: String?): Boolean {
         val raw = normalized(sensorId) ?: return true
+        // The watch has no Room at all — HistoryRepository is mobile-only — so
+        // native storage is its only history, whether readings arrive over
+        // WearSync2 or from a driver connected here after a handoff. Letting a
+        // managed driver answer "Room owns this" left both sources empty and the
+        // screen showing "No data" over a full store.
+        if (Applic.isWearable) return true
+        managedDriverHistorySync(raw)?.let { return it }
         val canonical = canonicalOrRaw(raw) ?: raw
+        if (!canonical.equals(raw, ignoreCase = true)) {
+            managedDriverHistorySync(canonical)?.let { return it }
+        }
         return ManagedSensorIdentityRegistry.shouldUseNativeHistorySync(canonical)
             ?: ManagedSensorIdentityRegistry.shouldUseNativeHistorySync(raw)
             ?: true
+    }
+
+    private fun managedDriverHistorySync(sensorId: String?): Boolean? {
+        val raw = normalized(sensorId) ?: return null
+        return runCatching {
+            SensorBluetooth.mygatts()
+                .asSequence()
+                .mapNotNull { it as? ManagedBluetoothSensorDriver }
+                .mapNotNull { driver ->
+                    val matches = runCatching { driver.matchesManagedSensorId(raw) }.getOrDefault(false)
+                    if (matches) runCatching { driver.shouldUseNativeHistorySync() }.getOrNull() else null
+                }
+                .firstOrNull()
+        }.getOrNull()
     }
 
     @JvmStatic
@@ -166,23 +242,16 @@ object SensorIdentity {
 
     @JvmStatic
     fun resolveMainSensor(): String? {
-        val managed = canonicalOrRaw(ManagedCurrentSensor.get())
-        if (!managed.isNullOrBlank()) {
-            return managed
-        }
-        val main = resolveAppSensorId(Natives.lastsensorname())
-        if (!main.isNullOrBlank()) {
-            return main
-        }
-        return Natives.activeSensors()
-            ?.asSequence()
-            ?.mapNotNull(::resolveAppSensorId)
-            ?.firstOrNull { !it.isNullOrBlank() }
+        return resolveAvailableMainSensor(
+            selectedMain = Natives.lastsensorname(),
+            preferredSensorId = null,
+            activeSensors = availableSensorCandidates()
+        )
     }
 
     @JvmStatic
     fun resolveLiveMainSensor(preferredSensorId: String?): String? {
-        val activeSensors = Natives.activeSensors()
+        val activeSensors = availableSensorCandidates()
         if (activeSensors.isNullOrEmpty()) {
             return resolveMainSensor()
         }
@@ -193,6 +262,41 @@ object SensorIdentity {
         ) ?: resolveMainSensor()
     }
 
+    /**
+     * True when [mainSensor] is no longer one of the native sensors, i.e. only a stale
+     * Bluetooth callback still names it. A removed sensor that keeps the main role
+     * silences notifications for every sensor that is actually streaming.
+     */
+    @JvmStatic
+    fun isGhostMainSensor(mainSensor: String?): Boolean {
+        if (mainSensor.isNullOrBlank()) {
+            return false
+        }
+        val native = runCatching { Natives.activeSensors() }.getOrNull() ?: return false
+        if (native.isEmpty()) {
+            return false
+        }
+        return native.none { matches(it, mainSensor) }
+    }
+
+    private fun availableSensorCandidates(): Array<String?>? {
+        val resolved = LinkedHashSet<String?>()
+
+        runCatching {
+            Natives.activeSensors()?.forEach { sensorId ->
+                normalized(sensorId)?.let(resolved::add)
+            }
+        }
+
+        runCatching {
+            SensorBluetooth.mygatts().forEach { callback ->
+                normalized(callback.SerialNumber)?.let(resolved::add)
+            }
+        }
+
+        return resolved.takeIf { it.isNotEmpty() }?.toTypedArray()
+    }
+
     @JvmStatic
     fun resolveAvailableMainSensor(
         selectedMain: String?,
@@ -200,9 +304,6 @@ object SensorIdentity {
         activeSensors: Array<String?>?
     ): String? {
         val managed = canonicalOrRaw(ManagedCurrentSensor.get())
-        if (!managed.isNullOrBlank()) {
-            return managed
-        }
         val active = activeSensors
             ?.mapNotNull(::canonicalOrRaw)
             ?.distinct()
@@ -211,7 +312,11 @@ object SensorIdentity {
         val canonicalPreferred = canonicalOrRaw(preferredSensorId)
 
         if (active.isEmpty()) {
-            return canonicalSelected ?: canonicalPreferred
+            return managed ?: canonicalSelected ?: canonicalPreferred
+        }
+
+        if (managed != null && active.any { matches(it, managed) }) {
+            return managed
         }
 
         if (canonicalSelected != null && active.any { matches(it, canonicalSelected) }) {
@@ -235,6 +340,21 @@ object SensorIdentity {
         if (normalizedCandidate.equals(normalizedExpected, ignoreCase = true)) {
             return true
         }
+        val cacheKey = normalizedCandidate + NULL_SENTINEL + normalizedExpected
+        matchCache[cacheKey]?.let { return it }
+        val result = matchesUncached(normalizedCandidate, normalizedExpected)
+        if (matchCache.size >= MATCH_CACHE_MAX_ENTRIES) matchCache.clear()
+        matchCache[cacheKey] = result
+        return result
+    }
+
+    /**
+     * The identity resolution behind [matches], minus the trivial-equality fast path.
+     * Everything here is a registry or regex lookup whose answer only changes when
+     * [invalidateCaches] is called, which every driver registry already does on a
+     * sensor-set change.
+     */
+    private fun matchesUncached(normalizedCandidate: String, normalizedExpected: String): Boolean {
         if (managedMatches(normalizedCandidate, normalizedExpected)) {
             return true
         }

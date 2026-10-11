@@ -18,6 +18,15 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material3.DateRangePickerState
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material3.Button
+import androidx.compose.material3.DateRangePicker
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SelectableDates
+import androidx.compose.material3.rememberDateRangePickerState
+import androidx.compose.material3.rememberModalBottomSheetState
+import tk.glucodata.ui.components.CompactSheetDragHandle
+import tk.glucodata.ui.components.StableModalBottomSheet
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -33,7 +42,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -45,11 +53,12 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 
 fun formatStatsDateRange(range: StatsDateRange?): String? {
     if (range == null) return null
     val formatter = SimpleDateFormat("MMM d", Locale.getDefault())
-    return "${formatter.format(Date(range.startMillis))} - ${formatter.format(Date(range.endMillis))}"
+    return "${formatter.format(Date(range.startMillis))} – ${formatter.format(Date(range.endMillis))}"
 }
 
 fun clampStatsDateRangeToAvailable(range: StatsDateRange?, availableRange: StatsDateRange?): StatsDateRange? {
@@ -113,9 +122,9 @@ private fun formatPickerHeadline(
     return when {
         startUtcMillis != null && endUtcMillis != null &&
             yearFormatter.format(Date(startUtcMillis)) == yearFormatter.format(Date(endUtcMillis)) ->
-            "${monthDayFormatter.format(Date(startUtcMillis))} - ${monthDayYearFormatter.format(Date(endUtcMillis))}"
+            "${monthDayFormatter.format(Date(startUtcMillis))} – ${monthDayYearFormatter.format(Date(endUtcMillis))}"
         startUtcMillis != null && endUtcMillis != null ->
-            "${monthDayYearFormatter.format(Date(startUtcMillis))} - ${monthDayYearFormatter.format(Date(endUtcMillis))}"
+            "${monthDayYearFormatter.format(Date(startUtcMillis))} – ${monthDayYearFormatter.format(Date(endUtcMillis))}"
         startUtcMillis != null -> monthDayYearFormatter.format(Date(startUtcMillis))
         else -> monthDayYearFormatter.format(Date(endUtcMillis!!))
     }
@@ -134,7 +143,6 @@ fun StatsDateRangePickerHeadline(
             text = headline,
             modifier = modifier.padding(start = 24.dp, end = 24.dp, bottom = 2.dp),
             style = MaterialTheme.typography.titleLarge.copy(
-                fontWeight = FontWeight.Medium,
                 lineHeight = 24.sp
             ),
             maxLines = 1,
@@ -153,6 +161,7 @@ fun StatsRangeSelectorControl(
     onRangeSelected: (StatsTimeRange) -> Unit,
     onCustomRangeClick: () -> Unit,
     modifier: Modifier = Modifier,
+    coveragePercent: Float? = null,
     countLabelResId: Int = R.string.points
 ) {
     val view = LocalView.current
@@ -170,12 +179,17 @@ fun StatsRangeSelectorControl(
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (hasData && readingCount > 0) {
+                // Reading count and sensor coverage are both facts about the window, so
+                // they belong on the window's own line rather than inside a result card.
+                val countText = "${java.text.NumberFormat.getIntegerInstance().format(readingCount)} ${stringResource(countLabelResId)}"
                 Text(
-                    text = "$readingCount ${stringResource(countLabelResId)}",
+                    text = coveragePercent
+                        ?.let { "$countText · ${stringResource(R.string.stats_coverage_active, it.roundToInt())}" }
+                        ?: countText,
                     style = MaterialTheme.typography.labelMedium.copy(fontFeatureSettings = "tnum"),
                     color = MaterialTheme.colorScheme.outline,
                     modifier = Modifier
@@ -191,7 +205,7 @@ fun StatsRangeSelectorControl(
             Surface(
                 modifier = Modifier.heightIn(min = 36.dp),
                 onClick = onCustomRangeClick,
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
                 color = if (selectedRange == null) {
                     MaterialTheme.colorScheme.primaryContainer
                 } else {
@@ -207,7 +221,7 @@ fun StatsRangeSelectorControl(
                     modifier = Modifier
                         .animateContentSize()
                         .heightIn(min = 36.dp)
-                        .padding(horizontal = 10.dp),
+                        .padding(horizontal = 12.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -259,5 +273,153 @@ fun StatsRangeSelectorControl(
             unselectedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
             modifier = Modifier.fillMaxWidth()
         )
+    }
+}
+
+/** Quick spans offered above the calendar, so most visits never touch a date grid. */
+private enum class RangePreset(val labelResId: Int, val days: Int) {
+    LAST_7(R.string.range_7d, 7),
+    LAST_14(R.string.range_14d, 14),
+    LAST_30(R.string.range_30d, 30),
+    LAST_90(R.string.range_90d, 90)
+}
+
+/**
+ * Custom range picker.
+ *
+ * Three things the old dialog got wrong: a single tapped day was not a valid choice, so
+ * "show me Tuesday" meant tapping Tuesday twice and hoping; the confirm button stayed
+ * dead until it decided you were finished; and there was no way to say "the last
+ * fortnight" without counting backwards on a calendar. A sheet also gives the grid the
+ * room the dialog never had.
+ */
+@Composable
+fun StatsDateRangeSheet(
+    availableRange: StatsDateRange?,
+    activeRange: StatsDateRange?,
+    onDismiss: () -> Unit,
+    onApply: (startMillis: Long, endMillis: Long) -> Unit
+) {
+    val initialRange = clampStatsDateRangeToAvailable(activeRange, availableRange) ?: availableRange
+    val availableStartDateMillis = availableRange?.startMillis?.let(::toPickerUtcDateMillis)
+    val availableEndDateMillis = availableRange?.endMillis?.let(::toPickerUtcDateMillis)
+    val pickerState = rememberDateRangePickerState(
+        initialSelectedStartDateMillis = initialRange?.startMillis?.let(::toPickerUtcDateMillis),
+        initialSelectedEndDateMillis = initialRange?.endMillis?.let(::toPickerUtcDateMillis),
+        selectableDates = object : SelectableDates {
+            override fun isSelectableDate(utcTimeMillis: Long): Boolean {
+                val earliest = availableStartDateMillis ?: 0L
+                val latest = availableEndDateMillis ?: toPickerUtcDateMillis(System.currentTimeMillis())
+                return utcTimeMillis in earliest..latest
+            }
+        }
+    )
+
+    val startUtc = pickerState.selectedStartDateMillis
+    // One tap is a one-day range. Waiting for a second tap made the common case the
+    // awkward one.
+    val endUtc = pickerState.selectedEndDateMillis ?: startUtc
+    val dayCount = if (startUtc != null && endUtc != null) {
+        (((endUtc - startUtc) / 86_400_000L) + 1L).toInt().coerceAtLeast(1)
+    } else {
+        0
+    }
+
+    StableModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        dragHandle = { CompactSheetDragHandle() }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 24.dp)) {
+                Text(
+                    text = stringResource(R.string.stats_custom_range_title),
+                    style = MaterialTheme.typography.headlineSmallEmphasized
+                )
+                Text(
+                    text = if (dayCount > 0) {
+                        val span = formatPickerHeadline(startUtc, endUtc).orEmpty()
+                        "$span · ${stringResource(R.string.stats_span_days, dayCount)}"
+                    } else {
+                        stringResource(R.string.stats_custom_range_hint)
+                    },
+                    style = MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            val presets = RangePreset.entries.toList()
+            val presetLabels = presets.associateWith { stringResource(it.labelResId) }
+            ConnectedButtonGroup(
+                options = presets,
+                selectedOption = null,
+                onOptionSelected = { preset ->
+                    val end = availableRange?.endMillis ?: System.currentTimeMillis()
+                    val endDay = toPickerUtcDateMillis(end)
+                    pickerState.setSelection(
+                        startDateMillis = endDay - ((preset.days - 1).toLong() * 86_400_000L),
+                        endDateMillis = endDay
+                    )
+                },
+                labelText = { preset -> presetLabels[preset].orEmpty() },
+                label = { preset ->
+                    Text(
+                        text = presetLabels[preset].orEmpty(),
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                },
+                itemHeight = 40.dp,
+                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                selectedContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                unselectedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp)
+            )
+
+            DateRangePicker(
+                state = pickerState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false),
+                title = null,
+                headline = null,
+                showModeToggle = false
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(text = stringResource(R.string.cancel))
+                }
+                Button(
+                    onClick = {
+                        val start = startUtc?.let(::pickerUtcDateMillisToLocalStart) ?: return@Button
+                        val end = (endUtc ?: startUtc).let(::pickerUtcDateMillisToLocalEnd)
+                        onApply(start, end)
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = startUtc != null
+                ) {
+                    Text(text = stringResource(R.string.stats_apply_range))
+                }
+            }
+        }
     }
 }

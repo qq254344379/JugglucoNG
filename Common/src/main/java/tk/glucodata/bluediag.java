@@ -65,7 +65,7 @@ import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 import static tk.glucodata.Applic.isWearable;
 import static tk.glucodata.Log.doLog;
 import static tk.glucodata.NumberView.avoidSpinnerDropdownFocus;
-import static tk.glucodata.Specific.useclose;
+import static tk.glucodata.VariantBootstrapAccess.useCloseButton;
 import static tk.glucodata.help.help;
 import static tk.glucodata.help.helplight;
 import static tk.glucodata.settings.Settings.removeContentView;
@@ -326,14 +326,35 @@ public class bluediag {
     MainActivity activity;
     static private int gattselected = 0;
 
+    private void restoreAfterFailedFinish(SuperGattCallback gatt) {
+        try {
+            gatt.setPause(false);
+            gatt.connectDevice(0L);
+        } catch (Throwable throwable) {
+            Log.stack(LOG_ID, "Could not restore " + gatt.SerialNumber + " after failed finish", throwable);
+        }
+    }
+
     void confirmFinish(SuperGattCallback gat) {
         AlertDialog.Builder builder = new AlertDialog.Builder(activity);
         String serial = gat.SerialNumber;
         builder.setTitle(serial).setMessage(R.string.finishsensormessage)
                 .setPositiveButton(R.string.ok, new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface dialog, int id) {
-                        gat.finishSensor();
-                        SensorBluetooth.sensorEnded(serial);
+                        try {
+                            gat.setPause(true);
+                            gat.closeGattTransport();
+                        } catch (Throwable throwable) {
+                            Log.stack(LOG_ID, "Could not finish " + serial, throwable);
+                        }
+                        final NativeSensorTermination.Result result =
+                                NativeSensorTermination.removeAndConfirm(serial);
+                        if (result == NativeSensorTermination.Result.CONFIRMED) {
+                            SensorBluetooth.sensorEnded(serial);
+                        } else {
+                            restoreAfterFailedFinish(gat);
+                            Applic.Toaster(activity.getString(R.string.disconnect_sensor_failed));
+                        }
                         activity.requestRender();
                         activity.doonback();
                         bluediag.start(activity);
@@ -396,7 +417,7 @@ public class bluediag {
         var close = getbutton(act, R.string.closename);
         var height = GlucoseCurve.getheight();
         var width = GlucoseCurve.getwidth();
-        if (!useclose)
+        if (!useCloseButton())
             close.setVisibility(GONE);
 
         var help = getbutton(act, R.string.helpname);
@@ -457,7 +478,7 @@ public class bluediag {
      * var close=getbutton(act,R.string.closename);
      * var height=GlucoseCurve.getheight();
      * var width=GlucoseCurve.getwidth();
-     * if(!useclose)
+     * if(!useCloseButton())
      * close.setVisibility(GONE);
      * Layout layout = new Layout(act, (l, w, h) -> {
      * l.setX((width-w)/2);
@@ -758,6 +779,11 @@ public class bluediag {
                             final int currentMode = Natives.getViewMode(gatt.dataptr);
                             if (currentMode != pos) {
                                 Natives.setViewMode(gatt.dataptr, pos);
+                                // The persisted store is what every surface reads
+                                // when no driver is live; writing native alone
+                                // would leave this choice invisible to them.
+                                tk.glucodata.drivers.ManagedSensorViewModeStore.INSTANCE.write(
+                                        Applic.app, gatt.SerialNumber, pos);
                                 act.requestRender();
                             }
                         }
@@ -890,7 +916,7 @@ public class bluediag {
 
         Button close = view.findViewById(R.id.close);
         close.setOnClickListener(v -> act.doonback());
-        if (!useclose)
+        if (!useCloseButton())
             close.setVisibility(GONE);
 
         view.setBackgroundColor(Applic.backgroundcolor);
@@ -945,8 +971,8 @@ public class bluediag {
             scheduled.cancel(false);
             act.setfineres(null);
             removeContentView(showview);
-            if (Menus.on) {
-                Menus.show(act);
+            if (LegacyScreensAccess.getMenusOn()) {
+                LegacyScreensAccess.get().openMenus(act);
             }
 
         });
@@ -1144,7 +1170,7 @@ public class bluediag {
         final ArrayList<SuperGattCallback> gatts = SensorBluetooth.mygatts();
         if (gatts == null || gatts.size() == 0) {
             if (isWearable)
-                Specific.wearnosensors(act);
+                VariantBootstrapAccess.create().wearnosensors(act);
             else
                 MirrorSensors.show(act);
             return;

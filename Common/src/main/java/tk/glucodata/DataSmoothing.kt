@@ -1,14 +1,11 @@
 package tk.glucodata
 
 import android.content.Context
+import tk.glucodata.settings.SettingsRegistry
 
 object DataSmoothing {
-    private const val PREFS_NAME = "tk.glucodata_preferences"
-    private const val MINUTES_KEY = "dashboard_chart_smoothing_minutes"
+    private const val PREFS_NAME = SettingsRegistry.FILE
     private const val LAST_ENABLED_MINUTES_KEY = "dashboard_data_smoothing_last_enabled_minutes"
-    private const val GRAPH_ONLY_KEY = "dashboard_data_smoothing_graph_only"
-    private const val COLLAPSE_CHUNKS_KEY = "dashboard_data_smoothing_collapse_chunks"
-    private const val EXCHANGE_OUTPUTS_ONLY_KEY = "dashboard_data_smoothing_exchange_outputs_only"
     private const val MAX_CHUNK_INTERVAL_MINUTES = 5
     private const val DEFAULT_ENABLED_MINUTES = MAX_CHUNK_INTERVAL_MINUTES
 
@@ -28,14 +25,17 @@ object DataSmoothing {
 
     @JvmStatic
     fun getMinutes(context: Context): Int {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return sanitizeMinutes(prefs.getInt(MINUTES_KEY, 0))
+        return sanitizeMinutes(SettingsRegistry.SMOOTHING_MINUTES.readInt(context))
     }
 
     @JvmStatic
     fun getLastEnabledMinutes(context: Context): Int {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val current = sanitizeMinutes(prefs.getInt(MINUTES_KEY, DEFAULT_ENABLED_MINUTES))
+        // The same key, but a different question: the fallback here is the last
+        // window that was on, not the setting's own default of 0.
+        val current = sanitizeMinutes(
+            prefs.getInt(SettingsRegistry.SMOOTHING_MINUTES.key, DEFAULT_ENABLED_MINUTES)
+        )
         val fallback = current.takeIf { it > 0 } ?: DEFAULT_ENABLED_MINUTES
         return sanitizeMinutes(prefs.getInt(LAST_ENABLED_MINUTES_KEY, fallback))
             .takeIf { it > 0 }
@@ -46,46 +46,81 @@ object DataSmoothing {
     fun isEnabled(context: Context): Boolean = getMinutes(context) > 0
 
     @JvmStatic
-    fun isGraphOnly(context: Context): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getBoolean(GRAPH_ONLY_KEY, false)
-    }
+    fun isGraphOnly(context: Context): Boolean =
+        SettingsRegistry.SMOOTHING_GRAPH_ONLY.readBool(context)
 
     @JvmStatic
-    fun collapseChunks(context: Context): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getBoolean(COLLAPSE_CHUNKS_KEY, false)
-    }
+    fun collapseChunks(context: Context): Boolean =
+        SettingsRegistry.SMOOTHING_COLLAPSE_CHUNKS.readBool(context)
 
     @JvmStatic
-    fun smoothOnlyExchangeOutputs(context: Context): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getBoolean(EXCHANGE_OUTPUTS_ONLY_KEY, false)
-    }
+    fun smoothOnlyExchangeOutputs(context: Context): Boolean =
+        SettingsRegistry.SMOOTHING_EXCHANGE_OUTPUTS_ONLY.readBool(context)
+
+    /**
+     * The three places a reading is used, and the one question each of them asks.
+     *
+     * The settings are three independent switches, so every caller used to recombine them
+     * for itself and they drifted: the same reading could be smoothed on its way to the
+     * notification and measured on its way to the row beside it. Ask here instead. Each
+     * destination has a `...SmoothingMinutes` accessor returning 0 when that destination
+     * takes the reading as measured, so "how much smoothing" and "any at all" are one
+     * question with one answer.
+     *
+     * Not fully independent, though: "collapse into chunks" is defined as keeping one
+     * *smoothed* reading per interval, so enabling it for exchange pulls exchange smoothing
+     * back on even under "graph only" — there is no smoothed reading to collapse to
+     * otherwise. See [shouldSmoothExchangeOutputs]'s `collapseChunks` parameter.
+     */
+    @JvmStatic
+    fun shouldSmoothGraph(context: Context): Boolean = graphSmoothingMinutes(context) > 0
 
     @JvmStatic
-    fun shouldSmoothGraph(context: Context): Boolean {
-        return getMinutes(context) > 0 && !smoothOnlyExchangeOutputs(context)
-    }
+    fun graphSmoothingMinutes(context: Context): Int = graphSmoothingMinutes(
+        smoothingMinutes = getMinutes(context),
+        exchangeOutputsOnly = smoothOnlyExchangeOutputs(context)
+    )
+
+    /**
+     * The window the app's own reading carries: the trend arrow, the Δ readout, the delta
+     * alarms and every threshold evaluated against a value. Smoothing here is deliberate —
+     * it is what keeps a single wild sample from deciding an arrow — and "smooth only
+     * graph" is the way to opt out of it.
+     */
+    @JvmStatic
+    fun localSmoothingMinutes(context: Context): Int = localSmoothingMinutes(
+        smoothingMinutes = getMinutes(context),
+        graphOnly = isGraphOnly(context),
+        exchangeOutputsOnly = smoothOnlyExchangeOutputs(context)
+    )
 
     @JvmStatic
-    fun graphSmoothingMinutes(context: Context): Int {
-        return if (shouldSmoothGraph(context)) getMinutes(context) else 0
-    }
-
-    @JvmStatic
-    fun shouldSmoothLocalData(context: Context): Boolean {
-        return getMinutes(context) > 0 &&
-            !isGraphOnly(context) &&
-            !smoothOnlyExchangeOutputs(context)
-    }
+    fun shouldSmoothLocalData(context: Context): Boolean = localSmoothingMinutes(context) > 0
 
     @JvmStatic
     fun shouldSmoothExchangeOutputs(context: Context): Boolean {
         return shouldSmoothExchangeOutputs(
             smoothingMinutes = getMinutes(context),
             graphOnly = isGraphOnly(context),
-            exchangeOutputsOnly = smoothOnlyExchangeOutputs(context)
+            exchangeOutputsOnly = smoothOnlyExchangeOutputs(context),
+            collapseChunks = collapseChunks(context)
+        )
+    }
+
+    /**
+     * Averaging window, in minutes, that every outgoing reading must carry — 0 when
+     * exchange outputs are configured to stay unsmoothed. Java-side outputs get this
+     * applied for them by [CurrentDisplaySource.resolveCurrentForExchange]; the native
+     * Nightscout uploader builds its entries straight from stored polls and has to ask
+     * for the window itself (see NightscoutCalibration.getExchangeSmoothingSeconds).
+     */
+    @JvmStatic
+    fun exchangeSmoothingMinutes(context: Context): Int {
+        return exchangeSmoothingMinutes(
+            smoothingMinutes = getMinutes(context),
+            graphOnly = isGraphOnly(context),
+            exchangeOutputsOnly = smoothOnlyExchangeOutputs(context),
+            collapseChunks = collapseChunks(context)
         )
     }
 
@@ -99,12 +134,31 @@ object DataSmoothing {
         )
     }
 
+    /**
+     * How often, in minutes, an exchange output is fed: 0 means every reading.
+     *
+     * "Collapse into chunks" thins the *rate* of what leaves the phone; it never changes what is
+     * sent. Whatever is sent is the newest reading under its own timestamp — the payload is not
+     * built from the last point of a completed chunk, which would be up to two intervals old.
+     * This applies uniformly to every exchange destination, including the xDrip/xInfuus loop feed
+     * AAPS doses from: it used to be exempt from collapse because the old design broke the "own
+     * timestamp" guarantee for it, not because thinning it was unsafe on its own.
+     */
+    @JvmStatic
+    fun exchangeThrottleIntervalMinutes(context: Context): Int =
+        exchangeThrottleIntervalMinutes(
+            smoothingMinutes = getMinutes(context),
+            graphOnly = isGraphOnly(context),
+            exchangeOutputsOnly = smoothOnlyExchangeOutputs(context),
+            collapseChunks = collapseChunks(context)
+        )
+
     @JvmStatic
     fun setMinutes(context: Context, minutes: Int) {
         val sanitized = sanitizeMinutes(minutes)
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putInt(MINUTES_KEY, sanitized)
+            .putInt(SettingsRegistry.SMOOTHING_MINUTES.key, sanitized)
             .apply()
         if (sanitized > 0) {
             setLastEnabledMinutes(context, sanitized)
@@ -123,7 +177,7 @@ object DataSmoothing {
     fun setGraphOnly(context: Context, graphOnly: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(GRAPH_ONLY_KEY, graphOnly)
+            .putBoolean(SettingsRegistry.SMOOTHING_GRAPH_ONLY.key, graphOnly)
             .apply()
     }
 
@@ -131,7 +185,7 @@ object DataSmoothing {
     fun setCollapseChunks(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(COLLAPSE_CHUNKS_KEY, enabled)
+            .putBoolean(SettingsRegistry.SMOOTHING_COLLAPSE_CHUNKS.key, enabled)
             .apply()
     }
 
@@ -139,7 +193,7 @@ object DataSmoothing {
     fun setSmoothOnlyExchangeOutputs(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(EXCHANGE_OUTPUTS_ONLY_KEY, enabled)
+            .putBoolean(SettingsRegistry.SMOOTHING_EXCHANGE_OUTPUTS_ONLY.key, enabled)
             .apply()
     }
 
@@ -153,10 +207,12 @@ object DataSmoothing {
     }
 
     @JvmStatic
+    @JvmOverloads
     fun smoothNativePoints(
         points: List<GlucosePoint>?,
         smoothingMinutes: Int,
-        collapseChunks: Boolean
+        collapseChunks: Boolean,
+        nowMillis: Long = System.currentTimeMillis()
     ): List<GlucosePoint> {
         if (points.isNullOrEmpty()) {
             return emptyList()
@@ -167,7 +223,7 @@ object DataSmoothing {
         }
         if (points.size < 3) {
             return if (collapseChunks) {
-                collapsePointsForDisplay(points, collapseIntervalMinutes(sanitizedMinutes))
+                collapsePointsForDisplay(points, collapseIntervalMinutes(sanitizedMinutes), nowMillis)
             } else {
                 points
             }
@@ -189,7 +245,7 @@ object DataSmoothing {
         }
 
         return if (collapseChunks) {
-            collapsePointsForDisplay(smoothed, collapseIntervalMinutes(sanitizedMinutes))
+            collapsePointsForDisplay(smoothed, collapseIntervalMinutes(sanitizedMinutes), nowMillis)
         } else {
             smoothed
         }
@@ -199,51 +255,12 @@ object DataSmoothing {
         points: List<GlucosePoint>,
         halfWindowMs: Long,
         useRawValue: Boolean
-    ): FloatArray {
-        val size = points.size
-        val prefixSums = DoubleArray(size + 1)
-        val prefixCounts = IntArray(size + 1)
-
-        for (index in 0 until size) {
-            val point = points[index]
-            val value = if (useRawValue) point.rawValue else point.value
-            val valid = value.isFinite() && value >= 0.1f
-            prefixSums[index + 1] = prefixSums[index] + if (valid) value.toDouble() else 0.0
-            prefixCounts[index + 1] = prefixCounts[index] + if (valid) 1 else 0
-        }
-
-        val result = FloatArray(size)
-        var windowStart = 0
-        var windowEndExclusive = 0
-
-        for (index in 0 until size) {
-            val point = points[index]
-            val original = if (useRawValue) point.rawValue else point.value
-            if (!original.isFinite() || original < 0.1f) {
-                result[index] = original
-                continue
-            }
-
-            val minTime = point.timestamp - halfWindowMs
-            val maxTime = point.timestamp + halfWindowMs
-
-            while (windowStart < size && points[windowStart].timestamp < minTime) {
-                windowStart++
-            }
-            while (windowEndExclusive < size && points[windowEndExclusive].timestamp <= maxTime) {
-                windowEndExclusive++
-            }
-
-            val count = prefixCounts[windowEndExclusive] - prefixCounts[windowStart]
-            result[index] = if (count > 0) {
-                ((prefixSums[windowEndExclusive] - prefixSums[windowStart]) / count).toFloat()
-            } else {
-                original
-            }
-        }
-
-        return result
-    }
+    ): FloatArray = GlucoseSmoothing.smoothLane(
+        points = points,
+        halfWindowMs = halfWindowMs,
+        timestamp = { it.timestamp },
+        selector = { if (useRawValue) it.rawValue else it.value },
+    )
 
     internal fun collapsePointsForDisplay(
         points: List<GlucosePoint>,
@@ -281,12 +298,45 @@ object DataSmoothing {
         }
     }
 
-    internal fun shouldSmoothExchangeOutputs(
+    /** Presentation. Untouched by "smooth only graph": that switch is about everything else. */
+    internal fun graphSmoothingMinutes(smoothingMinutes: Int, exchangeOutputsOnly: Boolean): Int {
+        val sanitized = sanitizeMinutes(smoothingMinutes)
+        return if (sanitized > 0 && !exchangeOutputsOnly) sanitized else 0
+    }
+
+    /** Evaluation: off when either "only the graph" or "only what leaves the phone" is set. */
+    internal fun localSmoothingMinutes(
         smoothingMinutes: Int,
         graphOnly: Boolean,
         exchangeOutputsOnly: Boolean
+    ): Int {
+        val sanitized = sanitizeMinutes(smoothingMinutes)
+        return if (sanitized > 0 && !graphOnly && !exchangeOutputsOnly) sanitized else 0
+    }
+
+    /**
+     * "Collapse" keeps one *smoothed* reading per interval (see its own description) — it
+     * has nothing meaningful to keep if exchange stayed unsmoothed, so turning it on pulls
+     * exchange smoothing back in even under "graph only". Default false keeps every
+     * existing three-switch call site (and its tests) unaffected.
+     */
+    internal fun shouldSmoothExchangeOutputs(
+        smoothingMinutes: Int,
+        graphOnly: Boolean,
+        exchangeOutputsOnly: Boolean,
+        collapseChunks: Boolean = false
     ): Boolean {
-        return sanitizeMinutes(smoothingMinutes) > 0 && (exchangeOutputsOnly || !graphOnly)
+        return sanitizeMinutes(smoothingMinutes) > 0 && (exchangeOutputsOnly || !graphOnly || collapseChunks)
+    }
+
+    internal fun exchangeSmoothingMinutes(
+        smoothingMinutes: Int,
+        graphOnly: Boolean,
+        exchangeOutputsOnly: Boolean,
+        collapseChunks: Boolean = false
+    ): Int {
+        val sanitized = sanitizeMinutes(smoothingMinutes)
+        return if (shouldSmoothExchangeOutputs(sanitized, graphOnly, exchangeOutputsOnly, collapseChunks)) sanitized else 0
     }
 
     internal fun shouldCollapseExchangeOutputs(
@@ -298,8 +348,20 @@ object DataSmoothing {
         return collapseChunks && shouldSmoothExchangeOutputs(
             smoothingMinutes = smoothingMinutes,
             graphOnly = graphOnly,
-            exchangeOutputsOnly = exchangeOutputsOnly
+            exchangeOutputsOnly = exchangeOutputsOnly,
+            collapseChunks = collapseChunks
         )
+    }
+
+    internal fun exchangeThrottleIntervalMinutes(
+        smoothingMinutes: Int,
+        graphOnly: Boolean,
+        exchangeOutputsOnly: Boolean,
+        collapseChunks: Boolean
+    ): Int = if (shouldCollapseExchangeOutputs(smoothingMinutes, graphOnly, exchangeOutputsOnly, collapseChunks)) {
+        collapseIntervalMinutes(smoothingMinutes)
+    } else {
+        0
     }
 
     private fun setLastEnabledMinutes(context: Context, minutes: Int) {

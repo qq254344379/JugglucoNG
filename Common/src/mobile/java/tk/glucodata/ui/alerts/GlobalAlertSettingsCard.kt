@@ -46,6 +46,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import tk.glucodata.ui.components.IconTile
+import tk.glucodata.BuildConfig
 import tk.glucodata.R
 import tk.glucodata.alerts.AlertConfig
 import tk.glucodata.alerts.AlertType
@@ -67,9 +69,8 @@ fun GlobalAlertSettingsCard(
 
     var draftConfig by remember { mutableStateOf(seedConfig) }
     var appliedDraft by remember { mutableStateOf(seedConfig) }
-    val hasPendingChanges = remember(draftConfig, appliedDraft) {
-        !draftConfig.sameMasterDraft(appliedDraft)
-    }
+    val hasPendingChanges = !draftConfig.sameMasterDraft(appliedDraft)
+    val canApplyToAll = shouldEnableApplyToAll(draftConfig, appliedDraft, allConfigs)
 
     LaunchedEffect(seedConfig) {
         if (!hasPendingChanges) {
@@ -131,38 +132,24 @@ fun GlobalAlertSettingsCard(
                     .padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Surface(
-                    modifier = Modifier.size(44.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    color = iconContainerColor
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.NotificationsActive,
-                            contentDescription = null,
-                            tint = iconTint,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-                }
+                IconTile(
+                    icon = Icons.Default.NotificationsActive,
+                    tint = iconTint,
+                    containerColor = iconContainerColor,
+                )
 
                 Spacer(modifier = Modifier.width(12.dp))
 
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = stringResource(R.string.master_alert_control),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                        style = MaterialTheme.typography.titleMediumEmphasized,)
                     Text(
+                        // The title already says "all alerts"; the line under it says on or off.
                         text = if (isMasterEnabled) {
                             stringResource(R.string.global_active)
                         } else {
-                            stringResource(R.string.global_all_alerts_disabled)
+                            stringResource(R.string.off)
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -201,7 +188,7 @@ fun GlobalAlertSettingsCard(
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.22f))
 
                     Column(
-                        modifier = Modifier.padding(vertical = 16.dp),
+                        modifier = Modifier.padding(top = 16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
                         Button(
@@ -209,7 +196,7 @@ fun GlobalAlertSettingsCard(
                                 onApplyToAll(draftConfig)
                                 appliedDraft = draftConfig
                             },
-                            enabled = hasPendingChanges,
+                            enabled = canApplyToAll,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 16.dp),
@@ -244,7 +231,22 @@ fun GlobalAlertSettingsCard(
     }
 }
 
-private fun AlertConfig.sameMasterDraft(other: AlertConfig): Boolean {
+internal fun shouldEnableApplyToAll(
+    draftConfig: AlertConfig,
+    appliedDraft: AlertConfig,
+    allConfigs: Map<AlertType, AlertConfig>,
+    packageName: String = BuildConfig.APPLICATION_ID
+): Boolean {
+    return !draftConfig.sameMasterDraft(appliedDraft) ||
+        allConfigs.values.any { target ->
+            val expected = draftConfig.copy(
+                customSoundUri = BundledAlertSounds.forAlert(draftConfig.customSoundUri, packageName, target.type.id)
+            )
+            !target.sameMasterDraft(expected)
+        }
+}
+
+internal fun AlertConfig.sameMasterDraft(other: AlertConfig): Boolean {
     return soundEnabled == other.soundEnabled &&
         vibrationEnabled == other.vibrationEnabled &&
         flashEnabled == other.flashEnabled &&
@@ -261,5 +263,7 @@ private fun AlertConfig.sameMasterDraft(other: AlertConfig): Boolean {
         retryEnabled == other.retryEnabled &&
         retryIntervalMinutes == other.retryIntervalMinutes &&
         retryCount == other.retryCount &&
+        soundDelayEnabled == other.soundDelayEnabled &&
+        soundDelaySeconds == other.soundDelaySeconds &&
         defaultSnoozeMinutes == other.defaultSnoozeMinutes
 }

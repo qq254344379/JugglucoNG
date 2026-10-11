@@ -32,7 +32,14 @@ enum class JournalIntensity(val storageValue: String) {
 enum class JournalEntrySource(val storageValue: String) {
     MANUAL("manual"),
     HEALTH_CONNECT("health_connect"),
-    AAPS("aaps");
+    METER("meter"),
+    PEN("pen"),
+    AAPS("aaps"),
+    NIGHTSCOUT("nightscout"),
+    API("api"),
+    CLONE("clone"),
+    CLONE_LOCAL_ICE("clone_local_ice"),
+    CLONE_TURN("clone_turn");
 
     companion object {
         fun fromStorage(value: String?): JournalEntrySource {
@@ -59,7 +66,15 @@ data class JournalEntry(
     val source: JournalEntrySource,
     val sourceRecordId: String?,
     val createdAt: Long,
-    val updatedAt: Long
+    val updatedAt: Long,
+    val insulinCurveJsonSnapshot: String? = null,
+    val insulinCurveProfileId: String? = null,
+    val insulinCurveModelVersion: Int? = null,
+    val insulinCurveEvidence: JournalCurveEvidence? = null,
+    val insulinBodyWeightKg: Float? = null,
+    val insulinCurveWasApproximated: Boolean = false,
+    /** Where the content originated before it arrived through [source]. */
+    val originSource: JournalEntrySource? = null,
 )
 
 data class JournalEntryInput(
@@ -78,7 +93,11 @@ data class JournalEntryInput(
     val proteinGrams: Float? = null,
     val fatGrams: Float? = null,
     val source: JournalEntrySource = JournalEntrySource.MANUAL,
-    val sourceRecordId: String? = null
+    val sourceRecordId: String? = null,
+    val recoveryId: String? = null,
+    val nsRemoteId: String? = null,
+    /** Authoritative source supplied by an importer, distinct from its transport. */
+    val originSource: JournalEntrySource? = null,
 )
 
 data class JournalFood(
@@ -107,10 +126,13 @@ data class JournalFoodInput(
     val sortOrder: Int = 0
 )
 
-data class JournalCurvePoint(
-    val minute: Int,
-    val activity: Float
-)
+/**
+ * The shared curve shape (plan §4 category W, D1). The watch computes against
+ * the same `(minute, activity)` points, so the type is the shared one and this
+ * name is a spelling of it -- which keeps every existing construction and
+ * signature in the phone's journal code compiling unchanged.
+ */
+typealias JournalCurvePoint = IobCurvePoint
 
 data class JournalInsulinPreset(
     val id: Long,
@@ -122,13 +144,22 @@ data class JournalInsulinPreset(
     val isBuiltIn: Boolean,
     val isArchived: Boolean,
     val countsTowardIob: Boolean,
-    val sortOrder: Int
+    val sortOrder: Int,
+    val useForCalculation: Boolean = true,
+    val curveProfileId: String? = null,
+    val curveModelVersion: Int = 0,
+    val curveEvidence: JournalCurveEvidence = JournalCurveEvidence.UNVERIFIED,
+    val scientificName: String? = null
 ) {
-    val curvePoints: List<JournalCurvePoint> = resolveJournalCurve(curveJson, onsetMinutes, durationMinutes)
+    val curvePoints: List<JournalCurvePoint> = resolveJournalCurve(
+        curveJson,
+        onsetMinutes,
+        durationMinutes,
+        forceZeroEndpoints = curveEvidence.requiresZeroEndpoints
+    )
 
     fun activeStartAt(timestamp: Long): Long {
-        val startMinute = curvePoints.firstOrNull { it.activity > 0.01f }?.minute ?: onsetMinutes
-        return timestamp + (startMinute.coerceAtLeast(0) * 60_000L)
+        return timestamp + (onsetMinutes.coerceAtLeast(0) * 60_000L)
     }
 
     fun activeEndAt(timestamp: Long): Long {
@@ -139,6 +170,21 @@ data class JournalInsulinPreset(
     fun activityFractionAt(doseTimestamp: Long, atMillis: Long): Float {
         val elapsedMinutes = ((atMillis - doseTimestamp) / 60_000f).coerceAtLeast(0f)
         return interpolateJournalCurve(curvePoints, elapsedMinutes)
+    }
+
+    fun resolveCurveForDose(amountUnits: Float, bodyWeightKg: Float?): JournalResolvedCurve {
+        val profile = curveProfileId?.let(JournalBuiltInCurveProfile::fromStorage)
+        if (profile == null || curveEvidence != JournalCurveEvidence.SOURCE_SINGLE_DOSE) {
+            return JournalResolvedCurve(
+                points = curvePoints,
+                profileId = curveProfileId,
+                modelVersion = curveModelVersion,
+                evidence = curveEvidence,
+                usedBodyWeightKg = null,
+                approximated = curveEvidence != JournalCurveEvidence.SOURCE_SINGLE_DOSE
+            )
+        }
+        return JournalInsulinCurveCatalogue.resolve(profile, amountUnits, bodyWeightKg)
     }
 }
 
@@ -152,7 +198,11 @@ data class JournalInsulinPresetInput(
     val isBuiltIn: Boolean = false,
     val isArchived: Boolean = false,
     val countsTowardIob: Boolean = true,
-    val sortOrder: Int = 0
+    val sortOrder: Int = 0,
+    val useForCalculation: Boolean = true,
+    val curveProfileId: String? = null,
+    val curveModelVersion: Int = 0,
+    val curveEvidence: JournalCurveEvidence = JournalCurveEvidence.UNVERIFIED
 )
 
 data class JournalChartMarker(
@@ -176,7 +226,9 @@ data class JournalActiveInsulinSummary(
     val activeEntryCount: Int,
     val totalUnits: Float,
     val weightedActivityPercent: Int,
-    val nextEndingAt: Long?
+    val activeUntil: Long?,
+    val iobUnits: Float = 0f,
+    val eiobUnits: Float = 0f
 )
 
 enum class JournalBuiltInCurveProfile {
@@ -190,18 +242,84 @@ enum class JournalBuiltInCurveProfile {
     URLI,
     AFREZZA,
     NPH,
-    ULTRA_LONG_BASAL
+    ULTRA_LONG_BASAL,
+    GLARGINE_U100,
+    GLARGINE_U300,
+    DETEMIR,
+    DEGLUDEC,
+    ICODEC,
+    HUMAN_REGULAR_U500,
+    RYZODEG_70_30,
+    ASPART_MIX_70_30,
+    LISPRO_MIX_50_50,
+    LISPRO_MIX_75_25,
+    HUMAN_MIX_70_30;
+
+    val storageValue: String get() = name.lowercase()
+
+    companion object {
+        fun fromStorage(value: String?): JournalBuiltInCurveProfile? {
+            return entries.firstOrNull { it.storageValue == value || it.name == value }
+        }
+    }
 }
 
-fun serializeJournalCurve(points: List<JournalCurvePoint>): String {
-    return normalizeJournalCurvePoints(points).joinToString(";") { point ->
+enum class JournalCurveEvidence(val storageValue: String) {
+    SOURCE_SINGLE_DOSE("source_single_dose"),
+    SOURCE_STEADY_STATE("source_steady_state"),
+    SOURCE_REFERENCE("source_reference"),
+    UNVERIFIED("unverified");
+
+    val isSourceBacked: Boolean get() = this != UNVERIFIED
+    val supportsPerDoseCalculation: Boolean
+        get() = this == SOURCE_SINGLE_DOSE || this == UNVERIFIED
+    val requiresZeroEndpoints: Boolean
+        get() = this == SOURCE_SINGLE_DOSE || this == UNVERIFIED
+
+    companion object {
+        fun fromStorage(value: String?): JournalCurveEvidence {
+            return entries.firstOrNull { it.storageValue == value } ?: UNVERIFIED
+        }
+    }
+}
+
+data class JournalResolvedCurve(
+    val points: List<JournalCurvePoint>,
+    val profileId: String?,
+    val modelVersion: Int,
+    val evidence: JournalCurveEvidence,
+    val usedBodyWeightKg: Float?,
+    val approximated: Boolean
+)
+
+fun serializeJournalCurve(
+    points: List<JournalCurvePoint>,
+    forceZeroEndpoints: Boolean = true
+): String {
+    return normalizeJournalCurvePoints(points, forceZeroEndpoints = forceZeroEndpoints).joinToString(";") { point ->
         "${point.minute}:${formatJournalCurveValue(point.activity)}"
     }
 }
 
+/**
+ * Parsed curves by their serialized form.
+ *
+ * Every insulin entry carries a curve snapshot, and the IOB summary, the chart
+ * markers and the prediction each parse every entry's snapshot again on every
+ * tick and every journal emission. There are only as many distinct snapshots
+ * as there are (preset, dose) shapes, so parsing each once is enough; the
+ * bound is there so an unbounded stream of imported curves cannot pin memory.
+ */
+private const val PARSED_CURVE_CACHE_CAPACITY = 512
+private val parsedCurveCache = object : LinkedHashMap<String, List<JournalCurvePoint>>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<JournalCurvePoint>>?): Boolean =
+        size > PARSED_CURVE_CACHE_CAPACITY
+}
+
 fun parseJournalCurve(serialized: String?): List<JournalCurvePoint> {
     if (serialized.isNullOrBlank()) return emptyList()
-    return serialized.split(';').mapNotNull { token ->
+    synchronized(parsedCurveCache) { parsedCurveCache[serialized] }?.let { return it }
+    val parsed = serialized.split(';').mapNotNull { token ->
         val minutePart = token.substringBefore(':', "").trim()
         val activityPart = token.substringAfter(':', "").trim()
         val minute = minutePart.toIntOrNull() ?: return@mapNotNull null
@@ -211,11 +329,14 @@ fun parseJournalCurve(serialized: String?): List<JournalCurvePoint> {
             activity = activity.coerceIn(0f, 1f)
         )
     }
+    synchronized(parsedCurveCache) { parsedCurveCache[serialized] = parsed }
+    return parsed
 }
 
 fun normalizeJournalCurvePoints(
     points: List<JournalCurvePoint>,
-    fallbackDurationMinutes: Int = points.maxOfOrNull { it.minute } ?: 0
+    fallbackDurationMinutes: Int = points.maxOfOrNull { it.minute } ?: 0,
+    forceZeroEndpoints: Boolean = true
 ): List<JournalCurvePoint> {
     val cleaned = points
         .map {
@@ -241,12 +362,12 @@ fun normalizeJournalCurvePoints(
 
     if (cleaned.first().minute != 0) {
         cleaned.add(0, JournalCurvePoint(0, 0f))
-    } else {
+    } else if (forceZeroEndpoints) {
         cleaned[0] = cleaned.first().copy(activity = 0f)
     }
 
     val lastMinute = cleaned.last().minute.coerceAtLeast(fallbackDurationMinutes)
-    if (cleaned.last().activity > 0f) {
+    if (forceZeroEndpoints && cleaned.last().activity > 0f) {
         cleaned.add(JournalCurvePoint(lastMinute.coerceAtLeast(cleaned.last().minute), 0f))
     } else if (cleaned.last().minute < lastMinute) {
         cleaned.add(JournalCurvePoint(lastMinute, 0f))
@@ -275,34 +396,33 @@ fun defaultJournalCurve(onsetMinutes: Int, durationMinutes: Int): List<JournalCu
 fun resolveJournalCurve(
     curveJson: String?,
     onsetMinutes: Int,
-    durationMinutes: Int
+    durationMinutes: Int,
+    forceZeroEndpoints: Boolean = true
 ): List<JournalCurvePoint> {
     val parsed = parseJournalCurve(curveJson)
     return if (parsed.isNotEmpty()) {
-        normalizeJournalCurvePoints(parsed, fallbackDurationMinutes = durationMinutes)
+        normalizeJournalCurvePoints(
+            parsed,
+            fallbackDurationMinutes = durationMinutes,
+            forceZeroEndpoints = forceZeroEndpoints
+        )
     } else {
         defaultJournalCurve(onsetMinutes, durationMinutes)
     }
 }
 
-private fun interpolateJournalCurve(points: List<JournalCurvePoint>, minute: Float): Float {
-    if (points.isEmpty()) return 0f
-    if (minute <= points.first().minute.toFloat()) return points.first().activity
-    if (minute >= points.last().minute.toFloat()) return points.last().activity
-
-    val upperIndex = points.indexOfFirst { it.minute >= minute }.takeIf { it >= 0 } ?: return 0f
-    val upper = points[upperIndex]
-    val lower = points.getOrNull(upperIndex - 1) ?: return upper.activity
-    val span = (upper.minute - lower.minute).toFloat().coerceAtLeast(1f)
-    val progress = ((minute - lower.minute) / span).coerceIn(0f, 1f)
-    return lower.activity + ((upper.activity - lower.activity) * progress)
-}
+internal fun interpolateJournalCurve(points: List<JournalCurvePoint>, minute: Float): Float =
+    JournalIobMath.interpolate(points, minute)
 
 private fun formatJournalCurveValue(value: Float): String {
     return ((value.coerceIn(0f, 1f) * 100f).roundToInt() / 100f).toString()
 }
 
 fun builtInJournalCurve(profile: JournalBuiltInCurveProfile): List<JournalCurvePoint> {
+    return JournalInsulinCurveCatalogue.referenceCurve(profile)
+}
+
+internal fun legacyGeneratedJournalCurve(profile: JournalBuiltInCurveProfile): List<JournalCurvePoint> {
     return when (profile) {
         JournalBuiltInCurveProfile.RAPID_GENERIC -> buildPolynomialCurve(
             spanMinutes = 360,
@@ -369,6 +489,7 @@ fun builtInJournalCurve(profile: JournalBuiltInCurveProfile): List<JournalCurveP
             shoulderFraction = 0.66f,
             lateTailFraction = 0.3f
         )
+        else -> error("No legacy generated curve for ${profile.name}")
     }
 }
 

@@ -33,13 +33,20 @@ import android.os.PowerManager
 import android.os.SystemClock
 import tk.glucodata.Applic
 import tk.glucodata.BatteryTrace
+import tk.glucodata.ExchangeTrend
 import tk.glucodata.Log
+import tk.glucodata.logd
+import tk.glucodata.logi
 import tk.glucodata.Natives
+import tk.glucodata.R
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.UiRefreshBus
 import tk.glucodata.drivers.ManagedSensorViewModeStore
 import tk.glucodata.drivers.aidex.AiDexScanReceiver
 import tk.glucodata.drivers.aidex.AiDexDriver
+import tk.glucodata.drivers.aidex.AiDexTemperatureStore
+import tk.glucodata.drivers.aidex.AiDexProvisioningStore
+import tk.glucodata.drivers.aidex.AiDexSerialIdentity
 import tk.glucodata.drivers.aidex.CalibrationRecord as SharedCalibrationRecord
 import tk.glucodata.drivers.aidex.native.crypto.Crc16CcittFalse
 import tk.glucodata.drivers.aidex.native.crypto.SerialCrypto
@@ -54,6 +61,40 @@ internal fun aiDexDeviceNameMatchesSerial(deviceName: String, serialNumber: Stri
     val bareSerial = SerialCrypto.stripPrefix(serialNumber)
     return deviceName.contains(bareSerial, ignoreCase = true) ||
             deviceName.contains(serialNumber, ignoreCase = true)
+}
+
+internal fun aiDexPairingKeyProblemStatusRes(usedSavedKey: Boolean): Int =
+    if (usedSavedKey) R.string.aidex_key_rejected else R.string.aidex_key_missing
+/**
+ * Brand words MicroTech sells the same GX-series hardware under, plus the bare "CGM"/"sensor"
+ * generic. All of them belong in the card's family chip, never the title — so the title loop
+ * below strips every leading one ("Wellion AiDEX …" loses both words) and whatever remains
+ * (normally the "X-…" serial) is the title.
+ */
+private val AIDEX_TITLE_PREFIX = Regex(
+    "^(?:aidex|linx|glucorx|vista|lumiflex|lumi|diax?expert|wellion|cgm|sensors?)(?:[\\s_\\-]+|$)",
+    RegexOption.IGNORE_CASE,
+)
+
+/**
+ * Pick the name a sensor card should be titled with.
+ *
+ * The card already carries the family chip, so brand words the sensor advertises
+ * ("AiDEX X-2222267V4E") are dropped from the title the same way Sibionics strips its managed
+ * prefix; "X-2222267V4E" is what remains. [SuperGattCallback.mygetDeviceName] falls back to
+ * the MAC address and then "?" before the first connect attempt — neither is a sensor name,
+ * so those collapse to the serial instead.
+ */
+internal fun aiDexDisplayName(advertisedName: String?, deviceAddress: String?, serialNumber: String): String {
+    val name = advertisedName?.trim().orEmpty()
+    if (name.isEmpty() || name == "?" || name.equals(deviceAddress, ignoreCase = true)) return serialNumber
+    var stripped = name
+    while (true) {
+        val next = stripped.replace(AIDEX_TITLE_PREFIX, "").trim()
+        if (next == stripped) break
+        stripped = next
+    }
+    return stripped.ifEmpty { serialNumber }
 }
 
 internal fun aiDexExtractLocalName(scanRecord: ByteArray): String? {
@@ -148,7 +189,26 @@ class AiDexBleManager(
         private const val GATT_WRITE_RETRY_DELAY_MS = 200L
 
         // -- Timeouts --
-        private const val MTU_DELAY_MS = 200L
+        /**
+         * Fallback only. Service discovery is normally started from [onMtuChanged]; this is how
+         * long we wait for that callback before assuming the stack swallowed it.
+         *
+         * It must stay comfortably longer than a real MTU round trip. Starting discovery — and
+         * therefore the first CCCD descriptor write — while the MTU exchange is still outstanding
+         * wedges the connection: the write never gets `onDescriptorWrite`, `mDeviceBusy` stays
+         * latched, and every later GATT op on that link is rejected until we reconnect.
+         */
+        private const val MTU_CALLBACK_FALLBACK_MS = 2_000L
+        /**
+         * Quiet time required after the last `onMtuChanged` before the first CCCD write goes
+         * out. The sensor runs a second, peer-initiated MTU exchange shortly after connect; a
+         * Write Request outstanding when it lands never completes and wedges the GATT. See
+         * [AiDexRuntimePolicy.cccdStartDelayMs].
+         */
+        private const val MTU_SETTLE_BEFORE_CCCD_MS = 750L
+        /** Re-reads allowed when F002 returns something other than the 17-byte BOND vector. */
+        private const val BOND_READ_MAX_REREADS = 1
+        private const val BOND_REREAD_DELAY_MS = 400L
         private const val DISCOVERY_RETRY_DELAY_MS = 1_500L
         private const val DISCOVERY_MAX_RETRIES = 2
         private const val HISTORY_PAGE_TIMEOUT_MS = 25_000L
@@ -164,6 +224,8 @@ class AiDexBleManager(
         private const val GATT_OP_TIMEOUT_MS = 15_000L    // Watchdog for stuck GATT operations
         private const val GATT_OP_WATCHDOG_RETRIES = 2  // Max retries on watchdog timeout before dropping op
         private const val STALE_CONNECTION_RECOVERY_FALLBACK_MS = 3_000L
+        private const val CLEAR_STORAGE_QUIET_WINDOW_MS = 12_000L
+        private const val POST_RESET_RECONNECT_DELAY_MS = 5_000L
         private const val EXPECTED_LIVE_INTERVAL_MS = 60_000L
         private const val EXPECTED_LIVE_GRACE_MS = 20_000L
         private const val NO_STREAM_WATCHDOG_MS = EXPECTED_LIVE_INTERVAL_MS + EXPECTED_LIVE_GRACE_MS
@@ -182,6 +244,7 @@ class AiDexBleManager(
         private const val START_TIME_REPAIR_RESPONSE_MAX_BYTES = 12
         private const val DEFAULT_PARAM_WRITE_ACK_TIMEOUT_MS = 10_000L
         private const val DEFAULT_PARAM_MAX_CHUNK_PAYLOAD_BYTES = 160
+        private const val KEY_EXCHANGE_MAX_FAILURES = 3
 
         // -- History Storage --
         private const val MIN_VALID_GLUCOSE_MGDL = 20
@@ -204,6 +267,8 @@ class AiDexBleManager(
         private const val BROADCAST_SCAN_INTERVAL_MS = 60_000L  // Time between scans (fallback)
         private const val BROADCAST_DUPLICATE_SUPPRESS_MS = 70_000L
         private const val BROADCAST_SCAN_ALARM_MIN_DELAY_MS = 10_000L
+        private const val BROADCAST_REJECTION_LOG_INTERVAL_MS = 60_000L
+        private const val BROADCAST_REJECTION_INITIAL_LOGS = 3
 
         // -- Phase-locked broadcast scan --
         // After we catch one broadcast we know roughly when the next will arrive.
@@ -220,8 +285,16 @@ class AiDexBleManager(
     }
 
     // -- Protocol Objects --
-    private val keyExchange = AiDexKeyExchange(serial)
-    private val commandBuilder = AiDexCommandBuilder(keyExchange)
+    private data class ProtocolSession(
+        val keyExchange: AiDexKeyExchange,
+        val commandBuilder: AiDexCommandBuilder = AiDexCommandBuilder(keyExchange),
+    )
+
+    @Volatile private var protocolSession = ProtocolSession(
+        AiDexKeyExchange(serial, AiDexPairingMaterialRegistry.find(serial))
+    )
+    private val keyExchange: AiDexKeyExchange get() = protocolSession.keyExchange
+    private val commandBuilder: AiDexCommandBuilder get() = protocolSession.commandBuilder
 
     // -- Reconnect Strategy --
     val reconnect = AiDexReconnect()
@@ -263,7 +336,10 @@ class AiDexBleManager(
         Log.e(TAG, "GATT operation watchdog FIRED — no callback received in ${GATT_OP_TIMEOUT_MS}ms for $op")
         gattOpActive = false
         currentGattOp = null
-        if (op != null && op.retryCount < GATT_OP_WATCHDOG_RETRIES) {
+        if (pendingResetReconnect && clearStorageQuietWindowActive) {
+            resetDiag("pre-f3-active-op-watchdog-dropped", "op=${describeGattOp(op)}")
+            Log.w(TAG, "GATT watchdog: dropping pre-reset operation so exclusive CLEAR_STORAGE can proceed")
+        } else if (op != null && op.retryCount < GATT_OP_WATCHDOG_RETRIES) {
             op.retryCount++
             Log.w(TAG, "GATT watchdog: retrying (attempt ${op.retryCount}/$GATT_OP_WATCHDOG_RETRIES)")
             gattQueue.addFirst(op)
@@ -275,6 +351,25 @@ class AiDexBleManager(
 
     // -- CCCD State --
     private var servicesReady = false
+    /** Guards against discovering twice when the MTU callback and its fallback both fire. */
+    private var serviceDiscoveryStarted = false
+    /** Wall time of the most recent `onMtuChanged` on this connection, ours or the sensor's. */
+    private var lastMtuCallbackAtMs = 0L
+    /**
+     * Set by [suppressPostUnpairBroadcastScan] before a delete-with-unbind. The ACK must not
+     * start a broadcast scan that the removal will stop before the platform has registered it.
+     */
+    @Volatile private var postUnpairBroadcastScanSuppressed = false
+    /**
+     * Pairs the ACK's write of [AiDexReconnect.isBroadcastOnlyMode] with the release that reads it.
+     * The ACK runs on the handler. Release runs on the disconnect coroutine's IO thread.
+     * The field is not volatile.
+     */
+    private val postUnpairScanLock = Any()
+    /** Set when an `onMtuChanged` lands on top of the pending CCCD write; see the watchdog. */
+    private var mtuExchangeCrossedPendingCccd = false
+    /** F002 BOND reads on this connection that came back short (not 17 bytes). */
+    private var shortBondReads = 0
     private var cccdQueue = ArrayDeque<UUID>() // Characteristics to enable notifications on
     private var cccdWriteInProgress = false
     private var cccdChainComplete = false
@@ -284,11 +379,56 @@ class AiDexBleManager(
 
     // -- Key Exchange State --
     private var challengeWritten = false
+    private var pairingKeyProblemStatus: String? = null
     private var bondDataRead = false
     private var keyExchangePendingBond = false
     private var bondStateAtConnection: Int = BluetoothDevice.BOND_NONE
     private var bondBecameBondedThisConnection = false
     @Volatile private var bondValidatedByStreaming = false
+    @Volatile private var persistedPairKey: ByteArray? = null
+    private var keyExchangeUsingSavedPairKey = false
+    private var pairKeyAwaitingLiveValidation = false
+    /**
+     * Consecutive key-exchange failures on this credential path; cleared by a valid live frame.
+     * Persisted: a process death mid-retry (Samsung's OOM killer, a crash loop) used to reset
+     * this to zero, so a dead saved key got three fresh tries per process and never latched.
+     */
+    private var keyExchangeFailures = 0
+        set(value) {
+            field = value
+            writeIntPref("keyExchangeFailures", value)
+        }
+    /**
+     * Latched once saved-key reconnects hit [KEY_EXCHANGE_MAX_FAILURES]; cleared by a valid
+     * live frame. Persisted for the same reason as [keyExchangeFailures]: the Pair button and
+     * the bonded auto-replace both key off it, and both must survive a manager recreation.
+     */
+    private var savedKeyExhausted = false
+        set(value) {
+            field = value
+            writeBoolPref("savedKeyExhausted", value)
+        }
+    /**
+     * Set by [rePairSensor]: the user pressed Pair. A saved key that has been exhausted may
+     * then be replaced by a fresh F001 exchange — the only route off a dead credential. Held
+     * across the bounded retries and cleared by a valid live frame, by giving up into
+     * broadcast-only, or by removing the sensor.
+     */
+    @Volatile private var explicitPairRequested = false
+    /**
+     * Set when the sensor acknowledges CLEAR_STORAGE: the reset wipes its bond and PAIR
+     * credential, so the next exchange pairs fresh over F001 instead of retrying a dead key.
+     * The saved key is kept, not deleted — it is replaced only by a fresh key that decrypts
+     * live data, and restored if the fresh pair keeps failing. Persisted: the reset is
+     * followed by a disconnect, and the manager may be recreated before the next connect.
+     */
+    private var pairKeyResetPending = false
+        set(value) {
+            field = value
+            writeBoolPref("pairKeyResetPending", value)
+        }
+    /** The running exchange is the fresh pair started by [pairKeyResetPending] over a saved key. */
+    private var keyExchangeIsFreshPairAfterReset = false
     private var preAuthEncryptedFrameCount = 0
     private var preAuthFirstEncryptedFrameAtMs = 0L
     private var preAuthLastEncryptedFrameAtMs = 0L
@@ -297,7 +437,6 @@ class AiDexBleManager(
     private enum class PendingInvalidSetupRecovery {
         NONE,
         RECONNECT,
-        REMOVE_BOND_AND_RECONNECT,
     }
 
     private enum class PostCccdFollowUp {
@@ -375,8 +514,8 @@ class AiDexBleManager(
     /** Watchdog: force-disconnect if key exchange doesn't complete within timeout. */
     private val keyExchangeWatchdog = Runnable {
         if (phase == Phase.KEY_EXCHANGE) {
-            Log.e(TAG, "Key exchange watchdog FIRED — timeout after ${KEY_EXCHANGE_TIMEOUT_MS}ms. Escalating invalid-setup recovery.")
-            recoverFromInvalidSetupState("key-exchange-timeout")
+            Log.e(TAG, "Key exchange watchdog FIRED — timeout after ${KEY_EXCHANGE_TIMEOUT_MS}ms")
+            handleKeyExchangeFailure("key-exchange-timeout")
         }
     }
 
@@ -459,6 +598,20 @@ class AiDexBleManager(
         }
     }
 
+    /** Fallback: some stacks never deliver `onMtuChanged`. Discover anyway rather than stall. */
+    private val mtuDiscoveryFallback = Runnable {
+        val gatt = mBluetoothGatt ?: return@Runnable
+        Log.w(TAG, "No onMtuChanged within ${MTU_CALLBACK_FALLBACK_MS}ms — discovering services anyway")
+        beginServiceDiscovery(gatt, "mtu-callback-timeout")
+    }
+
+    /** Deferred first CCCD write; runs once the MTU bearer has been quiet long enough. */
+    private val cccdChainStartAfterMtuSettle: Runnable = Runnable {
+        val gatt = mBluetoothGatt ?: return@Runnable
+        if (phase != Phase.CCCD_CHAIN || cccdWriteInProgress || cccdQueue.isEmpty()) return@Runnable
+        writeNextCccd(gatt)
+    }
+
     /** Watchdog: Android must callback after descriptor writes, but some stacks drop CCCD callbacks. */
     private val cccdWriteWatchdog: Runnable = Runnable {
         val pendingUuid = cccdPendingWriteUuid ?: return@Runnable
@@ -470,9 +623,23 @@ class AiDexBleManager(
                 timeoutRetries = cccdMissingCallbackRetries,
                 maxRetries = CCCD_WRITE_CALLBACK_MAX_EXTRA_WAITS,
                 canInferComplete = canInferMissingCccdCallbackComplete(),
+                mtuExchangeCrossedWrite = mtuExchangeCrossedPendingCccd,
             )
         ) {
             AiDexRuntimePolicy.MissingCccdCallbackAction.IGNORE -> Unit
+            AiDexRuntimePolicy.MissingCccdCallbackAction.RECOVER_WEDGED_GATT -> {
+                Log.w(
+                    TAG,
+                    "CCCD $pendingUuid descriptor callback missing after ${CCCD_WRITE_CALLBACK_TIMEOUT_MS}ms " +
+                        "and an MTU exchange crossed the write — GATT is wedged, reconnecting"
+                )
+                mtuExchangeCrossedPendingCccd = false
+                cccdPendingWriteUuid = null
+                cccdWriteInProgress = false
+                cccdMissingCallbackRetries = 0
+                lastInferredCccdUuid = null
+                recoverFromInvalidSetupState("mtu-exchange-crossed-cccd-write")
+            }
             AiDexRuntimePolicy.MissingCccdCallbackAction.WAIT -> {
                 cccdMissingCallbackRetries += 1
                 Log.w(
@@ -502,7 +669,7 @@ class AiDexBleManager(
     private val invalidSetupRecoveryFallback = Runnable {
         if (pendingInvalidSetupRecovery == PendingInvalidSetupRecovery.NONE) return@Runnable
         Log.w(TAG, "Invalid setup recovery disconnect did not callback — forcing cleanup")
-        handlePendingInvalidSetupRecovery(mBluetoothGatt?.device)
+        handlePendingInvalidSetupRecovery()
     }
 
     /** Fallback: stale runtime recovery requested a disconnect but Android never called back. */
@@ -510,6 +677,47 @@ class AiDexBleManager(
         if (!pendingStaleConnectionRecovery) return@Runnable
         Log.w(TAG, "Stale connection recovery disconnect did not callback — forcing cleanup")
         completeStaleConnectionRecovery("disconnect-timeout", stateAlreadyReset = false)
+    }
+
+    /** Fallback when Android does not report the local post-clear disconnect. */
+    private val postResetDisconnectFallback = Runnable {
+        if (!pendingResetReconnect) return@Runnable
+        Log.w(TAG, "Post-reset disconnect did not callback — forcing cleanup")
+        resetDiag("disconnect-callback-timeout")
+        completePostResetReconnect(
+            trigger = "clear-storage-disconnect-timeout",
+            stateAlreadyReset = false,
+        )
+    }
+
+    /** Let CLEAR_STORAGE finish without another sensor command, then reconnect for verification. */
+    private val clearStorageQuietWindowReconnect = Runnable {
+        if (!pendingResetReconnect) return@Runnable
+        Log.i(TAG, "CLEAR_STORAGE quiet window complete — disconnecting locally for clean post-reset verification")
+        postResetDisconnectRequestedAtMs = System.currentTimeMillis()
+        resetDiag("quiet-window-complete-local-disconnect", nowMs = postResetDisconnectRequestedAtMs)
+        val gatt = mBluetoothGatt
+        if (gatt == null) {
+            completePostResetReconnect("clear-storage-no-gatt", stateAlreadyReset = false)
+            return@Runnable
+        }
+        try {
+            gatt.disconnect()
+            handler.removeCallbacks(postResetDisconnectFallback)
+            handler.postDelayed(postResetDisconnectFallback, STALE_CONNECTION_RECOVERY_FALLBACK_MS)
+        } catch (_: Throwable) {
+            completePostResetReconnect("clear-storage-disconnect-throw", stateAlreadyReset = false)
+        }
+    }
+
+    private fun scheduleClearStorageQuietWindow(reason: String, nowMs: Long = System.currentTimeMillis()) {
+        handler.removeCallbacks(clearStorageQuietWindowReconnect)
+        handler.postDelayed(clearStorageQuietWindowReconnect, CLEAR_STORAGE_QUIET_WINDOW_MS)
+        resetDiag(
+            stage = "quiet-window-start",
+            details = "reason=$reason durationMs=$CLEAR_STORAGE_QUIET_WINDOW_MS",
+            nowMs = nowMs,
+        )
     }
 
     /** Watchdog: try bounded startup recovery steps, then reconnect if direct F003 never appears. */
@@ -563,6 +771,10 @@ class AiDexBleManager(
                 refreshLiveCccds(PostCccdFollowUp.RESUME_STREAMING, "no-stream-watchdog")
             }
             AiDexStreamingPolicy.NoStreamRecoveryAction.RECONNECT -> {
+                if (keyExchangeUsingSavedPairKey || pairKeyAwaitingLiveValidation) {
+                    handleKeyExchangeFailure("no-valid-direct-f003")
+                    return@Runnable
+                }
                 val delay = reconnect.nextReconnectDelayMs()
                 Log.w(TAG, "No F003 after bounded no-stream recovery — reconnecting in ${delay}ms")
                 constatstatusstr = "Reconnecting"
@@ -682,6 +894,11 @@ class AiDexBleManager(
     @Volatile private var firstValidReadingAnchorMs: Long = 0L
     @Volatile private var hasAuthoritativeSessionStart: Boolean = false
     @Volatile private var autoActivationAttemptedThisConnection: Boolean = false
+    @Volatile private var postResetRequestedAtMs: Long = 0L
+    @Volatile private var postResetClearStorageWriteAtMs: Long = 0L
+    @Volatile private var postResetClearStorageAckAtMs: Long = 0L
+    @Volatile private var postResetDisconnectRequestedAtMs: Long = 0L
+    private var postResetDroppedGattOps: Int = 0
 
     init {
         // Restore persisted history offsets so reconnects only download new data.
@@ -699,9 +916,31 @@ class AiDexBleManager(
         }
         postResetWarmupExtensionActive = readBoolPref("postResetWarmupExtensionActive", false)
         firstValidReadingAnchorMs = readLongPref("firstValidReadingAnchorMs", 0L)
+        postResetRequestedAtMs = readLongPref("postResetRequestedAtMs", 0L)
+        if (postResetRequestedAtMs > 0L) {
+            Log.i(TAG, "Restored post-reset history barrier from prefs: requestedAt=$postResetRequestedAtMs")
+        }
         bondValidatedByStreaming = readBoolPref("bondValidatedByStreaming", false)
         if (bondValidatedByStreaming) {
             Log.i(TAG, "Restored bondValidatedByStreaming=true from prefs")
+        }
+        persistedPairKey = AiDexPairKeyVault.load(Applic.app, SerialNumber)
+        if (persistedPairKey != null) {
+            keyExchangeFailures = readIntPref("keyExchangeFailures", 0)
+            savedKeyExhausted = readBoolPref("savedKeyExhausted", false)
+            pairKeyResetPending = readBoolPref("pairKeyResetPending", false)
+            Log.i(
+                TAG,
+                "Restored verified AiDex PAIR credential from redundant storage " +
+                    "(fp=${AiDexPairKeyVault.fingerprint(persistedPairKey)}, " +
+                    "failures=$keyExchangeFailures, exhausted=$savedKeyExhausted, " +
+                    "resetPending=$pairKeyResetPending)"
+            )
+        } else {
+            // No credential, nothing to have exhausted: the counters belong to the key.
+            keyExchangeFailures = 0
+            savedKeyExhausted = false
+            pairKeyResetPending = false
         }
     }
 
@@ -709,6 +948,24 @@ class AiDexBleManager(
         IDLE,
         DOWNLOADING_CALIBRATED,  // 0x23 (calibrated glucose)
         DOWNLOADING_RAW,         // 0x24 (ADC/raw data)
+    }
+
+    /**
+     * Mirror a skin-temperature sample into the display-only sidecar store.
+     *
+     * The F003 `i2` channel carries skin temperature in °C (verified against a
+     * co-worn Sibionics sensor). Implausible values are dropped by the store;
+     * nothing here touches glucose storage or calibration.
+     */
+    private fun appendSkinTemperature(timestampMs: Long, temperatureC: Float?) {
+        if (timestampMs <= 0L || temperatureC == null) return
+        if (!AiDexTemperatureStore.isPlausibleSkinTemperatureC(temperatureC)) return
+        val context = Applic.app ?: return
+        AiDexTemperatureStore.appendTemperatureHistory(
+            context,
+            SerialNumber,
+            listOf(AiDexTemperatureStore.TemperatureRecord(timestampMs, temperatureC)),
+        )
     }
 
     private fun clearPendingRoomHistory(reason: String? = null) {
@@ -780,6 +1037,8 @@ class AiDexBleManager(
     private var calibrationRangeEndIndex: Int = 0
     /** Whether a calibration download is in progress. */
     private var calibrationDownloading: Boolean = false
+    /** Set once the sensor has reported an empty calibration range on this connection. */
+    private var calibrationRangeKnownEmpty: Boolean = false
 
     // -- Startup Metadata / Legacy Start Time (0x10 / 0x21) --
     // The vendor/original stack treats raw `0x10` as startup device-info and
@@ -808,10 +1067,11 @@ class AiDexBleManager(
     private var lastHistoryNewestOffset: Int = 0
 
     // -- Reset Reconnect Flag --
-    // Set true BEFORE sending reset command. When disconnect arrives with this
-    // flag set, the driver removes the stale BLE bond, clears key exchange,
-    // waits for the sensor to reboot, and auto-reconnects.
+    // Set true BEFORE sending CLEAR_STORAGE. When disconnect arrives with this
+    // flag set, the driver clears only per-connection crypto, preserves the stable
+    // PAIR credential and Android bond, then reconnects after the sensor settles.
     @Volatile private var pendingResetReconnect: Boolean = false
+    @Volatile private var clearStorageQuietWindowActive: Boolean = false
 
     // -- Unpair Disconnect Flag --
     // Set true by unpairSensor(). The DELETE_BOND command is sent first; when the
@@ -823,7 +1083,8 @@ class AiDexBleManager(
     // -- AiDexDriver State --
     @Volatile private var _batteryMillivolts: Int = 0
     @Volatile private var _sensorExpired: Boolean = false
-    @Volatile private var _wearDays: Int = 15  // default 15-day sensor (AIDEX_SENSOR_MAX_DAYS)
+    @Volatile private var _wearDays: Int = 0  // authoritative only after sensor 0x10 reports wear_days
+    @Volatile private var sensorReportedWearDays: Boolean = false
     @Volatile private var _firmwareVersion: String = ""
     @Volatile private var _hardwareVersion: String = ""
     @Volatile private var _modelName: String = ""
@@ -838,6 +1099,27 @@ class AiDexBleManager(
         }
     }
     @Volatile private var _resetCompensationEnabled: Boolean = false
+
+    private fun reportedWearDaysOrNull(): Int? =
+        _wearDays.takeIf { sensorReportedWearDays && it > 0 }
+
+    private fun hasCompleteStartupMetadata(): Boolean =
+        _modelName.isNotBlank() &&
+            _firmwareVersion.isNotBlank() &&
+            hasAuthoritativeSessionStart &&
+            sensorstartmsec > 0L &&
+            sensorReportedWearDays
+
+    private fun updateSensorExpiredFromStart(now: Long): Boolean {
+        val wearDays = reportedWearDaysOrNull()
+        if (sensorstartmsec <= 0L || wearDays == null) {
+            _sensorExpired = false
+            return false
+        }
+        val expiryMs = sensorstartmsec + (wearDays.toLong() * 24 * 3600_000L)
+        _sensorExpired = now > expiryMs
+        return _sensorExpired
+    }
 
     // -- Broadcast Scan State --
     @Volatile private var broadcastScanActive: Boolean = false
@@ -856,6 +1138,8 @@ class AiDexBleManager(
     @Volatile private var noDirectLiveBroadcastFallbackMode: Boolean = false
     @Volatile private var broadcastScanStartedAtElapsed: Long = 0L
     @Volatile private var broadcastWakeLock: PowerManager.WakeLock? = null
+    private var broadcastRejectionLogCount: Int = 0
+    private var lastBroadcastRejectionLogAtMs: Long = 0L
 
     // Phase-lock state: learned per-broadcast cadence + count of confident catches.
     // `lastFreshBroadcastTimeMs` is the wall-clock time of the last *non-duplicate*
@@ -950,10 +1234,27 @@ class AiDexBleManager(
         UiRefreshBus.requestStatusRefresh()
     }
 
+    private fun armPostResetHistoryBarrier(reason: String, now: Long = System.currentTimeMillis()) {
+        postResetRequestedAtMs = now
+        writeLongPref("postResetRequestedAtMs", now)
+        Log.i(TAG, "Post-reset history barrier armed at $now ($reason)")
+    }
+
+    private fun clearPostResetHistoryBarrier(reason: String) {
+        if (postResetRequestedAtMs == 0L) return
+        resetDiag("barrier-clear", "reason=$reason")
+        Log.i(TAG, "Post-reset history barrier cleared ($reason, requestedAt=$postResetRequestedAtMs)")
+        postResetRequestedAtMs = 0L
+        writeLongPref("postResetRequestedAtMs", 0L)
+    }
+
     private fun noteValidReadingAvailable(timestampMs: Long, reason: String) {
         if (timestampMs > 0L && timestampMs > lastGlucoseTimeMs) {
             lastGlucoseTimeMs = timestampMs
         }
+        // Every path here decoded the reading over this device's own connection,
+        // which is the ownership claim Clone reads.
+        markLocalReadingAccepted(timestampMs)
         handler.removeCallbacks(broadcastAssistRunnable)
         clearFirstValidReadingWait(reason)
         if (phase == Phase.STREAMING && streamingStartedAtMs > 0L && lastF003FrameTimeMs < streamingStartedAtMs) {
@@ -1143,6 +1444,25 @@ class AiDexBleManager(
         }
     }
 
+    private fun resetDiag(
+        stage: String,
+        details: String = "",
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        val suffix = if (details.isBlank()) "" else " $details"
+        Log.i(
+            TAG,
+            "RESET_DIAG stage=$stage sensor=$SerialNumber fw=${_firmwareVersion.ifBlank { "?" }} " +
+                "model=${_modelName.ifBlank { "?" }} phase=$phase bond=${currentBondState()} key=${keyExchange.isComplete} " +
+                "requestAge=${ageSinceLabel(postResetRequestedAtMs, nowMs)} " +
+                "writeAge=${ageSinceLabel(postResetClearStorageWriteAtMs, nowMs)} " +
+                "ackAge=${ageSinceLabel(postResetClearStorageAckAtMs, nowMs)} " +
+                "disconnectRequestAge=${ageSinceLabel(postResetDisconnectRequestedAtMs, nowMs)} " +
+                "pending=$pendingResetReconnect quiet=$clearStorageQuietWindowActive " +
+                "queue=${gattQueue.size} active=${describeGattOp(currentGattOp)} dropped=$postResetDroppedGattOps$suffix"
+        )
+    }
+
     private fun logDisconnectContext(
         gatt: BluetoothGatt,
         status: Int,
@@ -1182,12 +1502,21 @@ class AiDexBleManager(
         queuePausedForBonding = false
         currentGattOp = null
         servicesReady = false
+        serviceDiscoveryStarted = false
+        lastMtuCallbackAtMs = 0L
+        mtuExchangeCrossedPendingCccd = false
+        shortBondReads = 0
+        handler.removeCallbacks(mtuDiscoveryFallback)
+        handler.removeCallbacks(cccdChainStartAfterMtuSettle)
         cccdChainComplete = false
         cccdWriteInProgress = false
         cccdPendingWriteUuid = null
         cccdMissingCallbackRetries = 0
         pendingBondedCccdUuid = null
         keyExchangePendingBond = false
+        keyExchangeUsingSavedPairKey = false
+        keyExchangeIsFreshPairAfterReset = false
+        pairKeyAwaitingLiveValidation = false
         postCccdFollowUp = PostCccdFollowUp.NONE
         historyDownloading = false
         cccdRetryCount = 0
@@ -1210,6 +1539,7 @@ class AiDexBleManager(
         pendingCalibrationRefresh = false
         pendingCalibrationRefreshReason = null
         pendingCalibrationRefreshScheduled = false
+        calibrationRangeKnownEmpty = false
         startupControlStage = StartupControlStage.IDLE
         lastF002FrameTimeMs = 0L
         noDirectLiveBroadcastFallbackMode = false
@@ -1239,8 +1569,7 @@ class AiDexBleManager(
         liveOffsetCutoff = 0
         lastHistoryNewestGlucose = 0f
         lastHistoryNewestOffset = 0
-        startupMetadataComplete =
-            _modelName.isNotBlank() && _firmwareVersion.isNotBlank() && hasAuthoritativeSessionStart && sensorstartmsec > 0L
+        startupMetadataComplete = hasCompleteStartupMetadata()
     }
 
     private fun shouldRecoverBlockedReconnectNow(now: Long = System.currentTimeMillis()): Boolean {
@@ -1295,6 +1624,40 @@ class AiDexBleManager(
         handler.postDelayed({ connectDevice(0) }, delay)
     }
 
+    private fun completePostResetReconnect(
+        trigger: String,
+        stateAlreadyReset: Boolean,
+    ) {
+        if (!pendingResetReconnect) return
+        resetDiag(
+            stage = "post-reset-cleanup",
+            details = "trigger=$trigger stateAlreadyReset=$stateAlreadyReset deviceBond=${currentBondState()}",
+        )
+        handler.removeCallbacks(clearStorageQuietWindowReconnect)
+        handler.removeCallbacks(postResetDisconnectFallback)
+        pendingResetReconnect = false
+        clearStorageQuietWindowActive = false
+        connectAttemptInFlight = false
+        if (!stateAlreadyReset) {
+            connectTime = 0L
+            setPhase(Phase.IDLE)
+            resetConnectionRuntimeState(reason = "post-reset:$trigger", resetInvalidSetupCounter = false)
+        }
+
+        // CLEAR_STORAGE also wipes the sensor's bond and PAIR credential; the ACK handler has
+        // already queued a fresh pair for the reconnect. Leave the Android bond alone (the
+        // stack drops it itself when the sensor refuses the old LTK) and keep the saved key
+        // as the fallback until a fresh one is validated by live data.
+        keyExchange.reset()
+        close()
+        reconnect.reset()
+        Log.i(TAG, "Post-reset cleanup complete ($trigger) — reconnecting after quiet delay")
+        handler.postDelayed({
+            stop = false
+            connectDevice(0)
+        }, POST_RESET_RECONNECT_DELAY_MS)
+    }
+
     private fun notePreAuthEncryptedTraffic(source: String, now: Long = System.currentTimeMillis()) {
         if (phase != Phase.DISCOVERING_SERVICES && phase != Phase.CCCD_CHAIN) return
         if (keyExchange.isComplete || keyExchangePendingBond) return
@@ -1318,19 +1681,6 @@ class AiDexBleManager(
         return currentBondState() == BluetoothDevice.BOND_BONDED
     }
 
-    private fun removeBondSafely(device: BluetoothDevice?, reason: String) {
-        try {
-            if (device?.bondState == BluetoothDevice.BOND_BONDED) {
-                val removeBond = device.javaClass.getMethod("removeBond")
-                removeBond.invoke(device)
-                setBondValidatedByStreaming(false, "$reason-removeBond")
-                Log.i(TAG, "$reason: BLE bond removed")
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "$reason: removeBond failed: ${t.message}")
-        }
-    }
-
     private fun advanceBondedReconnectToKeyExchange(gatt: BluetoothGatt, trafficAgeMs: Long) {
         Log.w(
             TAG,
@@ -1340,12 +1690,16 @@ class AiDexBleManager(
         pendingBondedCccdUuid = null
         cccdWriteInProgress = false
         cccdChainComplete = true
-        startKeyExchange(gatt)
+        startKeyExchangeForCurrentConnection(gatt)
     }
 
     private fun recoverFromInvalidSetupState(reason: String) {
         if (stop || isPaused || isUnpaired || reconnect.isBroadcastOnlyMode) {
             Log.w(TAG, "Invalid setup recovery ignored ($reason) stop=$stop paused=$isPaused unpaired=$isUnpaired broadcastOnly=${reconnect.isBroadcastOnlyMode}")
+            return
+        }
+        if (phase == Phase.KEY_EXCHANGE) {
+            handleKeyExchangeFailure(reason)
             return
         }
         val bondState = currentBondState()
@@ -1358,12 +1712,10 @@ class AiDexBleManager(
         )
         pendingInvalidSetupRecovery = when (action) {
             AiDexRuntimePolicy.InvalidSetupRecoveryAction.RECONNECT -> PendingInvalidSetupRecovery.RECONNECT
-            AiDexRuntimePolicy.InvalidSetupRecoveryAction.REMOVE_BOND_AND_RECONNECT -> PendingInvalidSetupRecovery.REMOVE_BOND_AND_RECONNECT
         }
         clearInvalidSetupTracking(resetRecoveryCounter = false, reason = "recover:$reason")
         constatstatusstr = when (pendingInvalidSetupRecovery) {
             PendingInvalidSetupRecovery.RECONNECT -> "Recovering connection"
-            PendingInvalidSetupRecovery.REMOVE_BOND_AND_RECONNECT -> "Recovering bond"
             PendingInvalidSetupRecovery.NONE -> constatstatusstr
         } ?: "Recovering"
         Log.w(
@@ -1378,11 +1730,11 @@ class AiDexBleManager(
             handler.postDelayed(invalidSetupRecoveryFallback, 3_000L)
         } catch (_: Throwable) {
             close()
-            handler.post { handlePendingInvalidSetupRecovery(null) }
+            handler.post { handlePendingInvalidSetupRecovery() }
         }
     }
 
-    private fun handlePendingInvalidSetupRecovery(device: BluetoothDevice?) {
+    private fun handlePendingInvalidSetupRecovery() {
         val recovery = pendingInvalidSetupRecovery
         if (recovery == PendingInvalidSetupRecovery.NONE) return
         handler.removeCallbacks(invalidSetupRecoveryFallback)
@@ -1399,16 +1751,6 @@ class AiDexBleManager(
                 Log.w(TAG, "Invalid setup recovery: reconnecting in ${delay}ms")
                 close()
                 handler.postDelayed({ connectDevice(0) }, delay)
-            }
-            PendingInvalidSetupRecovery.REMOVE_BOND_AND_RECONNECT -> {
-                Log.w(TAG, "Invalid setup recovery: removing BLE bond and reconnecting fresh")
-                removeBondSafely(device, "invalidSetupRecovery")
-                close()
-                reconnect.reset()
-                handler.postDelayed({
-                    stop = false
-                    connectDevice(0)
-                }, 1_500L)
             }
             PendingInvalidSetupRecovery.NONE -> Unit
         }
@@ -1445,6 +1787,9 @@ class AiDexBleManager(
         if (deviceName == null) return false
         return aiDexDeviceNameMatchesSerial(deviceName, SerialNumber)
     }
+
+    override fun mygetDeviceName(): String =
+        aiDexDisplayName(super.mygetDeviceName(), mActiveDeviceAddress, SerialNumber)
 
     override fun getService(): UUID = SERVICE_F000
 
@@ -1597,7 +1942,28 @@ class AiDexBleManager(
     // GATT Callbacks
     // =========================================================================
 
+    // Consecutive GATT_CONNECTING failures (status 133 / CONNECTION_FAILED_ESTABLISHMENT).
+    // A hard-to-reach sensor retried every few seconds can wedge the Bluetooth stack, so
+    // these are backed off progressively. Reset on a successful connection.
+    private var consecutiveConnectFailures = 0
+
+    /**
+     * Clear the Android GATT service cache for this connection via the hidden
+     * BluetoothGatt.refresh() (reflection). Helps recover from the stale connection
+     * state that causes persistent status-133 connect failures.
+     */
+    private fun refreshDeviceCache(gatt: BluetoothGatt?) {
+        if (gatt == null) return
+        try {
+            val ok = gatt.javaClass.getMethod("refresh").invoke(gatt) as? Boolean ?: false
+            Log.i(TAG, "refreshDeviceCache: gatt.refresh()=$ok")
+        } catch (t: Throwable) {
+            Log.w(TAG, "refreshDeviceCache: refresh() failed: ${t.message}")
+        }
+    }
+
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+        noteFirstGattCallback("onConnectionStateChange", gatt)
         super.onConnectionStateChange(gatt, status, newState)
         if (newState == BluetoothProfile.STATE_CONNECTED || newState == BluetoothProfile.STATE_DISCONNECTED) {
             connectAttemptInFlight = false
@@ -1620,10 +1986,14 @@ class AiDexBleManager(
             }
             connectTime = now
             constatstatusstr = "Connected"
+            consecutiveConnectFailures = 0  // link established — clear the 133 backoff streak
             _isPaused = false  // Clear paused flag — connection is active
             cancelBroadcastScan()
             liveOffsetCutoff = 0  // Reset live offset cutoff for this connection session
             setPhase(Phase.DISCOVERING_SERVICES)
+            if (postResetRequestedAtMs > 0L) {
+                resetDiag("reconnect-connected", "address=${gatt.device?.address ?: "?"}", nowMs = now)
+            }
 
             // Reset per-connection state
             bondStateAtConnection = gatt.device?.bondState ?: BluetoothDevice.BOND_NONE
@@ -1632,6 +2002,9 @@ class AiDexBleManager(
                 setBondValidatedByStreaming(false, "new-connection-unbonded")
             }
             keyExchange.reset()
+            keyExchangeUsingSavedPairKey = false
+            keyExchangeIsFreshPairAfterReset = false
+            pairKeyAwaitingLiveValidation = false
             challengeWritten = false
             bondDataRead = false
             servicesReady = false
@@ -1646,8 +2019,7 @@ class AiDexBleManager(
             cccdWriteInProgress = false
             cccdRetryCount = 0
             pendingBondedCccdUuid = null
-            startupMetadataComplete =
-                _modelName.isNotBlank() && _firmwareVersion.isNotBlank() && hasAuthoritativeSessionStart && sensorstartmsec > 0L
+            startupMetadataComplete = hasCompleteStartupMetadata()
             startupDeviceInfoRequested = false
             legacyStartTimeRequested = false
             startTimeRepairProbePending = false
@@ -1674,6 +2046,7 @@ class AiDexBleManager(
             pendingCalibrationRefresh = false
             pendingCalibrationRefreshReason = null
             pendingCalibrationRefreshScheduled = false
+            calibrationRangeKnownEmpty = false
             startupControlStage = StartupControlStage.IDLE
             lastF002FrameTimeMs = 0L
             negotiatedMtu = 23
@@ -1705,19 +2078,26 @@ class AiDexBleManager(
             lastBroadcastOffsetForCadence = -1
             lastFreshBroadcastTimeMs = 0L
 
+            serviceDiscoveryStarted = false
+            lastMtuCallbackAtMs = 0L
+            mtuExchangeCrossedPendingCccd = false
+            shortBondReads = 0
+            handler.removeCallbacks(cccdChainStartAfterMtuSettle)
             Log.i(TAG, "Connected to ${gatt.device?.address}. Requesting MTU 512...")
-            gatt.requestMtu(512)
+            val mtuRequested = runCatching { gatt.requestMtu(512) }.getOrDefault(false)
             handler.removeCallbacks(broadcastAssistRunnable)
             handler.postDelayed(broadcastAssistRunnable, BROADCAST_ASSIST_SCAN_DELAY_MS)
 
-            // Schedule service discovery after MTU exchange
-            handler.postDelayed({
-                if (mBluetoothGatt != null && !servicesReady) {
-                    Log.i(TAG, "Discovering services...")
-                    mBluetoothGatt?.discoverServices()
-                    scheduleDiscoveryRetries(gatt)
-                }
-            }, MTU_DELAY_MS)
+            // Service discovery waits for onMtuChanged. Discovering while the MTU exchange is
+            // still outstanding lets the first CCCD descriptor write race it, and that write is
+            // then never completed — the link survives but no GATT op on it can ever succeed.
+            handler.removeCallbacks(mtuDiscoveryFallback)
+            if (mtuRequested) {
+                handler.postDelayed(mtuDiscoveryFallback, MTU_CALLBACK_FALLBACK_MS)
+            } else {
+                Log.w(TAG, "requestMtu(512) was refused — discovering services immediately")
+                beginServiceDiscovery(gatt, "mtu-request-refused")
+            }
 
         } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
             val disconnectPhase = phase
@@ -1725,14 +2105,14 @@ class AiDexBleManager(
             logDisconnectContext(gatt, status, disconnectPhase)
             lastLiveReadingObservedTimeMs = 0L
             lastLiveContinuitySyncBucket = -1L
-            constatstatusstr = "Disconnected"
+            constatstatusstr = pairingKeyProblemStatus ?: "Disconnected"
             connectTime = 0L
             setPhase(Phase.IDLE)
             resetConnectionRuntimeState(reason = "disconnect", resetInvalidSetupCounter = false)
 
             if (pendingInvalidSetupRecovery != PendingInvalidSetupRecovery.NONE) {
                 Log.w(TAG, "Disconnect is owned by invalid-setup recovery (${pendingInvalidSetupRecovery.name})")
-                handlePendingInvalidSetupRecovery(gatt.device)
+                handlePendingInvalidSetupRecovery()
                 return
             }
             if (pendingStaleConnectionRecovery) {
@@ -1753,7 +2133,7 @@ class AiDexBleManager(
                     } else {
                         Log.w(TAG, "Auth failures exhausted — broadcast-only fallback")
                         close()
-                        constatstatusstr = "Pairing failed — Broadcast Only"
+                        constatstatusstr = Applic.getContext().getString(R.string.aidex_status_pairing_failed_broadcast_only)
                         reconnect.isBroadcastOnlyMode = true
                         stop = false
                         handler.post { startBroadcastScan("auth-failure-fallback") }
@@ -1806,65 +2186,44 @@ class AiDexBleManager(
 
             // Schedule reconnect — but NOT if paused (stop=true) or broadcast-only
             if (pendingUnpairDisconnect) {
-                // Unpair command was sent but sensor disconnected before (or right after)
-                // the response. Perform deferred cleanup now.
+                // Delivery without the sensor ACK is ambiguous. Never discard the last-known-good
+                // credential or Android bond on an unconfirmed disconnect.
                 pendingUnpairDisconnect = false
-                Log.i(TAG, "Disconnect during unpair — performing deferred cleanup")
-                val device = mBluetoothGatt?.device
-                try {
-                    if (device?.bondState == android.bluetooth.BluetoothDevice.BOND_BONDED) {
-                        val removeBond = device.javaClass.getMethod("removeBond")
-                        removeBond.invoke(device)
-                        Log.i(TAG, "unpairSensor: BLE bond removed (from disconnect handler)")
-                    }
-                } catch (_: Throwable) {}
+                isUnpaired = false
+                Log.w(TAG, "Disconnect during unpair without DELETE_BOND ACK — retaining PAIR credential")
                 keyExchange.reset()
                 enterBroadcastOnlyFallback(
-                    reason = "post-unpair-disconnect",
-                    statusText = "Unpaired — Broadcast Only",
+                    reason = "unpair-not-confirmed",
+                    statusText = "Unpair not confirmed — key retained",
                 )
             } else if (pendingResetReconnect) {
-                // Post-reset reconnect: sensor cleared its bond table + storage.
-                // We must: remove stale BLE bond, clear key exchange, wait for
-                // sensor reboot, then auto-reconnect fresh.
-                pendingResetReconnect = false
-                Log.i(TAG, "===== POST-RESET RECONNECT — removing bond, will reconnect in 5s =====")
-
-                // Clear crypto state — will re-derive on next connection
-                keyExchange.reset()
-
-                // Capture device ref before closing GATT
-                val device = mBluetoothGatt?.device
-
-                // Remove stale Android BLE bond via reflection
-                try {
-                    if (device?.bondState == android.bluetooth.BluetoothDevice.BOND_BONDED) {
-                        val removeBond = device.javaClass.getMethod("removeBond")
-                        removeBond.invoke(device)
-                        Log.i(TAG, "Post-reset: BLE bond removed")
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Post-reset: removeBond failed: ${t.message}")
-                }
-
-                close()
-
-                // Reset reconnect counters so the fresh connect uses clean backoff
-                reconnect.reset()
-
-                // Delay 5 seconds for sensor to finish rebooting, then reconnect
-                handler.postDelayed({
-                    Log.i(TAG, "Post-reset: attempting auto-reconnect after 5s delay")
-                    stop = false
-                    connectDevice(0)
-                }, 5_000L)
+                resetDiag(
+                    stage = "disconnect-callback",
+                    details = "status=$status disconnectPhase=$disconnectPhase",
+                )
+                completePostResetReconnect(
+                    trigger = "sensor-disconnect",
+                    stateAlreadyReset = true,
+                )
             } else if (stop) {
                 consecutiveSetupDisconnects = 0
                 Log.i(TAG, "Paused (stop=true) — not scheduling reconnect")
                 close()
             } else if (!reconnect.isBroadcastOnlyMode) {
-                val delay = reconnect.nextReconnectDelayMs()
-                Log.i(TAG, "Scheduling reconnect in ${delay}ms (attempt ${reconnect.softAttempts})")
+                // status 133 (GATT_ERROR / CONNECTION_FAILED_ESTABLISHMENT) is a hard
+                // link-layer connect failure; retrying every few seconds can wedge the
+                // Bluetooth stack (as seen in the field). Back off progressively and clear
+                // the stale GATT cache before retrying. Other statuses use the normal delay.
+                val extraDelay = if (status == 133) {
+                    consecutiveConnectFailures += 1
+                    refreshDeviceCache(gatt)
+                    (consecutiveConnectFailures.toLong() * 3_000L).coerceAtMost(30_000L)
+                } else {
+                    consecutiveConnectFailures = 0
+                    0L
+                }
+                val delay = reconnect.nextReconnectDelayMs() + extraDelay
+                Log.i(TAG, "Scheduling reconnect in ${delay}ms (attempt ${reconnect.softAttempts}, connectFailures=$consecutiveConnectFailures)")
                 close()
                 handler.postDelayed({ connectDevice(0) }, delay)
             } else {
@@ -1888,6 +2247,65 @@ class AiDexBleManager(
         } else {
             Log.w(TAG, "onMtuChanged: status=$status mtu=$mtu")
         }
+        lastMtuCallbackAtMs = System.currentTimeMillis()
+
+        if (
+            AiDexRuntimePolicy.mtuExchangeCrossedPendingCccd(
+                phase = phase,
+                cccdWriteInProgress = cccdWriteInProgress,
+                hasPendingCccd = cccdPendingWriteUuid != null,
+            )
+        ) {
+            // The sensor's own exchange landed on top of our outstanding Write Request. That
+            // write is expected never to call back; the watchdog reconnects if it does not,
+            // instead of inferring success and having the next write refused.
+            Log.w(TAG, "MTU exchange crossed pending CCCD write on $cccdPendingWriteUuid — expecting its callback to be lost")
+            mtuExchangeCrossedPendingCccd = true
+            return
+        }
+        if (phase == Phase.CCCD_CHAIN && !cccdWriteInProgress && cccdQueue.isNotEmpty()) {
+            // Chain not started yet: a late exchange restarts the quiet window.
+            scheduleCccdChainStart(gatt, "late-mtu-callback")
+            return
+        }
+
+        // The ATT bearer is free again — now it is safe to discover and write CCCDs.
+        handler.removeCallbacks(mtuDiscoveryFallback)
+        beginServiceDiscovery(gatt, "mtu-callback")
+    }
+
+    /**
+     * Issue the first CCCD write now, or once [MTU_SETTLE_BEFORE_CCCD_MS] has passed since
+     * the last `onMtuChanged`. Sensors that exchange MTU once pay nothing here.
+     */
+    private fun scheduleCccdChainStart(gatt: BluetoothGatt, reason: String) {
+        handler.removeCallbacks(cccdChainStartAfterMtuSettle)
+        val delay = AiDexRuntimePolicy.cccdStartDelayMs(
+            lastMtuCallbackAtMs = lastMtuCallbackAtMs,
+            nowMs = System.currentTimeMillis(),
+            settleMs = MTU_SETTLE_BEFORE_CCCD_MS,
+        )
+        if (delay <= 0L) {
+            writeNextCccd(gatt)
+            return
+        }
+        Log.i(TAG, "Holding first CCCD write ${delay}ms for the MTU exchange to settle ($reason)")
+        handler.postDelayed(cccdChainStartAfterMtuSettle, delay)
+    }
+
+    /**
+     * Start service discovery exactly once per connection.
+     *
+     * Called from [onMtuChanged] on the happy path, and from [mtuDiscoveryFallback] when a stack
+     * never delivers that callback.
+     */
+    private fun beginServiceDiscovery(gatt: BluetoothGatt, reason: String) {
+        if (gatt !== mBluetoothGatt) return
+        if (serviceDiscoveryStarted || servicesReady) return
+        serviceDiscoveryStarted = true
+        Log.i(TAG, "Discovering services ($reason)...")
+        gatt.discoverServices()
+        scheduleDiscoveryRetries(gatt)
     }
 
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -1915,20 +2333,33 @@ class AiDexBleManager(
         }
 
         servicesReady = true
-        Log.i(TAG, "Services discovered. Starting CCCD chain...")
         setPhase(Phase.CCCD_CHAIN)
         handler.removeCallbacks(cccdWriteWatchdog)
 
-        // Build CCCD queue: F003 first (data), then F002 (commands), then F001 (auth)
+        val keyStartAction = decidePairKeyStartAction()
+        Log.i(
+            TAG,
+            when (keyStartAction) {
+                AiDexRuntimePolicy.PairKeyStartAction.USE_SAVED_KEY ->
+                    "Services discovered. Starting saved-key CCCD chain..."
+                AiDexRuntimePolicy.PairKeyStartAction.FRESH_PAIR ->
+                    "Services discovered. Starting fresh-pair CCCD chain..."
+            }
+        )
+
+        // Saved-key reconnects never touch F001. A fresh pairing enables F001 so the sensor
+        // can provide its stable PAIR credential.
         cccdQueue.clear()
         cccdQueue.add(CHAR_F003)
         cccdQueue.add(CHAR_F002)
-        cccdQueue.add(CHAR_F001)
+        if (keyStartAction == AiDexRuntimePolicy.PairKeyStartAction.FRESH_PAIR) {
+            cccdQueue.add(CHAR_F001)
+        }
         cccdWriteInProgress = false
         cccdPendingWriteUuid = null
         cccdMissingCallbackRetries = 0
 
-        writeNextCccd(gatt)
+        scheduleCccdChainStart(gatt, "services-discovered")
     }
 
     override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -1972,6 +2403,10 @@ class AiDexBleManager(
         handler.removeCallbacks(cccdWriteWatchdog)
         cccdPendingWriteUuid = null
         cccdMissingCallbackRetries = 0
+        if (mtuExchangeCrossedPendingCccd) {
+            Log.i(TAG, "onDescriptorWrite: CCCD $charUuid callback arrived despite the crossed MTU exchange")
+            mtuExchangeCrossedPendingCccd = false
+        }
 
         if (isAuthRelatedCccdFailure(status)) {
             Log.i(TAG, "onDescriptorWrite: CCCD $charUuid auth/perm fail (status=$status) — re-queuing for retry after bond")
@@ -2050,7 +2485,7 @@ class AiDexBleManager(
                     // Already bonded (reconnect case, or bonding finished during CCCD chain).
                     // Small delay to let encryption fully settle.
                     Log.i(TAG, "Already bonded. Starting key exchange after 500ms settle delay...")
-                    handler.postDelayed({ startKeyExchange(gatt) }, 500L)
+                    handler.postDelayed({ startKeyExchangeForCurrentConnection(gatt) }, 500L)
                 }
                 BluetoothDevice.BOND_BONDING -> {
                     // Bonding in progress — defer key exchange to bonded() callback.
@@ -2060,10 +2495,12 @@ class AiDexBleManager(
                     scheduleDeferredBondCompletionCheck(gatt, attempt = 1)
                 }
                 else -> {
-                    // BOND_NONE — no bonding happened (unusual for AiDex).
-                    // Try key exchange anyway; the CCCD write itself may trigger bonding later.
-                    Log.w(TAG, "Bond state is BOND_NONE after CCCD chain — starting key exchange anyway")
-                    startKeyExchange(gatt)
+                    // Unbonded. With a saved key, read F002 with it right here — F002/F003
+                    // do not need link encryption, and asking for a bond is what the sensor
+                    // refuses (BOND_NONE, then status 22). Without one, the fresh chain has
+                    // F001 enabled and writing the challenge makes the sensor initiate pairing.
+                    Log.i(TAG, "Unbonded AiDex link — starting key exchange without requesting a bond")
+                    startKeyExchangeForCurrentConnection(gatt)
                 }
             }
         }
@@ -2106,7 +2543,7 @@ class AiDexBleManager(
                     if (waitingForDeferredKeyExchange) {
                         keyExchangePendingBond = false
                         Log.w(TAG, "BOND_BONDED observed via fallback check — starting deferred key exchange")
-                        startKeyExchange(gatt)
+                        startKeyExchangeForCurrentConnection(gatt)
                     }
                 }
                 BluetoothDevice.BOND_BONDING -> {
@@ -2132,11 +2569,16 @@ class AiDexBleManager(
     }
 
     override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        if (gatt !== mBluetoothGatt) {
+            Log.w(TAG, "onCharacteristicChanged: stale callback, ignoring")
+            return
+        }
         val uuid = characteristic.uuid
         val data = characteristic.value ?: return
         if (data.isEmpty()) return
 
-        Log.i(TAG, "onCharacteristicChanged: uuid=$uuid len=${data.size} hex=${AiDexParser.hexString(data.copyOfRange(0, minOf(data.size, 8)))}")
+        // Lazy: this fires per notification and the hex preview copies + formats bytes.
+        logi(TAG) { "onCharacteristicChanged: uuid=$uuid len=${data.size} hex=${AiDexParser.hexString(data.copyOfRange(0, minOf(data.size, 8)))}" }
 
         when (uuid) {
             CHAR_F003 -> handleF003(data)
@@ -2148,7 +2590,19 @@ class AiDexBleManager(
 
     override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
         super.onCharacteristicWrite(gatt, characteristic, status)
-        Log.d(TAG, "onCharacteristicWrite: uuid=${characteristic.uuid} status=$status")
+        if (gatt !== mBluetoothGatt) {
+            Log.w(TAG, "onCharacteristicWrite: stale callback, ignoring")
+            return
+        }
+        logd(TAG) { "onCharacteristicWrite: uuid=${characteristic.uuid} status=$status" }
+        if (
+            pendingResetReconnect &&
+            characteristic.uuid == CHAR_F002 &&
+            postResetClearStorageWriteAtMs > 0L &&
+            postResetClearStorageAckAtMs == 0L
+        ) {
+            resetDiag("f3-write-callback", "status=$status")
+        }
         if (gattOpActive) {
             handler.post {
                 handler.removeCallbacks(gattOpWatchdog)
@@ -2161,6 +2615,10 @@ class AiDexBleManager(
 
     override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
         super.onCharacteristicRead(gatt, characteristic, status)
+        if (gatt !== mBluetoothGatt) {
+            Log.w(TAG, "onCharacteristicRead: stale callback, ignoring")
+            return
+        }
         val uuid = characteristic.uuid
         val data = characteristic.value
 
@@ -2180,8 +2638,8 @@ class AiDexBleManager(
 
         when (uuid) {
             CHAR_F002 -> {
-                if (!bondDataRead && phase == Phase.KEY_EXCHANGE && data.size == 17) {
-                    handleBondData(data, gatt)
+                if (!bondDataRead && phase == Phase.KEY_EXCHANGE) {
+                    handleBondReadReply(data, gatt)
                 } else {
                     handleF002Response(data, gatt)
                 }
@@ -2206,7 +2664,7 @@ class AiDexBleManager(
                 val manufacturer = String(data, Charsets.UTF_8).trim('\u0000', ' ')
                 Log.i(TAG, "DIS Manufacturer Name: $manufacturer")
             }
-            // CGM Session Start Time (0x2AAA) — parse activation date + compute wear days
+            // CGM Session Start Time (0x2AAA) — parse activation date; wear days come from 0x10.
             CHAR_CGM_SESSION_START -> handleCGMSessionStartTime(data)
             // CGM Session Run Time (0x2AAB) — how long sensor has been running
             CHAR_CGM_SESSION_RUN -> {
@@ -2244,6 +2702,9 @@ class AiDexBleManager(
 
         if (parsed.isAllZeros) {
             Log.i(TAG, "$source start time: all zeros")
+            if (postResetRequestedAtMs > 0L) {
+                resetDiag("session-start-verification", "source=$source result=zeros")
+            }
             hasAuthoritativeSessionStart = false
             armFirstValidReadingWait(System.currentTimeMillis(), "$source-zero-session-start")
             if (allowActivation) {
@@ -2276,23 +2737,59 @@ class AiDexBleManager(
         val startMs = cal.timeInMillis - (tzOffsetSeconds * 1000L)
         if (startMs <= 0L || startMs >= System.currentTimeMillis() + 86400_000L) {
             Log.w(TAG, "$source start time parse produced out-of-range epoch: $startMs")
+            if (postResetRequestedAtMs > 0L) {
+                resetDiag("session-start-verification", "source=$source result=invalid startMs=$startMs")
+            }
+            return
+        }
+
+        if (postResetRequestedAtMs > 0L) {
+            resetDiag(
+                stage = "session-start-verification",
+                details = "source=$source result=parsed startMs=$startMs deltaFromResetMs=${startMs - postResetRequestedAtMs}",
+            )
+        }
+
+        if (
+            allowActivation &&
+            needsPostResetActivation &&
+            postResetRequestedAtMs > 0L &&
+            startMs < postResetRequestedAtMs - 2L * 60_000L
+        ) {
+            if (!autoActivationAttemptedThisConnection) {
+                needsPostResetActivation = false
+                writeBoolPref("needsPostResetActivation", false)
+                Log.w(
+                    TAG,
+                    "$source start time predates reset request (startMs=$startMs, resetAt=$postResetRequestedAtMs) — " +
+                        "forcing SET_NEW_SENSOR (0x20) for reset fallback"
+                )
+                startNewSensor()
+                handler.postDelayed({ readCGMSessionCharacteristics() }, 2_000L)
+            } else {
+                Log.w(TAG, "$source start time still predates reset after activation attempt — waiting for first valid reading")
+                armFirstValidReadingWait(postResetRequestedAtMs, "$source-stale-post-reset-start")
+            }
             return
         }
 
         hasAuthoritativeSessionStart = true
         val ageMs = System.currentTimeMillis() - startMs
         val ageDays = ageMs.toDouble() / 86400_000.0
-        val remainDays = _wearDays - ageDays
+        val reportedWearDays = reportedWearDaysOrNull()
+        val remainDays = reportedWearDays?.let { it - ageDays }
         Log.i(
             TAG,
             "$source start time parsed: startMs=$startMs, age=${String.format("%.1f", ageDays)} days, " +
-                "remaining=${String.format("%.1f", remainDays)} days"
+                "remaining=${remainDays?.let { String.format("%.1f days", it) } ?: "unknown"}"
         )
 
-        try {
-            Natives.aidexSetWearDays(dataptr, _wearDays)
-            Log.i(TAG, "aidexSetWearDays: days=$_wearDays (from $source)")
-        } catch (_: Throwable) {}
+        if (reportedWearDays != null) {
+            try {
+                Natives.aidexSetWearDays(dataptr, reportedWearDays)
+                Log.i(TAG, "aidexSetWearDays: days=$reportedWearDays (sensor-reported, from $source)")
+            } catch (_: Throwable) {}
+        }
 
         if (sensorstartmsec <= 0L || kotlin.math.abs(sensorstartmsec - startMs) > 60_000L) {
             Log.i(TAG, "Updating sensorstartmsec from $source: $sensorstartmsec → $startMs")
@@ -2303,8 +2800,7 @@ class AiDexBleManager(
             armFirstValidReadingWait(startMs, "$source-authoritative-start")
         }
 
-        val expiryMs = startMs + (_wearDays.toLong() * 24 * 3600_000L)
-        _sensorExpired = System.currentTimeMillis() > expiryMs
+        updateSensorExpiredFromStart(System.currentTimeMillis())
         if (
             pendingInitialHistoryRequest &&
             !historyDownloading &&
@@ -2319,7 +2815,7 @@ class AiDexBleManager(
     /**
      * Parse CGM Session Start Time (0x2AAA):
      * Bytes: year(u16LE), month, day, hour, minute, second, timezone(s8), DST(u8)
-     * Sets sensorstartmsec and computes actual wear days from the sensor.
+     * Sets sensorstartmsec. Wear duration is reported separately by startup device info 0x10.
      */
     private fun handleCGMSessionStartTime(data: ByteArray) {
         val parsed = AiDexParser.parseLocalStartTimePayload(data)
@@ -2377,7 +2873,7 @@ class AiDexBleManager(
                 // 500ms delay to let encryption fully settle after bonding,
                 // matching vendor driver's approach (AiDexSensor.kt line 6013)
                 Log.i(TAG, "Bond complete. Starting deferred key exchange after 500ms settle delay...")
-                handler.postDelayed({ startKeyExchange(gatt) }, 500L)
+                handler.postDelayed({ startKeyExchangeForCurrentConnection(gatt) }, 500L)
             } else if (
                 phase == Phase.STREAMING &&
                 keyExchange.isComplete &&
@@ -2564,9 +3060,84 @@ class AiDexBleManager(
     // Key Exchange
     // =========================================================================
 
-    private fun startKeyExchange(gatt: BluetoothGatt) {
-        clearInvalidSetupTracking(resetRecoveryCounter = false, reason = "start-key-exchange")
+    private fun decidePairKeyStartAction(): AiDexRuntimePolicy.PairKeyStartAction {
+        if (persistedPairKey == null) {
+            // A handoff writes the vault straight to SharedPreferences and may land after this
+            // manager was constructed, which is when the key is normally read. Without this the
+            // receiving device (typically the watch) would fresh-pair a sensor whose key it now
+            // holds — and a fresh F001 is what the sensor refuses while another device is bonded.
+            AiDexPairKeyVault.load(Applic.app, SerialNumber)?.let { stored ->
+                Log.i(TAG, "Picked up an AiDex PAIR credential stored after this manager started")
+                persistedPairKey = stored
+                savedKeyExhausted = false
+            }
+        }
+        return AiDexRuntimePolicy.decidePairKeyStartAction(
+            hasSavedPairKey = persistedPairKey?.size == AiDexPairKeyBackup.PAIR_KEY_BYTES,
+            savedKeyExhausted = savedKeyExhausted,
+            explicitPairRequested = explicitPairRequested,
+            bonded = currentBondState() == BluetoothDevice.BOND_BONDED,
+            pairKeyResetPending = pairKeyResetPending,
+        )
+    }
+
+    private fun startKeyExchangeForCurrentConnection(gatt: BluetoothGatt) {
+        when (decidePairKeyStartAction()) {
+            AiDexRuntimePolicy.PairKeyStartAction.USE_SAVED_KEY -> startSavedPairKeyExchange(gatt)
+            AiDexRuntimePolicy.PairKeyStartAction.FRESH_PAIR -> startFreshPairKeyExchange(gatt)
+        }
+    }
+
+    private fun startSavedPairKeyExchange(gatt: BluetoothGatt) {
+        val savedPairKey = persistedPairKey?.takeIf {
+            it.size == AiDexPairKeyBackup.PAIR_KEY_BYTES
+        } ?: run {
+            Log.e(TAG, "Saved-key exchange requested without a valid PAIR credential")
+            enterBroadcastOnlyFallback(
+                reason = "invalid-saved-pair-key",
+                statusText = "Pairing key unavailable — Broadcast Only",
+            )
+            return
+        }
+
+        // A saved key needs no provisioning material; just clear any prior pairing error.
+        pairingKeyProblemStatus = null
+        clearInvalidSetupTracking(resetRecoveryCounter = false, reason = "start-saved-key-exchange")
         setPhase(Phase.KEY_EXCHANGE)
+        keyExchange.reset()
+        keyExchange.onPairKeyReceived(savedPairKey)
+        keyExchangeUsingSavedPairKey = true
+        keyExchangeIsFreshPairAfterReset = false
+        pairKeyAwaitingLiveValidation = false
+        challengeWritten = false
+        bondDataRead = false
+
+        handler.removeCallbacks(keyExchangeWatchdog)
+        handler.postDelayed(keyExchangeWatchdog, KEY_EXCHANGE_TIMEOUT_MS)
+        Log.i(TAG, "Key exchange: reading fresh F002 BOND data with saved PAIR credential")
+        readBondData(gatt)
+    }
+
+    private fun startFreshPairKeyExchange(gatt: BluetoothGatt) {
+        if (persistedPairKey != null) {
+            Log.w(
+                TAG,
+                "Fresh pair over a stored credential (fp=${AiDexPairKeyVault.fingerprint(persistedPairKey)}, " +
+                    "explicit=$explicitPairRequested, bonded=${currentBondState() == BluetoothDevice.BOND_BONDED}, " +
+                    "afterReset=$pairKeyResetPending); a validated F001 key will replace it"
+            )
+        }
+        pairingKeyProblemStatus = null
+        maybeUseAdvertisedProtocolSerial()
+        maybeUseProvisionedPairingMaterial()
+        clearInvalidSetupTracking(resetRecoveryCounter = false, reason = "start-fresh-key-exchange")
+        setPhase(Phase.KEY_EXCHANGE)
+        keyExchange.reset()
+        keyExchangeUsingSavedPairKey = false
+        keyExchangeIsFreshPairAfterReset = pairKeyResetPending && persistedPairKey != null
+        pairKeyAwaitingLiveValidation = false
+        challengeWritten = false
+        bondDataRead = false
 
         // Start watchdog timer — force disconnect if key exchange doesn't complete
         handler.removeCallbacks(keyExchangeWatchdog)
@@ -2574,21 +3145,67 @@ class AiDexBleManager(
 
         // Step 1: Write SN challenge to F001
         val challenge = keyExchange.getChallenge()
-        Log.i(TAG, "Key exchange: writing challenge to F001 (${AiDexParser.hexString(challenge)})")
+        Log.i(TAG, "Key exchange: writing one-time challenge to F001")
 
         val service = gatt.getService(SERVICE_F000)
         val f001 = service?.getCharacteristic(CHAR_F001)
         if (service == null || f001 == null) {
-            Log.e(TAG, "startKeyExchange: SERVICE_F000 or F001 not found — cannot proceed. Triggering recovery.")
-            handler.removeCallbacks(keyExchangeWatchdog)
-            recoverFromServiceDiscoveryFailure()
+            Log.e(TAG, "startFreshPairKeyExchange: SERVICE_F000 or F001 not found")
+            handleKeyExchangeFailure("f001-unavailable")
             return
         }
 
         f001.value = challenge
         f001.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        gatt.writeCharacteristic(f001)
-        challengeWritten = true
+        challengeWritten = gatt.writeCharacteristic(f001)
+        if (!challengeWritten) {
+            Log.e(TAG, "Fresh PAIR challenge was rejected by Android GATT")
+            handleKeyExchangeFailure("f001-write-rejected")
+        }
+    }
+
+    /**
+     * Compatibility for sensors saved by older setup code as `X-<MAC>` after it failed to parse
+     * a generation-prefixed advertisement. This changes only the protocol secret; it deliberately
+     * does not rename storage or native sensor identity while a sensor is active.
+     */
+    private fun maybeUseAdvertisedProtocolSerial() {
+        // Raw stack name, not the display override: protocol identity must not depend on title logic.
+        val advertisedName = try {
+            super.mygetDeviceName()
+        } catch (_: Throwable) {
+            null
+        }
+        val address = mActiveDeviceAddress ?: mActiveBluetoothDevice?.address
+        val advertisedSerial = AiDexSerialIdentity.advertisedProtocolSerialForMacFallback(
+            storedSensorId = SerialNumber,
+            address = address,
+            advertisedName = advertisedName,
+        ) ?: return
+        if (advertisedSerial.equals(keyExchange.bareSerial, ignoreCase = true)) return
+
+        AiDexProvisioningStore.installSaved(Applic.app, advertisedSerial)
+        protocolSession = ProtocolSession(
+            AiDexKeyExchange(advertisedSerial, AiDexPairingMaterialRegistry.find(advertisedSerial))
+        )
+        Log.w(
+            TAG,
+            "Using advertised AiDEX protocol serial $advertisedSerial for MAC-fallback identity $SerialNumber"
+        )
+    }
+
+    /** Pick up material installed or removed after construction but before F001 is written. */
+    private fun maybeUseProvisionedPairingMaterial() {
+        val protocolSerial = keyExchange.bareSerial
+        AiDexProvisioningStore.installSaved(Applic.app, protocolSerial)
+        val material = AiDexPairingMaterialRegistry.find(protocolSerial)
+        if (material == null && !keyExchange.usesProvisionedPairingMaterial) return
+        protocolSession = ProtocolSession(AiDexKeyExchange(protocolSerial, material))
+        if (material != null) {
+            Log.i(TAG, "Using provisioned AiDEX pairing material for $protocolSerial")
+        } else {
+            Log.i(TAG, "Provisioned AiDEX pairing material cleared for $protocolSerial; using serial derivation")
+        }
     }
 
     /**
@@ -2596,7 +3213,18 @@ class AiDexBleManager(
      */
     private fun handleF001Response(data: ByteArray, gatt: BluetoothGatt) {
         if (data.size < 16) {
-            Log.w(TAG, "F001 response too short (${data.size} bytes)")
+            Log.w(TAG, "F001 response too short (${data.size} bytes, hex=${AiDexParser.hexString(data)})")
+            if (
+                data.size == 1 &&
+                (data[0].toInt() and 0xFF) == 0
+            ) {
+                pairingKeyProblemStatus = Applic.getContext().getString(
+                    aiDexPairingKeyProblemStatusRes(keyExchange.usesProvisionedPairingMaterial),
+                )
+                constatstatusstr = pairingKeyProblemStatus.orEmpty()
+                Log.e(TAG, pairingKeyProblemStatus.orEmpty())
+                UiRefreshBus.requestStatusRefresh()
+            }
             return
         }
 
@@ -2613,7 +3241,18 @@ class AiDexBleManager(
         // Extract PAIR key (first 16 bytes of notification)
         val pairKeyData = data.copyOfRange(0, 16)
         keyExchange.onPairKeyReceived(pairKeyData)
-        Log.i(TAG, "Key exchange: PAIR key received (${AiDexParser.hexString(pairKeyData)})")
+        pairingKeyProblemStatus = null
+        val stored = persistedPairKey
+        val relation = when {
+            stored == null -> "no stored key"
+            stored.contentEquals(pairKeyData) -> "same as stored"
+            else -> "differs from stored fp=${AiDexPairKeyVault.fingerprint(stored)}"
+        }
+        Log.i(
+            TAG,
+            "Key exchange: PAIR credential received (fp=${AiDexPairKeyVault.fingerprint(pairKeyData)}, $relation); " +
+                "awaiting end-to-end validation"
+        )
 
         // Step 3: Read BOND data from F002
         readBondData(gatt)
@@ -2627,6 +3266,39 @@ class AiDexBleManager(
         enqueueGattOp(GattOp.Read(CHAR_F002))
     }
 
+    /** The reply to [readBondData]: the 17-byte BOND vector, or the sensor declining to give one. */
+    private fun handleBondReadReply(data: ByteArray, gatt: BluetoothGatt) {
+        when (
+            AiDexRuntimePolicy.decideShortBondReadAction(
+                replyLength = data.size,
+                rereads = shortBondReads,
+                maxRereads = BOND_READ_MAX_REREADS,
+            )
+        ) {
+            AiDexRuntimePolicy.ShortBondReadAction.ACCEPT -> handleBondData(data, gatt)
+            AiDexRuntimePolicy.ShortBondReadAction.REREAD -> {
+                shortBondReads += 1
+                Log.w(
+                    TAG,
+                    "Key exchange: F002 BOND read returned ${data.size} byte(s) " +
+                        "(${AiDexParser.hexString(data)}) — re-reading (${shortBondReads}/$BOND_READ_MAX_REREADS)"
+                )
+                handler.postDelayed({
+                    if (mBluetoothGatt === gatt && phase == Phase.KEY_EXCHANGE && !bondDataRead) readBondData(gatt)
+                }, BOND_REREAD_DELAY_MS)
+            }
+            AiDexRuntimePolicy.ShortBondReadAction.FAIL_KEY_EXCHANGE -> {
+                Log.e(
+                    TAG,
+                    "Key exchange: sensor refused BOND data (${data.size} byte(s) " +
+                        "${AiDexParser.hexString(data)}, saved=$keyExchangeUsingSavedPairKey, " +
+                        "bond=${currentBondState()}) — counting as key exchange failure"
+                )
+                handleKeyExchangeFailure("f002-bond-read-refused")
+            }
+        }
+    }
+
     /**
      * Handle BOND data read from F002 (17 bytes).
      */
@@ -2637,24 +3309,137 @@ class AiDexBleManager(
         Log.i(TAG, "Key exchange: BOND data received (${data.size} bytes)")
 
         if (!keyExchange.decryptBond(data)) {
-            Log.e(TAG, "Key exchange: BOND decryption/CRC failed!")
-            // Retry entire key exchange on next connection
-            close()
-            reconnect.nextReconnectDelayMs()
-            handler.postDelayed({ connectDevice(0) }, reconnect.adaptiveDelayMs())
+            // The BOND vector is a per-connection ciphertext, not a secret; the key is only
+            // ever logged as a fingerprint. Together they tell a rotated sensor key apart from
+            // a corrupted stored one in the next bug report.
+            Log.e(
+                TAG,
+                "Key exchange: BOND decryption/CRC failed (saved=$keyExchangeUsingSavedPairKey, " +
+                    "fp=${AiDexPairKeyVault.fingerprint(keyExchange.pairKey)}, " +
+                    "bond=${AiDexParser.hexString(data)})"
+            )
+            handleKeyExchangeFailure("f002-decrypt-or-crc")
             return
         }
 
-        Log.i(TAG, "Key exchange: Session key established!")
+        pairKeyAwaitingLiveValidation = !keyExchangeUsingSavedPairKey
+        Log.i(TAG, "Key exchange: session key established; waiting for valid direct F003")
 
         // Step 5: Send post-BOND config
         sendPostBondConfig(gatt)
     }
 
     /**
+     * A key exchange — saved-key or fresh — did not produce a working session. Neither path
+     * touches the stored credential: a saved key is retained through every failure, and a
+     * fresh pair has nothing stored yet. Retry through a clean GATT a bounded number of
+     * times. A saved key that used up its retries while this phone holds the sensor's bond
+     * is then replaced over F001 (the sensor accepts F001 from its bonded device, and the
+     * new key only overwrites the stored one after a CRC-valid live frame); otherwise hold
+     * in broadcast-only until the user acts.
+     */
+    private fun handleKeyExchangeFailure(reason: String) {
+        val usedSavedKey = keyExchangeUsingSavedPairKey
+        val freshPairAfterReset = keyExchangeIsFreshPairAfterReset
+        // Read before close(): afterwards there is no GATT device to ask.
+        val bonded = currentBondState() == BluetoothDevice.BOND_BONDED ||
+            bondStateAtConnection == BluetoothDevice.BOND_BONDED
+        keyExchangeFailures += 1
+        keyExchange.reset()
+        keyExchangeUsingSavedPairKey = false
+        keyExchangeIsFreshPairAfterReset = false
+        pairKeyAwaitingLiveValidation = false
+        bondDataRead = false
+        challengeWritten = false
+        handler.removeCallbacks(keyExchangeWatchdog)
+        setPhase(Phase.IDLE)
+        close()
+
+        val pathName = when {
+            usedSavedKey -> "Saved-key reconnect"
+            freshPairAfterReset -> "Post-reset fresh pair"
+            else -> "Fresh pair"
+        }
+        when (
+            AiDexRuntimePolicy.decideKeyExchangeFailureAction(
+                consecutiveFailures = keyExchangeFailures,
+                maxFailures = KEY_EXCHANGE_MAX_FAILURES,
+                usedSavedKey = usedSavedKey,
+                bonded = bonded,
+                freshPairAfterReset = freshPairAfterReset,
+            )
+        ) {
+            AiDexRuntimePolicy.KeyExchangeFailureAction.RESTORE_SAVED_KEY -> {
+                // The sensor did not hand out a working key after the reset, so the reset
+                // may not have touched its credential. Go back to the one that was kept.
+                pairKeyResetPending = false
+                keyExchangeFailures = 0
+                savedKeyExhausted = false
+                val delay = reconnect.nextReconnectDelayMs()
+                Log.w(
+                    TAG,
+                    "$pathName failed $KEY_EXCHANGE_MAX_FAILURES times ($reason); falling back to the kept " +
+                        "PAIR credential (fp=${AiDexPairKeyVault.fingerprint(persistedPairKey)}) in ${delay}ms"
+                )
+                handler.postDelayed({ connectDevice(0) }, delay)
+                return
+            }
+            AiDexRuntimePolicy.KeyExchangeFailureAction.REPLACE_SAVED_KEY -> {
+                savedKeyExhausted = true
+                // The fresh pair gets its own retry budget.
+                keyExchangeFailures = 0
+                val delay = reconnect.nextReconnectDelayMs()
+                Log.w(
+                    TAG,
+                    "$pathName failed $KEY_EXCHANGE_MAX_FAILURES times ($reason) on a bonded link; " +
+                        "replacing the stored credential over F001 in ${delay}ms"
+                )
+                constatstatusstr = Applic.getContext().getString(R.string.aidex_status_saved_key_rejected_repairing)
+                UiRefreshBus.requestStatusRefresh()
+                handler.postDelayed({ connectDevice(0) }, delay)
+                return
+            }
+            AiDexRuntimePolicy.KeyExchangeFailureAction.BROADCAST_ONLY -> {
+                if (usedSavedKey) savedKeyExhausted = true
+                Log.w(TAG, "$pathName failed $keyExchangeFailures times ($reason); stored credential untouched")
+                explicitPairRequested = false
+                enterBroadcastOnlyFallback(
+                    reason = "key-exchange-failed:$reason",
+                    statusText = Applic.getContext().getString(
+                        if (usedSavedKey) {
+                            R.string.aidex_status_saved_key_rejected_press_pair
+                        } else {
+                            R.string.aidex_status_pairing_failed_broadcast_only
+                        },
+                    ),
+                )
+                return
+            }
+            AiDexRuntimePolicy.KeyExchangeFailureAction.RETRY_CLEAN_GATT -> Unit
+        }
+        val delay = reconnect.nextReconnectDelayMs()
+        Log.w(
+            TAG,
+            "$pathName failed ($reason); retrying clean GATT in ${delay}ms " +
+                "($keyExchangeFailures/$KEY_EXCHANGE_MAX_FAILURES)"
+        )
+        handler.postDelayed({ connectDevice(0) }, delay)
+    }
+
+    /**
      * Send post-BOND config (plaintext 10 C1 F3, encrypted).
      */
     private fun sendPostBondConfig(gatt: BluetoothGatt) {
+        if (currentBondState() != BluetoothDevice.BOND_BONDED) {
+            // F001 is the one characteristic that needs link encryption. On an unbonded
+            // saved-key session the write never completes: Android tries to pair, the sensor
+            // refuses, the callback never comes, every queued F002 command waits behind it,
+            // and the sensor drops the link ~19s in. The sensor streams F003 without this
+            // config (phone B, 05:01:40), so skip it and let the F002 startup commands run.
+            Log.i(TAG, "Key exchange: unbonded link — skipping post-BOND config write to F001")
+            onKeyExchangeComplete()
+            return
+        }
         val configData = keyExchange.getPostBondConfig()
         if (configData == null) {
             Log.e(TAG, "Key exchange: failed to encrypt post-BOND config")
@@ -2836,6 +3621,17 @@ class AiDexBleManager(
                 liveOffsetCutoff = trustedOffset
             }
         }
+        if (
+            trustedTimeOffsetMinutes != null &&
+            !AiDexHistoryPolicy.isWithinWearDuration(trustedTimeOffsetMinutes, reportedWearDaysOrNull())
+        ) {
+            _sensorExpired = true
+            Log.w(
+                TAG,
+                "F003($source): skipping post-wear live reading offset=$trustedTimeOffsetMinutes wearDays=${reportedWearDaysOrNull()}"
+            )
+            return
+        }
         markStartupControlComplete("first-live-$source")
         val shouldStartHistoryNow = AiDexRuntimePolicy.shouldStartHistoryImmediately(
             pendingInitialHistoryRequest = pendingInitialHistoryRequest,
@@ -2866,6 +3662,14 @@ class AiDexBleManager(
             sensorStartMs = sensorstartmsec,
             offsetMinutes = trustedTimeOffsetMinutes,
         )
+        if (!AiDexHistoryPolicy.shouldAcceptRealtimeTimestamp(sampleTimestampMs, lastGlucoseTimeMs)) {
+            Log.w(
+                TAG,
+                "F003($source): dropping stale realtime sample time=$sampleTimestampMs " +
+                    "latestAccepted=$lastGlucoseTimeMs wireOffset=$trustedTimeOffsetMinutes"
+            )
+            return
+        }
         noteValidReadingAvailable(sampleTimestampMs, "valid-$source")
 
         val bareSerial = tk.glucodata.drivers.aidex.native.crypto.SerialCrypto.stripPrefix(SerialNumber)
@@ -2878,8 +3682,10 @@ class AiDexBleManager(
             rawI1 = rawI1,
             rawI2 = rawI2,
             timeOffsetMinutes = trustedTimeOffsetMinutes ?: 0,
+            temperatureC = rawI2,
         )
         onGlucoseReading?.invoke(reading)
+        appendSkinTemperature(sampleTimestampMs, rawI2)
 
         if (dataptr != 0L) {
             try {
@@ -2889,7 +3695,9 @@ class AiDexBleManager(
                     sampleTimestampMs,
                     autoValue,
                     normalizedRawValue ?: 0f,
-                    1.0f
+                    1.0f,
+                    // The direct F003 live frame carries no trend byte.
+                    Natives.AIDEX_TREND_UNKNOWN
                 )
                 handleGlucoseResult(res, sampleTimestampMs, normalizedRawValue ?: Float.NaN)
                 if (constatstatusstr == "Connected") {
@@ -2926,8 +3734,10 @@ class AiDexBleManager(
             return untrusted("wire offset=$wireOffset is not positive")
         }
         if (wireOffset.toLong() > maxOffsetMinutes) {
-            // 1.8.1 has been observed to produce correct glucose/raw with garbage timing bytes.
-            // Accept the reading, but do not let that field rewrite start time or dedupe state.
+            // Kept as a safety net. Until the bytes[4..5] fix this fired on *every* frame on
+            // every firmware, because the offset was being read from the wrong bytes; a genuine
+            // out-of-range offset should now be rare. Accept the reading either way, but do not
+            // let that field rewrite start time or dedupe state.
             val derivedFromSession = deriveOffsetFromAuthoritativeSession(now)
             if (derivedFromSession != null) {
                 return trust(
@@ -3010,6 +3820,7 @@ class AiDexBleManager(
             startupMetadataComplete = startupMetadataComplete,
             hasModelMetadata = _modelName.isNotBlank() && _firmwareVersion.isNotBlank(),
             hasAuthoritativeSessionStart = hasAuthoritativeSessionStart,
+            hasSensorReportedWearDays = sensorReportedWearDays,
         )
     }
 
@@ -3017,6 +3828,7 @@ class AiDexBleManager(
         return AiDexRuntimePolicy.shouldRequestRoutineCalibrationRefresh(
             hasCachedCalibrationRecords = _calibrationRecords.isNotEmpty(),
             calibrationDownloading = calibrationDownloading,
+            calibrationRangeKnownEmpty = calibrationRangeKnownEmpty,
         )
     }
 
@@ -3129,7 +3941,8 @@ class AiDexBleManager(
         }
         val needsModelMetadata = _modelName.isBlank() || _firmwareVersion.isBlank()
         val needsSessionMetadata = !hasAuthoritativeSessionStart
-        if (!needsModelMetadata && !needsSessionMetadata) {
+        val needsStartupWearDays = !sensorReportedWearDays
+        if (!needsModelMetadata && !needsSessionMetadata && !needsStartupWearDays) {
             pendingStreamingMetadataRead = false
             pendingStreamingMetadataReason = null
             pendingStreamingMetadataScheduled = false
@@ -3149,7 +3962,7 @@ class AiDexBleManager(
         if (needsSessionMetadata) {
             readCGMSessionCharacteristics()
         }
-        if (!startupMetadataComplete || needsModelMetadata) {
+        if (!startupMetadataComplete || needsModelMetadata || needsStartupWearDays) {
             handler.postDelayed({
                 maybeRequestStartupDeviceInfo("streaming-metadata-$reason")
             }, STARTUP_DEVICE_INFO_REQUEST_DELAY_MS)
@@ -3210,7 +4023,7 @@ class AiDexBleManager(
     private fun maybeRequestStartupDeviceInfo(reason: String) {
         if (startupMetadataComplete || startupDeviceInfoRequested) return
         if (!keyExchange.isComplete) return
-        if (_modelName.isNotBlank() && _firmwareVersion.isNotBlank() && hasAuthoritativeSessionStart) {
+        if (hasCompleteStartupMetadata()) {
             startupMetadataComplete = true
             return
         }
@@ -3424,7 +4237,7 @@ class AiDexBleManager(
         val now = System.currentTimeMillis()
         lastF003FrameTimeMs = now
         handler.removeCallbacks(noStreamWatchdog)
-        Log.i(TAG, "handleF003: len=${encryptedData.size}, raw=${AiDexParser.hexString(encryptedData.copyOfRange(0, minOf(encryptedData.size, 8)))}")
+        logi(TAG) { "handleF003: len=${encryptedData.size}, raw=${AiDexParser.hexString(encryptedData.copyOfRange(0, minOf(encryptedData.size, 8)))}" }
 
         // Status/keepalive frames (5 bytes) — decrypt and extract battery voltage
         val frameType = AiDexParser.classifyFrame(encryptedData)
@@ -3459,12 +4272,11 @@ class AiDexBleManager(
             return
         }
 
-        Log.i(
-            TAG,
+        logi(TAG) {
             "F003 parsed: offset=${frame.timeOffsetMinutes}min glucose=${frame.glucoseMgDl} mg/dL " +
                 "packed=${frame.rawGlucosePacked} i1=${frame.i1} i2=${frame.i2} " +
                 "opcode=0x${"%02X".format(frame.opcode)} valid=${frame.isValid}"
-        )
+        }
 
         // Validate CRC-16 embedded in frame (bytes 15-16)
         val frameCrc = Crc16CcittFalse.checksum(decrypted.copyOfRange(0, 15))
@@ -3489,6 +4301,33 @@ class AiDexBleManager(
                 UiRefreshBus.requestStatusRefresh()
             }
             return
+        }
+
+        if (pairKeyAwaitingLiveValidation) {
+            val candidate = keyExchange.pairKey
+            if (candidate != null && AiDexPairKeyVault.saveValidated(Applic.app, SerialNumber, candidate)) {
+                persistedPairKey = candidate.copyOf()
+                pairKeyAwaitingLiveValidation = false
+                Log.i(
+                    TAG,
+                    "Persisted AiDex PAIR credential after valid direct F003 validation " +
+                        "(fp=${AiDexPairKeyVault.fingerprint(candidate)})"
+                )
+                UiRefreshBus.requestStatusRefresh()
+            } else {
+                Log.e(TAG, "Could not persist validated AiDex PAIR credential; will retry on the next live frame")
+            }
+        }
+        keyExchangeUsingSavedPairKey = false
+        keyExchangeIsFreshPairAfterReset = false
+        keyExchangeFailures = 0
+        savedKeyExhausted = false
+        explicitPairRequested = false
+        if (pairKeyResetPending && !pairKeyAwaitingLiveValidation) {
+            // Either the fresh key was just persisted or the kept key still works; the reset
+            // is settled either way.
+            pairKeyResetPending = false
+            Log.i(TAG, "Post-reset pairing settled by valid live data")
         }
 
         if (currentBondState() == BluetoothDevice.BOND_BONDED) {
@@ -3615,6 +4454,14 @@ class AiDexBleManager(
         val opcode = plaintext[0].toInt() and 0xFF
         Log.d(TAG, "F002 response: opcode=0x${"%02X".format(opcode)}, len=${plaintext.size}, crc=$crcValid")
 
+        if (pendingResetReconnect && clearStorageQuietWindowActive && opcode != AiDexOpcodes.CLEAR_STORAGE) {
+            resetDiag(
+                stage = "quiet-window-response-ignored",
+                details = "opcode=0x${"%02X".format(opcode)} len=${plaintext.size} crc=$crcValid",
+            )
+            return
+        }
+
         // For data-carrying opcodes, reject on CRC failure
         if (!crcValid && opcode in intArrayOf(0x21, 0x22, 0x23, 0x24, 0x26, 0x27)) {
             Log.e(TAG, "F002: CRC-16 FAILED for data opcode 0x${"%02X".format(opcode)} — rejecting corrupt response")
@@ -3663,31 +4510,46 @@ class AiDexBleManager(
         } else {
             data.size
         }
-        if (payloadEndExclusive <= 2) {
+        if (payloadEndExclusive <= 1) {
             Log.d(TAG, "Startup device info 0x10: too short (${data.size} bytes)")
             return
         }
 
-        val payload = data.copyOfRange(2, payloadEndExclusive)
-        val parsed = AiDexParser.parseStartupDeviceInfoPayload(payload)
+        val payload = data.copyOfRange(1, payloadEndExclusive)
+        val parsed = AiDexParser.parseStartupDeviceInfoFrame(data, payloadEndExclusive)
         if (parsed == null) {
-            Log.d(TAG, "Startup device info 0x10: unsupported payload len=${payload.size} — keeping DIS/2AAA as source of truth")
+            Log.d(
+                TAG,
+                "Startup device info 0x10: unsupported payload len=${payload.size} " +
+                    "hex=${AiDexParser.hexString(payload.copyOfRange(0, minOf(payload.size, 16)))} — keeping DIS/2AAA as source of truth"
+            )
             return
         }
 
-        startupMetadataComplete = true
         val resolvedFirmwareVersion = mergedFirmwareVersion(_firmwareVersion, parsed.firmwareVersion)
         _firmwareVersion = resolvedFirmwareVersion
         _hardwareVersion = parsed.hardwareVersion
-        _wearDays = parsed.wearDays
+        if (parsed.wearDays > 0) {
+            _wearDays = parsed.wearDays
+            sensorReportedWearDays = true
+            if (dataptr != 0L) {
+                try {
+                    Natives.aidexSetWearDays(dataptr, parsed.wearDays)
+                    Log.i(TAG, "aidexSetWearDays: days=${parsed.wearDays} (sensor-reported, from startup-0x10)")
+                } catch (_: Throwable) {}
+            }
+            if (sensorstartmsec > 0L) {
+                updateSensorExpiredFromStart(System.currentTimeMillis())
+            }
+        }
         _modelName = parsed.modelName
-        applyWearProfileFromModel(_modelName)
+        startupMetadataComplete = hasCompleteStartupMetadata()
         Log.i(
             TAG,
             "Startup device info 0x10: fw=${parsed.firmwareVersion}" +
                 if (resolvedFirmwareVersion != parsed.firmwareVersion) " mergedFw=$resolvedFirmwareVersion" else "" +
                 " hw=$_hardwareVersion " +
-                "days=$_wearDays model=$_modelName"
+                "days=${reportedWearDaysOrNull()?.toString() ?: "unknown"} source=${if (sensorReportedWearDays) "sensor" else "unknown"} model=$_modelName"
         )
         if (phase == Phase.STREAMING) {
             scheduleOptionalStreamingSync("startup-0x10-ready")
@@ -3718,7 +4580,7 @@ class AiDexBleManager(
                 allowActivation = false,
                 allowRepairProbe = true,
             )
-            startupMetadataComplete = startupMetadataComplete || hasAuthoritativeSessionStart
+            startupMetadataComplete = startupMetadataComplete || hasCompleteStartupMetadata()
             return
         }
 
@@ -3775,7 +4637,7 @@ class AiDexBleManager(
             }
         }
 
-        startupMetadataComplete = startupMetadataComplete || (_modelName.isNotBlank() && _firmwareVersion.isNotBlank())
+        startupMetadataComplete = startupMetadataComplete || hasCompleteStartupMetadata()
     }
 
     private fun handleBroadcastDataResponse(data: ByteArray) {
@@ -3999,6 +4861,36 @@ class AiDexBleManager(
         clearPendingRoomHistory("history-range-reset")
         Log.i(TAG, "History range: briefStart=$briefStart, rawStart=$rawStart, newest=$newest")
 
+        val now = System.currentTimeMillis()
+        if (postResetRequestedAtMs > 0L) {
+            val quarantine = AiDexHistoryPolicy.shouldQuarantinePostResetHistoryRange(
+                newestOffsetMinutes = newest,
+                resetRequestedAtMs = postResetRequestedAtMs,
+                nowMs = now,
+            )
+            resetDiag(
+                stage = "history-range-verification",
+                details = "briefStart=$briefStart rawStart=$rawStart newest=$newest quarantine=$quarantine",
+                nowMs = now,
+            )
+            if (quarantine) {
+                val nextIndex = (newest + 1).coerceAtLeast(1)
+                historyRawNextIndex = nextIndex
+                historyBriefNextIndex = nextIndex
+                historyDownloadStartIndex = nextIndex
+                writeIntPref("historyRawNextIndex", nextIndex)
+                writeIntPref("historyBriefNextIndex", nextIndex)
+                Log.w(
+                    TAG,
+                    "Post-reset history quarantine: sensor reported newest=$newest too soon after resetAt=$postResetRequestedAtMs; " +
+                        "advancing cursors to $nextIndex and skipping stale ring contents"
+                )
+                onHistoryDownloadComplete()
+                return
+            }
+            clearPostResetHistoryBarrier("history-range-plausible-new-session")
+        }
+
         val downloadPlan = AiDexHistoryPolicy.planInitialDownload(
             briefStart = briefStart,
             rawStart = rawStart,
@@ -4042,7 +4934,7 @@ class AiDexBleManager(
         // been running for days. ensureSensorStartTime will override if >10min off.
         if (newest > 0) {
             lastOffsetMinutes = newest
-            ensureSensorStartTime(System.currentTimeMillis())
+            ensureSensorStartTime(now)
         }
 
         Log.i(TAG, "History download: starting from raw=$historyRawNextIndex, brief=$historyBriefNextIndex (sensor range: $rawStart..$newest)")
@@ -4192,11 +5084,16 @@ class AiDexBleManager(
         calibrationRangeEndIndex = endIndex
 
         if (endIndex <= 0 || startIndex > endIndex) {
+            // The sensor has answered: it holds no calibrations. Without this the routine refresh
+            // re-armed on every live reading — "no records cached" is not the same as "not asked" —
+            // and re-sent this query roughly once a minute for the whole sensor life.
+            calibrationRangeKnownEmpty = true
             Log.i(TAG, "No calibration records available (start=$startIndex, end=$endIndex)")
             return
         }
 
         // Fetch all calibration records, starting from startIndex, chaining through endIndex
+        calibrationRangeKnownEmpty = false
         calibrationDownloading = true
         requestCalibrationPaginated(startIndex, endIndex)
     }
@@ -4306,40 +5203,76 @@ class AiDexBleManager(
 
     /**
      * Handle CLEAR_STORAGE (0xF3) response.
-     * On success (status=0x00), send RESET (0xF0) as the second step of the reset sequence.
+     * On success, leave the sensor command channel quiet while flash/storage clearing finishes.
+     * Success is status `0x01` (see [AiDexRuntimePolicy.COMMAND_ACCEPTED]); `0x00` is a refusal.
      */
     private fun handleClearStorageResponse(data: ByteArray) {
         val status = if (data.size >= 2) data[1].toInt() and 0xFF else 0xFF
-        Log.i(TAG, "CLEAR_STORAGE response: status=0x${"%02X".format(status)}")
-        if (pendingResetReconnect && status == 0x00) {
-            // Step 2: Now send RESET (0xF0)
-            Log.i(TAG, "CLEAR_STORAGE done — sending RESET (0xF0)")
-            val cmd = commandBuilder.reset()
-            if (cmd != null) {
-                enqueueGattOp(GattOp.Write(CHAR_F002, cmd))
-            } else {
-                Log.e(TAG, "Cannot send RESET: session key unavailable")
-            }
-        } else if (status != 0x00) {
-            Log.e(TAG, "CLEAR_STORAGE failed — not arming extended post-reset warmup")
+        val confirmed = AiDexRuntimePolicy.isClearStorageConfirmed(data.size, status)
+        if (data.size > 4) {
+            // Not an ACK. Newer firmware is reported to answer with key material, so log its
+            // shape and a fingerprint only, never the bytes.
+            Log.w(
+                TAG,
+                "CLEAR_STORAGE response is not an ACK: len=${data.size} " +
+                    "fp=${AiDexPairKeyVault.fingerprint(data)} — treating the reset as not confirmed"
+            )
+        } else {
+            Log.i(TAG, "CLEAR_STORAGE response: status=0x${"%02X".format(status)} confirmed=$confirmed")
+        }
+        if (pendingResetReconnect || postResetRequestedAtMs > 0L) {
+            postResetClearStorageAckAtMs = System.currentTimeMillis()
+            resetDiag(
+                stage = "f3-ack",
+                details = "status=0x${"%02X".format(status)} responseLen=${data.size} confirmed=$confirmed",
+                nowMs = postResetClearStorageAckAtMs,
+            )
+        }
+        if (confirmed && persistedPairKey != null) {
+            // The reset took the sensor's PAIR credential with it (a raw maintenance 0xF3 as
+            // much as the lifecycle reset). Pair fresh on the next connection rather than
+            // retrying the dead key; the kept key stays the fallback.
+            pairKeyResetPending = true
+            keyExchangeFailures = 0
+            savedKeyExhausted = false
+            Log.i(
+                TAG,
+                "CLEAR_STORAGE confirmed — next connection pairs fresh; keeping PAIR credential " +
+                    "fp=${AiDexPairKeyVault.fingerprint(persistedPairKey)} until a new one is validated"
+            )
+        }
+        if (pendingResetReconnect && confirmed) {
+            clearStorageQuietWindowActive = true
+            gattQueue.clear()
+            postResetWarmupExtensionActive = true
+            writeBoolPref("postResetWarmupExtensionActive", true)
+            Log.i(
+                TAG,
+                "CLEAR_STORAGE accepted — not sending RESET (0xF0); waiting ${CLEAR_STORAGE_QUIET_WINDOW_MS}ms for clear/reboot"
+            )
+            scheduleClearStorageQuietWindow("f3-ack", postResetClearStorageAckAtMs)
+        } else if (!confirmed) {
+            Log.e(TAG, "CLEAR_STORAGE not confirmed by the sensor — reset abandoned, PAIR credential untouched")
+            handler.removeCallbacks(clearStorageQuietWindowReconnect)
+            handler.removeCallbacks(postResetDisconnectFallback)
             pendingResetReconnect = false
+            clearStorageQuietWindowActive = false
             needsPostResetActivation = false
             postResetWarmupExtensionActive = false
             writeBoolPref("needsPostResetActivation", false)
             writeBoolPref("postResetWarmupExtensionActive", false)
+            clearPostResetHistoryBarrier("clear-storage-failed")
         }
     }
 
     /**
      * Handle RESET (0xF0) response.
-     * The sensor will disconnect shortly after this. The disconnect handler
-     * checks pendingResetReconnect to perform bond removal + delayed reconnect.
+     * This is a separate hardware-maintenance command. Lifecycle reset uses
+     * CLEAR_STORAGE (0xF3) only because chaining 0xF0 can interrupt the clear.
      */
     private fun handleResetResponse(data: ByteArray) {
         val status = if (data.size >= 2) data[1].toInt() and 0xFF else 0xFF
-        Log.i(TAG, "RESET response: status=0x${"%02X".format(status)} — sensor will disconnect shortly")
-        postResetWarmupExtensionActive = (status == 0x00)
-        writeBoolPref("postResetWarmupExtensionActive", postResetWarmupExtensionActive)
+        Log.i(TAG, "RESET response: status=0x${"%02X".format(status)}")
     }
 
     /**
@@ -4349,9 +5282,15 @@ class AiDexBleManager(
     private fun handleDeleteBondResponse(data: ByteArray) {
         val status = if (data.size >= 2) data[1].toInt() and 0xFF else 0xFF
         Log.i(TAG, "DELETE_BOND response: status=0x${"%02X".format(status)}")
-        if (pendingUnpairDisconnect) {
+        if (AiDexRuntimePolicy.shouldClearPersistedPairKey(pendingUnpairDisconnect, status)) {
             pendingUnpairDisconnect = false
-            Log.i(TAG, "DELETE_BOND delivered — performing deferred unpair cleanup")
+            isUnpaired = true
+            Log.i(TAG, "DELETE_BOND acknowledged — performing confirmed unpair cleanup")
+            if (!AiDexPairKeyVault.clearAfterConfirmedUnpair(Applic.app, SerialNumber)) {
+                Log.e(TAG, "Confirmed unpair credential cleanup was not fully committed")
+            }
+            persistedPairKey = null
+            pairKeyResetPending = false
             // Remove Android-level bond
             try {
                 val device = mBluetoothGatt?.device
@@ -4367,11 +5306,27 @@ class AiDexBleManager(
             keyExchange.reset()
             softDisconnect()
             constatstatusstr = "Unpaired — Broadcast Only"
-            // Transition to broadcast-only mode so user keeps getting data
-            reconnect.isBroadcastOnlyMode = true
+            // The ACK runs on the handler. Release reads the mode on the IO thread, so the
+            // write and that read share this lock.
             stop = false
+            val startPostUnpairScan = synchronized(postUnpairScanLock) {
+                reconnect.isBroadcastOnlyMode = true
+                !postUnpairBroadcastScanSuppressed
+            }
             UiRefreshBus.requestStatusRefresh()
-            handler.post { startBroadcastScan("post-unpair") }
+            if (startPostUnpairScan) {
+                handler.post { startBroadcastScan("post-unpair") }
+            } else {
+                Log.i(TAG, "post-unpair broadcast scan suppressed — sensor is being removed")
+            }
+        } else if (pendingUnpairDisconnect) {
+            pendingUnpairDisconnect = false
+            // The suppression stays: delete-with-unbind still removes the sensor after a rejected
+            // unpair. Its finally releases the flag if that removal does not happen.
+            isUnpaired = false
+            Log.w(TAG, "DELETE_BOND was rejected or malformed; retaining PAIR credential")
+            constatstatusstr = "Unpair failed — key retained"
+            UiRefreshBus.requestStatusRefresh()
         }
     }
 
@@ -4475,8 +5430,45 @@ class AiDexBleManager(
     // GATT Queue
     // =========================================================================
 
+    private fun enqueueExclusiveClearStorage(cmd: ByteArray) {
+        handler.post {
+            val queuedBefore = gattQueue.size
+            val activeBefore = describeGattOp(currentGattOp)
+            val historyDownloadingBefore = historyDownloading
+            handler.removeCallbacks(historyPageWatchdog)
+            handler.removeCallbacks(delayedInitialHistoryRequest)
+            handler.removeCallbacks(delayedStreamingMetadataRequest)
+            handler.removeCallbacks(delayedDefaultParamAutoProvisioningRequest)
+            handler.removeCallbacks(delayedCalibrationRefreshRequest)
+            handler.removeCallbacks(startupControlAckTimeout)
+            pendingInitialHistoryRequest = false
+            historyDownloading = false
+            historyPhase = HistoryPhase.IDLE
+            calibrationDownloading = false
+            clearDefaultParamProbeState()
+            clearDefaultParamApplyState()
+
+            gattQueue.clear()
+            gattQueue.addFirst(GattOp.Write(CHAR_F002, cmd))
+            Log.i(TAG, "Queued exclusive CLEAR_STORAGE; cancelled pending F002/history work")
+            resetDiag(
+                stage = "f3-exclusive-queued",
+                details = "queuedBefore=$queuedBefore activeBefore=$activeBefore historyDownloadingBefore=$historyDownloadingBefore",
+            )
+            if (!gattOpActive) {
+                drainGattQueue()
+            }
+        }
+    }
+
     private fun enqueueGattOp(op: GattOp) {
         handler.post {
+            if (clearStorageQuietWindowActive) {
+                postResetDroppedGattOps += 1
+                Log.i(TAG, "Dropping queued GATT operation during CLEAR_STORAGE quiet window: ${describeGattOp(op)}")
+                resetDiag("quiet-window-op-dropped", "op=${describeGattOp(op)}")
+                return@post
+            }
             gattQueue.add(op)
             if (!gattOpActive) {
                 drainGattQueue()
@@ -4523,6 +5515,33 @@ class AiDexBleManager(
                 characteristic.writeType = writeType
                 val ok = gatt.writeCharacteristic(characteristic)
                 Log.d(TAG, "GATT write [${next.charUuid}]: ok=$ok, queueRemaining=${gattQueue.size}")
+                if (
+                    pendingResetReconnect &&
+                    clearStorageQuietWindowActive &&
+                    next.charUuid == CHAR_F002 &&
+                    postResetClearStorageAckAtMs == 0L
+                ) {
+                    if (postResetClearStorageWriteAtMs == 0L) {
+                        postResetClearStorageWriteAtMs = System.currentTimeMillis()
+                    }
+                    resetDiag(
+                        stage = "f3-write-dispatched",
+                        details = "ok=$ok writeType=$writeType props=0x${"%02X".format(characteristic.properties)} " +
+                            "encryptedLen=${next.data.size} encrypted=${AiDexParser.hexString(next.data)} retry=${next.retryCount}",
+                    )
+                }
+                if (
+                    ok &&
+                    pendingResetReconnect &&
+                    clearStorageQuietWindowActive &&
+                    next.charUuid == CHAR_F002 &&
+                    postResetClearStorageAckAtMs == 0L
+                ) {
+                    scheduleClearStorageQuietWindow(
+                        reason = "f3-write-dispatched-awaiting-ack",
+                        nowMs = postResetClearStorageWriteAtMs,
+                    )
+                }
 
                 if (ok && writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
                     gattOpActive = false
@@ -4671,8 +5690,7 @@ class AiDexBleManager(
      */
     private fun ensureSensorStartTime(now: Long, trustedOffsetMinutes: Int? = null) {
         if (hasAuthoritativeSessionStart && sensorstartmsec > 0L) {
-            val expiryMs = sensorstartmsec + (_wearDays.toLong() * 24 * 3600_000L)
-            _sensorExpired = now > expiryMs
+            updateSensorExpiredFromStart(now)
             return
         }
 
@@ -4683,11 +5701,11 @@ class AiDexBleManager(
                 sensorstartmsec = inferredStart
                 Log.i(TAG, "Updated sensorstartmsec from offset: ${effectiveOffsetMinutes}min → $inferredStart")
                 if (dataptr != 0L) {
-                    // Push wear days BEFORE start time — aidexSetStartTime
-                    // uses info->days to compute wearduration2
-                    try {
-                        Natives.aidexSetWearDays(dataptr, _wearDays)
-                    } catch (_: Throwable) {}
+                    reportedWearDaysOrNull()?.let { wearDays ->
+                        try {
+                            Natives.aidexSetWearDays(dataptr, wearDays)
+                        } catch (_: Throwable) {}
+                    }
                     try {
                         Natives.aidexSetStartTime(dataptr, sensorstartmsec)
                     } catch (_: Throwable) {}
@@ -4697,8 +5715,7 @@ class AiDexBleManager(
 
         // Update local expiry state whenever start time is set
         if (sensorstartmsec > 0L) {
-            val expiryMs = sensorstartmsec + (_wearDays.toLong() * 24 * 3600_000L)
-            _sensorExpired = now > expiryMs
+            updateSensorExpiredFromStart(now)
         }
     }
 
@@ -4729,14 +5746,22 @@ class AiDexBleManager(
         }
 
         val now = System.currentTimeMillis()
+        val reportedWearDays = reportedWearDaysOrNull()
+        val wearDurationMinutes = AiDexHistoryPolicy.wearDurationMinutes(reportedWearDays)
         var stored = 0
+        var skippedWearDuration = 0
         var newestStoredTimeMs = 0L
+        val temperatureRecords = ArrayList<AiDexTemperatureStore.TemperatureRecord>()
 
         for (entry in entries) {
             // Filter invalid
             if (!entry.isValid) continue
             if (entry.offsetMinutes <= 0) continue
             if (entry.offsetMinutes.toLong() > MAX_OFFSET_DAYS * 24L * 60L) continue
+            if (!AiDexHistoryPolicy.isWithinWearDuration(entry.offsetMinutes, reportedWearDays)) {
+                skippedWearDuration++
+                continue
+            }
 
             // Skip entries beyond the sensor's reported newest offset — these contain
             // uninitialized/corrupt data from the sensor's ring buffer write head.
@@ -4776,6 +5801,11 @@ class AiDexBleManager(
                 pendingRoomHistoryTimestamps.add(historicalTimeMs)
                 pendingRoomHistoryValues.add(entry.glucoseMgDl)
                 pendingRoomHistoryRawValues.add(rawForStore)
+                if (AiDexTemperatureStore.isPlausibleSkinTemperatureC(entry.temperatureC)) {
+                    temperatureRecords.add(
+                        AiDexTemperatureStore.TemperatureRecord(historicalTimeMs, entry.temperatureC)
+                    )
+                }
                 stored++
                 historyStoredCount++
                 if (historicalTimeMs > newestStoredTimeMs) {
@@ -4792,9 +5822,22 @@ class AiDexBleManager(
 
         }
 
+        if (skippedWearDuration > 0) {
+            val wearLimitLabel = wearDurationMinutes?.let { "${it}min" } ?: "unknown"
+            Log.w(
+                TAG,
+                "storeHistoryEntries: skipped $skippedWearDuration/${entries.size} entries at/after declared wear duration " +
+                    "($wearLimitLabel, wearDays=$reportedWearDays)"
+            )
+        }
         if (stored > 0) {
             noteValidReadingAvailable(newestStoredTimeMs, "valid-history")
             Log.i(TAG, "storeHistoryEntries: stored $stored/${entries.size} entries (total=$historyStoredCount)")
+            if (temperatureRecords.isNotEmpty()) {
+                Applic.app?.let { context ->
+                    AiDexTemperatureStore.appendTemperatureHistory(context, SerialNumber, temperatureRecords)
+                }
+            }
         }
     }
 
@@ -4858,7 +5901,7 @@ class AiDexBleManager(
             // storage. The history row was already persisted above.
             SuperGattCallback.processExternalCurrentReading(
                 SerialNumber,
-                catchUpDisplayGlucose,
+                tk.glucodata.LiveReadingLanes.stock(catchUpDisplayGlucose, Float.NaN),
                 0f,
                 catchUpTimestamp,
                 sensorgen
@@ -4905,12 +5948,11 @@ class AiDexBleManager(
     }
 
     private fun applyWearProfileFromModel(modelName: String) {
-        val normalized = modelName.trim().uppercase(java.util.Locale.US)
-        _wearDays = when {
-            normalized.startsWith("GX-01S") -> 15
-            else -> 15
+        if (sensorReportedWearDays) {
+            Log.i(TAG, "Wear profile: keeping sensor-reported days=$_wearDays for model=$modelName")
+            return
         }
-        Log.i(TAG, "Wear profile: model=$modelName days=$_wearDays")
+        Log.i(TAG, "Wear profile: model=$modelName; waiting for sensor-reported wear_days")
     }
 
     // =========================================================================
@@ -5010,7 +6052,7 @@ class AiDexBleManager(
 
     override val broadcastOnlyConnection: Boolean get() = reconnect.isBroadcastOnlyMode
 
-    override fun isVendorPaired(): Boolean = keyExchange.isComplete
+    override fun isVendorPaired(): Boolean = persistedPairKey != null
 
     override fun isVendorConnected(): Boolean = phase == Phase.STREAMING && mBluetoothGatt != null
 
@@ -5024,10 +6066,18 @@ class AiDexBleManager(
     override fun getSensorRemainingHours(): Int {
         if (sensorstartmsec <= 0L) return -1
         val elapsedMs = System.currentTimeMillis() - sensorstartmsec
-        val totalMs = _wearDays.toLong() * 24 * 60 * 60 * 1000
+        val wearDays = reportedWearDaysOrNull() ?: return -1
+        val totalMs = wearDays.toLong() * 24 * 60 * 60 * 1000
         val remainingMs = totalMs - elapsedMs
         return if (remainingMs <= 0) 0 else (remainingMs / (60 * 60 * 1000)).toInt()
     }
+
+    override fun getSensorReportedWearDays(): Int = reportedWearDaysOrNull() ?: -1
+
+    override fun getDisplayWearDays(): Int =
+        AiDexWearProfile.resolve(reportedWearDaysOrNull(), AiDexWearProfile.ratedDays(_modelName)) ?: -1
+
+    override fun shouldUseNativeOfficialEndFallback(): Boolean = false
 
     override fun getSensorAgeHours(): Int {
         if (sensorstartmsec <= 0L) return -1
@@ -5055,6 +6105,9 @@ class AiDexBleManager(
         connectAttemptInFlight = false
         cancelBroadcastScan()
         keyExchange.reset()
+        explicitPairRequested = false
+        // Local removal is not proof of sensor-side UNPAIR. Keep the portable credential so
+        // re-adding the sensor cannot force another F001 exchange.
         // Notify C++ layer that this sensor is being removed — prevents zombie resurrection
         try { finishSensor() } catch (_: Throwable) {}
         // Capture device reference BEFORE nullifying gatt
@@ -5095,9 +6148,20 @@ class AiDexBleManager(
         // (e.g., "Paused", "Unpaired", "Broadcast Only", "Pairing cancelled")
     }
 
+    override fun onBluetoothAdapterUnavailable() {
+        pendingStaleConnectionRecovery = false
+        connectAttemptInFlight = false
+        connectTime = 0L
+        resetConnectionRuntimeState(reason = "bluetooth-adapter-off", resetInvalidSetupCounter = false)
+        setPhase(Phase.IDLE)
+        constatstatusstr = "Bluetooth off"
+        UiRefreshBus.requestStatusRefresh()
+    }
+
     override fun manualReconnectNow() {
         Log.i(TAG, "manualReconnectNow: forcing reconnect for $SerialNumber")
         consecutiveSetupDisconnects = 0
+        keyExchangeFailures = 0
         noDirectLiveBroadcastFallbackMode = false
         cancelBroadcastScan()
         _isPaused = false   // Clear paused flag — user explicitly wants reconnection
@@ -5127,15 +6191,44 @@ class AiDexBleManager(
         }
     }
 
+    override fun supportsResetAction(): Boolean =
+        AiDexRuntimePolicy.supportsLifecycleReset(_firmwareVersion)
+
     override fun resetSensor(): Boolean {
-        Log.i(TAG, "resetSensor: CLEAR_STORAGE (0xF3) then RESET (0xF0) for $SerialNumber")
+        if (!supportsResetAction()) {
+            Log.w(TAG, "resetSensor: firmware $_firmwareVersion refuses CLEAR_STORAGE — not sending it")
+            return false
+        }
+        Log.i(TAG, "resetSensor: CLEAR_STORAGE (0xF3) only for $SerialNumber")
         tk.glucodata.HistorySyncAccess.markSensorReset(SerialNumber)
 
-        // Step 0: Build CLEAR_STORAGE command (requires session key)
+        // CLEAR_STORAGE is the complete lifecycle-reset command. Do not immediately
+        // chain RESET (0xF0), which can interrupt the clear and leave the old history
+        // range exposed.
         val cmd = commandBuilder.clearStorage() ?: run {
             Log.e(TAG, "resetSensor: session key not available")
             return false
         }
+
+        handler.removeCallbacks(clearStorageQuietWindowReconnect)
+        handler.removeCallbacks(postResetDisconnectFallback)
+        val resetRequestedAt = System.currentTimeMillis()
+        postResetClearStorageWriteAtMs = 0L
+        postResetClearStorageAckAtMs = 0L
+        postResetDisconnectRequestedAtMs = 0L
+        postResetDroppedGattOps = 0
+        clearStorageQuietWindowActive = true
+        pendingResetReconnect = true
+        needsPostResetActivation = true
+        writeBoolPref("needsPostResetActivation", true)
+        armPostResetHistoryBarrier("reset-sensor", resetRequestedAt)
+        resetDiag(
+            stage = "request",
+            details = "historyDownloading=$historyDownloading historyPhase=$historyPhase rawNext=$historyRawNextIndex " +
+                "briefNext=$historyBriefNextIndex newest=$historyNewestOffset sessionStartMs=$sensorstartmsec " +
+                "lastOffset=$lastOffsetMinutes",
+            nowMs = resetRequestedAt,
+        )
 
         // Reset history indices — new sensor means history starts from scratch
         historyRawNextIndex = 0
@@ -5146,24 +6239,17 @@ class AiDexBleManager(
         clearPendingRoomHistory("reset-sensor")
         Log.i(TAG, "resetSensor: history indices reset to 0")
 
-        // Set flags BEFORE sending commands — the disconnect handler checks pendingResetReconnect,
-        // and handleCGMSessionStartTime checks needsPostResetActivation on the next connection
-        pendingResetReconnect = true
-        needsPostResetActivation = true
-        writeBoolPref("needsPostResetActivation", true)
-
-        // Step 1: Send CLEAR_STORAGE (0xF3)
-        // Step 2 (RESET 0xF0) is sent from handleClearStorageResponse() when
-        // the sensor acknowledges the clear.
-        enqueueGattOp(GattOp.Write(CHAR_F002, cmd))
+        enqueueExclusiveClearStorage(cmd)
         return true
     }
 
     override fun startNewSensor(): Boolean {
         Log.i(TAG, "startNewSensor: activating sensor $SerialNumber")
+        val now = System.currentTimeMillis()
         autoActivationAttemptedThisConnection = true
         hasAuthoritativeSessionStart = false
-        armFirstValidReadingWait(System.currentTimeMillis(), "start-new-sensor")
+        armPostResetHistoryBarrier("start-new-sensor", now)
+        armFirstValidReadingWait(now, "start-new-sensor")
         tk.glucodata.HistorySyncAccess.markSensorReset(SerialNumber)
 
         // Reset history indices — new sensor means history starts from scratch
@@ -5235,28 +6321,50 @@ class AiDexBleManager(
         return true
     }
 
+    override fun suppressPostUnpairBroadcastScan() {
+        postUnpairBroadcastScanSuppressed = true
+    }
+
+    override fun releasePostUnpairBroadcastScanSuppression() {
+        // Under the same lock as the ACK's mode write. Clearing the flag here either happens
+        // before that read, so the ACK starts the scan, or after it, so this side sees
+        // broadcast-only and starts the scan the ACK skipped. Release runs off the handler,
+        // and the field is not volatile.
+        val startNow = synchronized(postUnpairScanLock) {
+            if (!postUnpairBroadcastScanSuppressed) return@synchronized false
+            postUnpairBroadcastScanSuppressed = false
+            reconnect.isBroadcastOnlyMode
+        }
+        if (!startNow) return
+        handler.post {
+            if (postUnpairBroadcastScanSuppressed || !broadcastOnlyConnection) return@post
+            startBroadcastScan("delete-unbind-cancelled")
+        }
+    }
+
+    /**
+     * A refused unpair did not send DELETE_BOND, so no ACK will start the scan. Drop the
+     * suppression. Once a confirmed unpair has already entered broadcast-only, the ACK skipped
+     * its scan and [releasePostUnpairBroadcastScanSuppression] still owes it: clearing the flag
+     * here would make that release return without starting.
+     */
+    private fun clearPostUnpairSuppressionUnlessBroadcastOnly() {
+        synchronized(postUnpairScanLock) {
+            if (!reconnect.isBroadcastOnlyMode) {
+                postUnpairBroadcastScanSuppressed = false
+            }
+        }
+    }
+
     override fun unpairSensor(): Boolean {
         Log.i(TAG, "unpairSensor: sending deleteBond (0xF2) for $SerialNumber")
         consecutiveSetupDisconnects = 0
-        isUnpaired = true  // Block reconnection permanently until re-pair
         val cmd = commandBuilder.deleteBond() ?: run {
-            Log.e(TAG, "unpairSensor: session key not available — disconnecting without 0xF2")
-            // Even without session key, disconnect and remove bond
-            try {
-                val device = mBluetoothGatt?.device
-                if (device?.bondState == android.bluetooth.BluetoothDevice.BOND_BONDED) {
-                    val removeBond = device.javaClass.getMethod("removeBond")
-                    removeBond.invoke(device)
-                    setBondValidatedByStreaming(false, "unpair-no-session-key")
-                }
-            } catch (_: Throwable) {}
-            keyExchange.reset()
-            softDisconnect()
-            enterBroadcastOnlyFallback(
-                reason = "post-unpair",
-                statusText = "Unpaired — Broadcast Only",
-            )
-            return true
+            clearPostUnpairSuppressionUnlessBroadcastOnly()
+            Log.e(TAG, "unpairSensor: session key unavailable — refusing unconfirmed local cleanup")
+            constatstatusstr = "Connect before unpairing — key retained"
+            UiRefreshBus.requestStatusRefresh()
+            return false
         }
         // Set flag BEFORE sending — the response handler (or disconnect handler)
         // will perform bond removal + disconnect after the command is delivered.
@@ -5267,10 +6375,33 @@ class AiDexBleManager(
         return true
     }
 
+    override fun forgetSavedPairKey() {
+        Log.i(TAG, "forgetSavedPairKey: force-clearing stored PAIR credential for $SerialNumber")
+        val cleared = AiDexPairKeyVault.clearStoredKey(Applic.app, SerialNumber)
+        if (!cleared) Log.e(TAG, "forgetSavedPairKey: credential removal was not fully committed")
+        persistedPairKey = null
+        savedKeyExhausted = false
+        keyExchangeFailures = 0
+        pairKeyResetPending = false
+        UiRefreshBus.requestStatusRefresh()
+    }
+
     override fun rePairSensor() {
-        Log.i(TAG, "rePairSensor: resetting key exchange and reconnecting for $SerialNumber")
+        Log.i(TAG, "rePairSensor: reconnecting without discarding PAIR credential for $SerialNumber")
         consecutiveSetupDisconnects = 0
         keyExchange.reset()
+        // A backup may have been restored since this manager loaded its key.
+        AiDexPairKeyVault.load(Applic.app, SerialNumber)?.let { restored ->
+            if (persistedPairKey?.contentEquals(restored) != true) {
+                Log.i(TAG, "rePairSensor: picked up a restored PAIR credential from storage")
+                persistedPairKey = restored
+                savedKeyExhausted = false
+            }
+        }
+        // The user asked for a pairing: give it a full set of retries, and let it replace a
+        // saved key only if that key has already been proven dead.
+        keyExchangeFailures = 0
+        explicitPairRequested = true
         softDisconnect()
         constatstatusstr = "Re-pairing..."
         UiRefreshBus.requestStatusRefresh()
@@ -5462,6 +6593,7 @@ class AiDexBleManager(
     }
 
     private fun startBroadcastScan(reason: String, continuous: Boolean = shouldContinueBroadcastScanning()) {
+        if (postUnpairBroadcastScanSuppressed) return
         if (broadcastScanActive && !recoverAlarmScanIfStale("start-$reason")) return
 
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
@@ -5764,8 +6896,15 @@ class AiDexBleManager(
         return lo or ((carry and 0x03) shl 8)
     }
 
-    private fun parseBroadcastSamplePayload(payload: ByteArray): ParsedBroadcastSample? {
-        if (payload.size < 7) return null
+    private data class BroadcastPayloadParseResult(
+        val sample: ParsedBroadcastSample? = null,
+        val rejectionReason: String? = null,
+    )
+
+    private fun parseBroadcastSamplePayload(payload: ByteArray): BroadcastPayloadParseResult {
+        if (payload.size < 7) {
+            return BroadcastPayloadParseResult(rejectionReason = "too-short")
+        }
 
         val offsetCandidate = if (payload.size >= 4) u32LE(payload, 0).toInt() else u16LE(payload, 0)
         val offsetMinutes = when {
@@ -5773,7 +6912,9 @@ class AiDexBleManager(
             else -> u16LE(payload, 0)
         }
         if (offsetMinutes <= 0 || offsetMinutes.toLong() > (MAX_OFFSET_DAYS * 24L * 60L)) {
-            return null
+            return BroadcastPayloadParseResult(
+                rejectionReason = "invalid-offset(u32=$offsetCandidate,u16=${u16LE(payload, 0)})"
+            )
         }
 
         val trend = payload[4].toInt()
@@ -5785,14 +6926,31 @@ class AiDexBleManager(
             else -> 0
         }
         if (glucoseMgDl !in MIN_VALID_GLUCOSE_MGDL..MAX_VALID_GLUCOSE_MGDL) {
-            return null
+            return BroadcastPayloadParseResult(
+                rejectionReason = "invalid-glucose(packed=$packedGlucose,byte5=$fallbackGlucose)"
+            )
         }
 
-        return ParsedBroadcastSample(
-            offsetMinutes = offsetMinutes,
-            trend = trend,
-            glucoseMgDl = glucoseMgDl,
+        return BroadcastPayloadParseResult(
+            sample = ParsedBroadcastSample(
+                offsetMinutes = offsetMinutes,
+                trend = trend,
+                glucoseMgDl = glucoseMgDl,
+            )
         )
+    }
+
+    private fun logRejectedBroadcastPayload(source: String, payload: ByteArray, reason: String, now: Long) {
+        val shouldLogPayload =
+            broadcastRejectionLogCount < BROADCAST_REJECTION_INITIAL_LOGS ||
+                now - lastBroadcastRejectionLogAtMs >= BROADCAST_REJECTION_LOG_INTERVAL_MS
+        if (shouldLogPayload) {
+            broadcastRejectionLogCount += 1
+            lastBroadcastRejectionLogAtMs = now
+            logd(TAG) {
+                "$source payload rejected: len=${payload.size} reason=$reason hex=${AiDexParser.hexString(payload)}"
+            }
+        }
     }
 
     private fun resolveBroadcastSampleTimestampMs(observedAtMs: Long, offsetMinutes: Int): Long {
@@ -5830,16 +6988,21 @@ class AiDexBleManager(
         val now = System.currentTimeMillis()
         val waitingForFirstDirectLive = waitingForFirstDirectLive()
         val hadRecentLiveDataBeforeBroadcast = hasRecentLiveData(now)
-        val sample = parseBroadcastSamplePayload(payload)
+        val parsed = parseBroadcastSamplePayload(payload)
+        val sample = parsed.sample
         if (sample == null) {
-            Log.d(TAG, "$source payload rejected: len=${payload.size}")
+            logRejectedBroadcastPayload(
+                source = source,
+                payload = payload,
+                reason = parsed.rejectionReason ?: "unknown",
+                now = now,
+            )
             return
         }
 
-        Log.i(
-            TAG,
+        logi(TAG) {
             "$source sample: offset=${sample.offsetMinutes}min glucose=${sample.glucoseMgDl} mg/dL trend=${sample.trend}"
-        )
+        }
 
         // Capture timing of the previous *fresh* (non-duplicate) accepted broadcast
         // before any state is touched. The cadence estimator MUST anchor here, not
@@ -5857,11 +7020,10 @@ class AiDexBleManager(
             sample.trend == lastBroadcastTrendSeen &&
             (now - lastBroadcastOffsetSeenAtMs) < BROADCAST_DUPLICATE_SUPPRESS_MS
         ) {
-            Log.d(
-                TAG,
+            logd(TAG) {
                 "$source duplicate suppressed: offset=${sample.offsetMinutes}min glucose=${sample.glucoseMgDl} trend=${sample.trend} " +
                     "ageMs=${now - lastBroadcastOffsetSeenAtMs}"
-            )
+            }
             if (stopActiveScanAfterHandling) {
                 stopBroadcastScan("broadcast-duplicate", found = true)
             }
@@ -5896,6 +7058,19 @@ class AiDexBleManager(
         lastOffsetMinutes = sample.offsetMinutes
         ensureSensorStartTime(now, sample.offsetMinutes)
         val sampleTimestampMs = resolveBroadcastSampleTimestampMs(now, sample.offsetMinutes)
+        val reportedWearDays = reportedWearDaysOrNull()
+        if (!AiDexHistoryPolicy.isWithinWearDuration(sample.offsetMinutes, reportedWearDays)) {
+            _sensorExpired = true
+            Log.w(
+                TAG,
+                "$source: skipping post-wear broadcast reading offset=${sample.offsetMinutes} wearDays=$reportedWearDays"
+            )
+            if (stopActiveScanAfterHandling) {
+                stopBroadcastScan("broadcast-post-wear", found = true)
+            }
+            return
+        }
+        ExchangeTrend.cacheAiDexTrend(SerialNumber, sampleTimestampMs, sample.trend)
 
         val fallbackActive = AiDexRuntimePolicy.shouldAcceptBroadcastFallback(
             broadcastOnlyMode = reconnect.isBroadcastOnlyMode,
@@ -5920,10 +7095,9 @@ class AiDexBleManager(
         // scan happened to catch it. Never drop a new minute just because it arrived
         // only ~40s after the previous one; that is how visible chart gaps were created.
         if (lastBroadcastStoredOffsetMinutes > 0 && sample.offsetMinutes < lastBroadcastStoredOffsetMinutes) {
-            Log.d(
-                TAG,
+            logd(TAG) {
                 "$source older minute suppressed: offset=${sample.offsetMinutes} storedOffset=$lastBroadcastStoredOffsetMinutes"
-            )
+            }
             maybePromoteFallbackReadingToHistory(now, source)
             if (stopActiveScanAfterHandling) {
                 stopBroadcastScan("broadcast-older-minute", found = true)
@@ -5956,7 +7130,7 @@ class AiDexBleManager(
             )
             SuperGattCallback.processExternalCurrentReading(
                 SerialNumber,
-                displayGlucose,
+                tk.glucodata.LiveReadingLanes.stock(displayGlucose, Float.NaN),
                 0f,
                 sampleTimestampMs,
                 sensorgen
@@ -5979,7 +7153,10 @@ class AiDexBleManager(
                     sampleTimestampMs,
                     sample.glucoseMgDl.toFloat(),
                     0f,
-                    1.0f
+                    1.0f,
+                    // Broadcast samples do carry the sensor's own trend byte — the same
+                    // value cached into ExchangeTrend above. Prefer it over a derived rate.
+                    sample.trend
                 )
                 handleGlucoseResult(res, sampleTimestampMs)
                 maybePromoteFallbackReadingToHistory(now, source)

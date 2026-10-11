@@ -5,6 +5,7 @@ package tk.glucodata.ui
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -17,12 +18,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.CheckCircle
@@ -42,13 +44,16 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Watch
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -59,14 +64,16 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.core.content.FileProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -84,13 +91,21 @@ import java.net.NetworkInterface
 import java.text.DateFormat
 import java.util.Collections
 import java.util.Date
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import tk.glucodata.ui.components.AppTopBar
+import tk.glucodata.webserver.WebServerCertificate
 import tk.glucodata.Applic
+import tk.glucodata.AutoSensorSwitch
 import tk.glucodata.GoogleServices
 import tk.glucodata.Natives
 import tk.glucodata.Notify
 import tk.glucodata.R
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.WatchInterop
+import tk.glucodata.WearSensorClaimState
+import tk.glucodata.WearSensorClaimStatus
 import tk.glucodata.watchdrip
 import tk.glucodata.ui.components.CardPosition
 import tk.glucodata.ui.components.MasterSwitchCard
@@ -119,18 +134,14 @@ fun WatchSettingsScreen(navController: NavController) {
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.watches)) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = null)
-                    }
-                },
+            AppTopBar(
+                title = stringResource(R.string.watches),
+                onNavigateBack = { navController.popBackStack() },
                 actions = {
                     IconButton(onClick = { showHelp = true }) {
                         Icon(Icons.Filled.Info, contentDescription = stringResource(R.string.helpname))
                     }
-                }
+                },
             )
         }
     ) { padding ->
@@ -139,10 +150,10 @@ fun WatchSettingsScreen(navController: NavController) {
                 .fillMaxSize()
                 .padding(padding),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             item("watch_transport_section") {
-                SectionLabel("Transport", topPadding = 0.dp)
+                SectionLabel(stringResource(R.string.watch_transport_section), topPadding = 0.dp)
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     SettingsSwitchItem(
                         title = "Watchdrip",
@@ -153,6 +164,7 @@ fun WatchSettingsScreen(navController: NavController) {
                         onCheckedChange = {
                             watchdripEnabled = it
                             Natives.setwatchdrip(it)
+                            tk.glucodata.WearToggleSync.push()
                             watchdrip.set(it)
                         }
                     )
@@ -166,6 +178,9 @@ fun WatchSettingsScreen(navController: NavController) {
                             gadgetBridgeEnabled = it
                             Natives.setgadgetbridge(it)
                             SuperGattCallback.doGadgetbridge = it
+                            // The watch mirrors these switches; tell it now
+                            // rather than leave it a cycle behind.
+                            tk.glucodata.WearToggleSync.push()
                         }
                     )
                     SettingsSwitchItem(
@@ -199,7 +214,7 @@ fun WatchSettingsScreen(navController: NavController) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     SettingsSwitchItem(
                         title = "WearOS",
-                        subtitle = if (gmsAvailable) "Enable Wear OS message transport" else "Google Play Services unavailable",
+                        subtitle = if (gmsAvailable) stringResource(R.string.watch_wearos_enable_desc) else stringResource(R.string.watch_gms_unavailable),
                         checked = wearOsEnabled,
                         icon = Icons.Filled.Watch,
                         iconTint = MaterialTheme.colorScheme.primary,
@@ -208,7 +223,7 @@ fun WatchSettingsScreen(navController: NavController) {
                             if (!gmsAvailable && enabled) {
                                 Toast.makeText(
                                     context,
-                                    "Google Play Services unavailable on this device",
+                                    context.getString(R.string.watch_gms_unavailable_device),
                                     Toast.LENGTH_LONG
                                 ).show()
                                 return@SettingsSwitchItem
@@ -223,11 +238,10 @@ fun WatchSettingsScreen(navController: NavController) {
                     SettingsItem(
                         title = stringResource(R.string.config),
                         subtitle = if (wearConfigEnabled) {
-                            "WearOS device and routing settings"
+                            stringResource(R.string.watch_wearos_config_desc)
                         } else {
-                            "Enable WearOS to configure routes"
+                            stringResource(R.string.watch_wearos_config_disabled)
                         },
-                        showArrow = true,
                         icon = Icons.Filled.Settings,
                         iconTint = MaterialTheme.colorScheme.primary,
                         position = CardPosition.BOTTOM,
@@ -246,7 +260,7 @@ fun WatchSettingsScreen(navController: NavController) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     SettingsSwitchItem(
                         title = "Garmin Connect IQ",
-                        subtitle = "Kerfstok transport bridge",
+                        subtitle = stringResource(R.string.watch_kerfstok_bridge),
                         checked = kerfstokEnabled,
                         icon = Icons.Filled.CheckCircle,
                         iconTint = MaterialTheme.colorScheme.secondary,
@@ -262,11 +276,10 @@ fun WatchSettingsScreen(navController: NavController) {
                     SettingsItem(
                         title = stringResource(R.string.status),
                         subtitle = if (garminStatusEnabled) {
-                            "Connection status and pairing"
+                            stringResource(R.string.watch_garmin_status_desc)
                         } else {
-                            "Enable Kerfstok to view status"
+                            stringResource(R.string.watch_garmin_enable_hint)
                         },
-                        showArrow = true,
                         icon = Icons.Filled.Link,
                         iconTint = MaterialTheme.colorScheme.secondary,
                         position = CardPosition.BOTTOM,
@@ -286,9 +299,9 @@ fun WatchSettingsScreen(navController: NavController) {
         InAppHelpDialog(
             title = stringResource(R.string.watches),
             lines = listOf(
-                "Enable WearOS to use watch message transport in this app.",
-                "Use Config to pick a watch node and set direct sensor routing.",
-                "Garmin Connect IQ works through Kerfstok and has separate status controls."
+                stringResource(R.string.watch_help_wearos),
+                stringResource(R.string.watch_help_config),
+                stringResource(R.string.watch_help_garmin)
             ),
             onDismiss = { showHelp = false }
         )
@@ -299,50 +312,161 @@ fun WatchSettingsScreen(navController: NavController) {
 fun WearOsConfigScreen(navController: NavController) {
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
+    val scope = rememberCoroutineScope()
 
-    var nodes by remember { mutableStateOf(WatchInterop.getWearNodes()) }
-    var selectedNodeId by rememberSaveable { mutableStateOf(nodes.firstOrNull()?.id ?: "") }
+    var nodes by remember { mutableStateOf<List<WatchInterop.WearNodeInfo>>(emptyList()) }
+    var selectedNodeId by rememberSaveable { mutableStateOf("") }
     var directOnWatch by rememberSaveable { mutableStateOf(false) }
     var enterOnWatch by rememberSaveable { mutableStateOf(false) }
+    // Phone-owned and not part of a node's routing, so it is read straight from
+    // the setting rather than seeded from what a watch has confirmed.
+    var autoSwitch by rememberSaveable { mutableStateOf(AutoSensorSwitch.isEnabled()) }
+    var refreshingNodes by remember { mutableStateOf(false) }
+    var syncStatus by remember { mutableStateOf(WatchInterop.getWearSyncStatus()) }
+    val claimRevision by WearSensorClaimStatus.revision.collectAsStateWithLifecycle()
 
-    fun refreshNodes() {
-        WatchInterop.refreshWearNodes()
-        val latest = WatchInterop.getWearNodes()
+    fun applyNodes(latest: List<WatchInterop.WearNodeInfo>) {
         nodes = latest
         if (latest.none { it.id == selectedNodeId }) {
             selectedNodeId = latest.firstOrNull()?.id ?: ""
         }
     }
 
+    suspend fun refreshNodesNow() {
+        refreshingNodes = true
+        try {
+            val latest = withContext(Dispatchers.IO) {
+                WatchInterop.refreshWearNodes()
+                WatchInterop.getWearNodes()
+            }
+            applyNodes(latest)
+            syncStatus = WatchInterop.getWearSyncStatus()
+        } finally {
+            refreshingNodes = false
+        }
+    }
+
+    fun refreshNodes() {
+        scope.launch {
+            refreshNodesNow()
+        }
+    }
+
+    LaunchedEffect(claimRevision) {
+        refreshNodesNow()
+    }
+
+    // Seed the switches from what the user asked for, not from what the watch
+    // has confirmed. Direct routing is a two-phase handoff — the watch only
+    // claims the sensor after a connected driver accepts a reading — so binding
+    // to the confirmed state made every toggle spring straight back to off.
     LaunchedEffect(selectedNodeId, nodes) {
         val selected = nodes.firstOrNull { it.id == selectedNodeId } ?: return@LaunchedEffect
-        if (selected.directSensorMode >= 0) {
-            directOnWatch = selected.directSensorMode > 0
+        directOnWatch = when {
+            selected.directRequested -> true
+            selected.claimState != null -> selected.claimState != WearSensorClaimState.PHONE_OWNS
+            selected.directSensorMode >= 0 -> selected.directSensorMode > 0
+            else -> false
         }
-        if (selected.watchNumsMode >= 0) {
-            enterOnWatch = selected.watchNumsMode > 0
+        enterOnWatch = when {
+            selected.enterRequested -> true
+            selected.watchNumsMode >= 0 -> selected.watchNumsMode > 0
+            else -> false
         }
     }
 
     val selected = nodes.firstOrNull { it.id == selectedNodeId }
-    val canSetDirect = selected?.directSensorMode?.let { it >= 0 } == true
-    val canSetNums = selected?.watchNumsMode?.let { it >= 0 } == true
+    val selectedAppInstalled = selected?.appInstalled == true
+    // Having the app on the watch is the only real precondition. Requiring a
+    // known native host first was circular: applying the routing is what creates
+    // that host, so both switches sat greyed out forever on a fresh pairing.
+    val canSetDirect = selectedAppInstalled
+    val canSetNums = selectedAppInstalled
+    // Both directions apply immediately. Turning direct mode on used to change
+    // nothing until "Sync now" was pressed, and the state was overwritten by the
+    // next refresh before the user got there.
+    fun updateDirectRouting(enabled: Boolean) {
+        directOnWatch = enabled
+        val node = selected ?: return
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                if (enabled) {
+                    WatchInterop.applyStandaloneSensorMode(
+                        node.id,
+                        node.isGalaxy,
+                        directOnWatch = true,
+                        enterOnWatch = enterOnWatch,
+                    )
+                } else {
+                    WatchInterop.applyWearNodeRouting(
+                        node.id,
+                        node.isGalaxy,
+                        directOnWatch = false,
+                        enterOnWatch = enterOnWatch,
+                    )
+                }
+            }
+            if (!ok) {
+                directOnWatch = !enabled
+                Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_SHORT).show()
+            }
+            refreshNodesNow()
+        }
+    }
+
+    fun updateAutoSwitch(enabled: Boolean) {
+        autoSwitch = enabled
+        val node = selected ?: return
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                WatchInterop.setAutoSensorSwitch(node.id, enabled)
+            }
+            if (!ok) {
+                // The setting itself is applied on the phone either way; only
+                // the push to the watch can fail, and it retries at the next
+                // handshake. Say so rather than springing the switch back.
+                Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_SHORT).show()
+            }
+            refreshNodesNow()
+        }
+    }
+
+    fun updateEnterOnWatch(enabled: Boolean) {
+        enterOnWatch = enabled
+        val node = selected ?: return
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                WatchInterop.applyWearNodeRouting(
+                    node.id,
+                    node.isGalaxy,
+                    directOnWatch = directOnWatch,
+                    enterOnWatch = enabled,
+                )
+            }
+            if (!ok) {
+                enterOnWatch = !enabled
+                Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_SHORT).show()
+            }
+            refreshNodesNow()
+        }
+    }
+    fun timeStatus(timeMs: Long): String = if (timeMs <= 0L) {
+        context.getString(R.string.never)
+    } else {
+        DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(timeMs))
+    }
 
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
         topBar = {
-            TopAppBar(
-                title = { Text("WearOS config") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = null)
-                    }
-                },
+            AppTopBar(
+                title = stringResource(R.string.wearos_config_title),
+                onNavigateBack = { navController.popBackStack() },
                 actions = {
-                    IconButton(onClick = { refreshNodes() }) {
+                    IconButton(onClick = { refreshNodes() }, enabled = !refreshingNodes) {
                         Icon(Icons.Filled.Refresh, contentDescription = null)
                     }
-                }
+                },
             )
         }
     ) { padding ->
@@ -351,14 +475,14 @@ fun WearOsConfigScreen(navController: NavController) {
                 .fillMaxSize()
                 .padding(padding),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             item("wear_nodes") {
-                SectionLabel("Connected watches", topPadding = 0.dp)
+                SectionLabel(stringResource(R.string.watch_status_section), topPadding = 0.dp)
                 if (nodes.isEmpty()) {
                     SettingsItem(
-                        title = "No Wear OS watches found",
-                        subtitle = "Tap refresh after opening Juggluco on the watch",
+                        title = stringResource(R.string.watch_none_found),
+                        subtitle = stringResource(R.string.watch_none_found_hint),
                         icon = Icons.Filled.BluetoothSearching,
                         iconTint = MaterialTheme.colorScheme.tertiary
                     )
@@ -372,11 +496,37 @@ fun WearOsConfigScreen(navController: NavController) {
                                 else -> CardPosition.MIDDLE
                             }
                             val isSelected = node.id == selectedNodeId
+                            val appStatus = if (node.appInstalled) {
+                                stringResource(R.string.watchappinstalled)
+                            } else {
+                                stringResource(R.string.wear_watch_app_missing)
+                            }
+                            val liveStatus = if (isSelected) {
+                                val chunks = syncStatus.lastChunkCount
+                                val claimStatus = when (node.claimState) {
+                                    WearSensorClaimState.PHONE_OWNS -> stringResource(R.string.wear_claim_state_phone_owns)
+                                    WearSensorClaimState.REQUESTING -> stringResource(R.string.wear_claim_state_requesting)
+                                    WearSensorClaimState.CONNECTED -> stringResource(R.string.wear_claim_state_connected)
+                                    null -> null
+                                }
+                                "\nHistory served: ${timeStatus(syncStatus.lastServedMs)}${if (chunks > 0) " ($chunks chunks)" else ""}" +
+                                    "\nNetwork info: ${timeStatus(syncStatus.lastNetInfoExchangeMs)}" +
+                                    (claimStatus?.let { "\n$it" } ?: "")
+                            } else ""
+                            val appSubtitle = if (node.appInstalled) {
+                                "$appStatus • ${node.id}$liveStatus"
+                            } else {
+                                "$appStatus • ${node.id}\n${stringResource(R.string.wear_watch_app_missing_hint)}"
+                            }
                             SettingsItem(
                                 title = node.displayName,
-                                subtitle = node.id,
+                                subtitle = appSubtitle,
                                 icon = if (node.isGalaxy) Icons.Filled.Watch else Icons.Filled.Devices,
-                                iconTint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
+                                iconTint = when {
+                                    !node.appInstalled -> MaterialTheme.colorScheme.error
+                                    isSelected -> MaterialTheme.colorScheme.primary
+                                    else -> MaterialTheme.colorScheme.tertiary
+                                },
                                 position = position,
                                 onClick = { selectedNodeId = node.id },
                                 trailingContent = {
@@ -395,28 +545,38 @@ fun WearOsConfigScreen(navController: NavController) {
             }
 
             item("wear_routing") {
-                SectionLabel("Routing", topPadding = 0.dp)
+                SectionLabel(stringResource(R.string.watch_routing_section), topPadding = 0.dp)
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    // Say which phase the handoff is in, so a switch that is on
+                    // while the phone still owns Bluetooth reads as "waiting",
+                    // not as "broken".
+                    val handoffPhase = when {
+                        selected?.claimState == WearSensorClaimState.CONNECTED ->
+                            stringResource(R.string.wear_claim_state_connected)
+                        directOnWatch && selected?.directPending == true ->
+                            stringResource(R.string.wear_claim_state_requesting)
+                        else -> stringResource(R.string.wear_claim_state_phone_owns)
+                    }
                     SettingsItem(
-                        title = "Direct sensor connection",
-                        subtitle = if (directOnWatch) {
-                            "Watch connects directly"
+                        title = stringResource(R.string.wear_auto_sensor_switch),
+                        subtitle = if (autoSwitch) {
+                            stringResource(R.string.wear_auto_sensor_switch_on_desc)
                         } else {
-                            "Phone connects directly"
+                            stringResource(R.string.wear_auto_sensor_switch_off_desc)
                         },
-                        icon = if (directOnWatch) Icons.Filled.Watch else Icons.Filled.PhoneAndroid,
-                        iconTint = MaterialTheme.colorScheme.primary,
+                        icon = Icons.Filled.SwapHoriz,
+                        iconTint = MaterialTheme.colorScheme.tertiary,
                         position = CardPosition.TOP,
                         onClick = if (selected != null && canSetDirect) {
-                            { directOnWatch = !directOnWatch }
+                            { updateAutoSwitch(!autoSwitch) }
                         } else {
                             null
                         },
                         trailingContent = {
                             StyledSwitch(
-                                checked = directOnWatch,
+                                checked = autoSwitch,
                                 onCheckedChange = if (selected != null && canSetDirect) {
-                                    { directOnWatch = it }
+                                    { updateAutoSwitch(it) }
                                 } else {
                                     null
                                 },
@@ -425,17 +585,44 @@ fun WearOsConfigScreen(navController: NavController) {
                         }
                     )
                     SettingsItem(
-                        title = "Enter amounts on watch",
-                        subtitle = if (enterOnWatch) {
-                            "Watch entry enabled"
+                        title = stringResource(R.string.wear_direct_sensor_on_watch),
+                        subtitle = (if (directOnWatch) {
+                            stringResource(R.string.wear_direct_sensor_watch_desc)
                         } else {
-                            "Phone entry only"
+                            stringResource(R.string.wear_direct_sensor_phone_desc)
+                        }) + "\n" + handoffPhase,
+                        icon = if (directOnWatch) Icons.Filled.Watch else Icons.Filled.PhoneAndroid,
+                        iconTint = MaterialTheme.colorScheme.primary,
+                        position = CardPosition.MIDDLE,
+                        onClick = if (selected != null && canSetDirect) {
+                            { updateDirectRouting(!directOnWatch) }
+                        } else {
+                            null
+                        },
+                        trailingContent = {
+                            StyledSwitch(
+                                checked = directOnWatch,
+                                onCheckedChange = if (selected != null && canSetDirect) {
+                                    { updateDirectRouting(it) }
+                                } else {
+                                    null
+                                },
+                                enabled = selected != null && canSetDirect
+                            )
+                        }
+                    )
+                    SettingsItem(
+                        title = stringResource(R.string.watch_enter_amounts),
+                        subtitle = if (enterOnWatch) {
+                            stringResource(R.string.watch_enter_amounts_on)
+                        } else {
+                            stringResource(R.string.watch_enter_amounts_off)
                         },
                         icon = Icons.Filled.Edit,
                         iconTint = MaterialTheme.colorScheme.primary,
                         position = CardPosition.BOTTOM,
                         onClick = if (selected != null && canSetNums) {
-                            { enterOnWatch = !enterOnWatch }
+                            { updateEnterOnWatch(!enterOnWatch) }
                         } else {
                             null
                         },
@@ -443,7 +630,7 @@ fun WearOsConfigScreen(navController: NavController) {
                             StyledSwitch(
                                 checked = enterOnWatch,
                                 onCheckedChange = if (selected != null && canSetNums) {
-                                    { enterOnWatch = it }
+                                    { updateEnterOnWatch(it) }
                                 } else {
                                     null
                                 },
@@ -455,79 +642,86 @@ fun WearOsConfigScreen(navController: NavController) {
             }
 
             item("wear_actions") {
+                SectionLabel(stringResource(R.string.actions_section), topPadding = 0.dp)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
+                    FilledTonalButton(
                         onClick = {
                             if (selected == null) {
-                                Toast.makeText(context, "No watch selected", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.watch_none_selected), Toast.LENGTH_SHORT).show()
                             } else {
-                                val ok = WatchInterop.applyWearNodeRouting(
-                                    nodeId = selected.id,
-                                    isGalaxy = selected.isGalaxy,
-                                    directOnWatch = directOnWatch,
-                                    enterOnWatch = enterOnWatch
-                                )
-                                Toast.makeText(
-                                    context,
-                                    if (ok) context.getString(R.string.saved) else context.getString(R.string.wentwrong),
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                                refreshNodes()
+                                scope.launch {
+                                    val routingOk = withContext(Dispatchers.IO) {
+                                        WatchInterop.applyStandaloneSensorMode(selected.id, selected.isGalaxy, directOnWatch, enterOnWatch)
+                                    }
+                                    val ok = routingOk && WatchInterop.syncWearNow()
+                                    Toast.makeText(
+                                        context,
+                                        if (ok) context.getString(R.string.saved) else context.getString(R.string.wentwrong),
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    refreshNodes()
+                                }
                             }
                         },
-                        enabled = selected != null,
-                        modifier = Modifier.fillMaxWidth()
+                        enabled = selectedAppInstalled,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
                         Icon(Icons.Filled.Sync, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Apply routing")
+                        Text(stringResource(R.string.watch_sync_now))
                     }
                     OutlinedButton(
                         onClick = {
                             if (selected == null) {
-                                Toast.makeText(context, "No watch selected", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.watch_none_selected), Toast.LENGTH_SHORT).show()
                             } else {
-                                val ok = WatchInterop.startWearApp(selected.id, selected.isGalaxy)
-                                Toast.makeText(
-                                    context,
-                                    if (ok) "Start command sent to watch" else context.getString(R.string.wentwrong),
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                scope.launch {
+                                    val ok = withContext(Dispatchers.IO) {
+                                        WatchInterop.startWearApp(selected.id, selected.isGalaxy)
+                                    }
+                                    Toast.makeText(
+                                        context,
+                                        if (ok) "Restart command sent to watch" else context.getString(R.string.wentwrong),
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
                             }
                         },
-                        enabled = selected != null,
-                        modifier = Modifier.fillMaxWidth()
+                        enabled = selectedAppInstalled,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = null)
+                        Icon(Icons.Filled.Refresh, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Start watch app")
+                        Text(stringResource(R.string.watch_restart_app))
                     }
                     OutlinedButton(
                         onClick = {
                             if (selected == null) {
-                                Toast.makeText(context, "No watch selected", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.watch_none_selected), Toast.LENGTH_SHORT).show()
                             } else {
-                                val ok = WatchInterop.applyWearDefaults(selected.id, selected.isGalaxy)
-                                Toast.makeText(
-                                    context,
-                                    if (ok) "Defaults sent" else context.getString(R.string.wentwrong),
-                                    Toast.LENGTH_SHORT
-                                ).show()
+                                scope.launch {
+                                    val ok = withContext(Dispatchers.IO) {
+                                        WatchInterop.applyWearDefaults(selected.id, selected.isGalaxy)
+                                    }
+                                    Toast.makeText(
+                                        context,
+                                        if (ok) "Defaults sent" else context.getString(R.string.wentwrong),
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
                             }
                         },
-                        enabled = selected != null,
-                        modifier = Modifier.fillMaxWidth()
+                        enabled = selectedAppInstalled,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
                         Icon(Icons.Filled.Settings, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Apply defaults")
+                        Text(stringResource(R.string.watch_send_defaults))
                     }
-                    OutlinedButton(
+                    TextButton(
                         onClick = { uriHandler.openUri("https://www.juggluco.nl/JugglucoWearOS/intro/index.html") },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Icon(Icons.Filled.Info, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
                         Text(stringResource(R.string.helpname))
                     }
                 }
@@ -551,18 +745,14 @@ fun GarminStatusScreen(navController: NavController) {
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
         topBar = {
-            TopAppBar(
-                title = { Text("Garmin status") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = null)
-                    }
-                },
+            AppTopBar(
+                title = stringResource(R.string.garmin_status_title),
+                onNavigateBack = { navController.popBackStack() },
                 actions = {
                     IconButton(onClick = { refreshSnapshot() }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null)
                     }
-                }
+                },
             )
         }
     ) { padding ->
@@ -571,42 +761,42 @@ fun GarminStatusScreen(navController: NavController) {
                 .fillMaxSize()
                 .padding(padding),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             item("garmin_status") {
-                SectionLabel("State", topPadding = 0.dp)
+                SectionLabel(stringResource(R.string.garmin_state_section), topPadding = 0.dp)
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     SettingsItem(
-                        title = "SDK ready",
-                        subtitle = if (snapshot.sdkReady) "Yes" else "No",
+                        title = stringResource(R.string.garmin_sdk_ready),
+                        subtitle = if (snapshot.sdkReady) stringResource(R.string.answer_yes) else stringResource(R.string.answer_no),
                         icon = Icons.Filled.CheckCircle,
                         iconTint = if (snapshot.sdkReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
                         position = CardPosition.TOP
                     )
                     SettingsItem(
-                        title = "Registered",
-                        subtitle = if (snapshot.registered) "Yes" else "No",
+                        title = stringResource(R.string.garmin_registered),
+                        subtitle = if (snapshot.registered) stringResource(R.string.answer_yes) else stringResource(R.string.answer_no),
                         icon = Icons.Filled.Link,
                         iconTint = if (snapshot.registered) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
                         position = CardPosition.MIDDLE
                     )
                     SettingsItem(
-                        title = "Last send",
-                        subtitle = "${formatEpoch(snapshot.sendTimeMs)} • ${snapshot.sendStatus}",
+                        title = stringResource(R.string.garmin_last_send),
+                        subtitle = "${formatEpoch(snapshot.sendTimeMs, stringResource(R.string.never))} · ${snapshot.sendStatus}",
                         icon = Icons.Filled.Sync,
                         iconTint = MaterialTheme.colorScheme.tertiary,
                         position = CardPosition.MIDDLE
                     )
                     SettingsItem(
-                        title = "Last received",
-                        subtitle = formatEpoch(snapshot.receivedTimeMs),
+                        title = stringResource(R.string.garmin_last_received),
+                        subtitle = formatEpoch(snapshot.receivedTimeMs, stringResource(R.string.never)),
                         icon = Icons.Filled.CheckCircle,
                         iconTint = MaterialTheme.colorScheme.tertiary,
                         position = CardPosition.MIDDLE
                     )
                     SettingsItem(
-                        title = "Queued messages",
-                        subtitle = if (snapshot.waitingQueue) "Waiting" else "Empty",
+                        title = stringResource(R.string.garmin_queued_messages),
+                        subtitle = if (snapshot.waitingQueue) stringResource(R.string.garmin_queue_waiting) else stringResource(R.string.garmin_queue_empty),
                         icon = Icons.Filled.Hub,
                         iconTint = MaterialTheme.colorScheme.tertiary,
                         position = CardPosition.BOTTOM
@@ -615,7 +805,7 @@ fun GarminStatusScreen(navController: NavController) {
             }
 
             item("garmin_actions") {
-                SectionLabel("Actions", topPadding = 0.dp)
+                SectionLabel(stringResource(R.string.actions_section), topPadding = 0.dp)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
@@ -667,7 +857,7 @@ fun GarminStatusScreen(navController: NavController) {
                     }
                     SettingsSwitchItem(
                         title = stringResource(R.string.darkmode),
-                        subtitle = "Kerfstok watch UI",
+                        subtitle = stringResource(R.string.kerfstok_watch_ui),
                         checked = kerfstokDark,
                         icon = Icons.Filled.Shield,
                         iconTint = MaterialTheme.colorScheme.primary,
@@ -703,6 +893,13 @@ fun GarminStatusScreen(navController: NavController) {
     }
 }
 
+/**
+ * The accurate type for a PEM file, and the one Android's certificate installer
+ * registers for -- so a shared certificate can be opened and trusted directly on
+ * the receiving device rather than only saved.
+ */
+private const val PEM_MIME_TYPE = "application/x-pem-file"
+
 @Composable
 fun WebServerSettingsScreen(navController: NavController) {
     val context = LocalContext.current
@@ -714,9 +911,15 @@ fun WebServerSettingsScreen(navController: NavController) {
     var showSecret by rememberSaveable { mutableStateOf(false) }
     var sslEnabled by rememberSaveable { mutableStateOf(Natives.getuseSSL()) }
     var sslExpanded by rememberSaveable { mutableStateOf(sslEnabled) }
+    var httpPortText by rememberSaveable { mutableStateOf(Natives.getxdripport().toString()) }
     var sslPortText by rememberSaveable { mutableStateOf(Natives.getsslport().toString()) }
     var intervalText by rememberSaveable { mutableStateOf(Natives.getinterval().toString()) }
     var showHelp by rememberSaveable { mutableStateOf(false) }
+    var certificate by remember { mutableStateOf(WebServerCertificate.installed(context)) }
+    var generatingCertificate by remember { mutableStateOf(false) }
+    var showCertificateImport by rememberSaveable { mutableStateOf(false) }
+    var showCertificateExport by rememberSaveable { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     val privateKeyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -725,6 +928,8 @@ fun WebServerSettingsScreen(navController: NavController) {
             Toast.makeText(context, error, Toast.LENGTH_LONG).show()
         } else {
             Toast.makeText(context, context.getString(R.string.saved), Toast.LENGTH_SHORT).show()
+            WebServerCertificate.clearSelfSignedMarker(context)
+            certificate = WebServerCertificate.installed(context)
             if (sslEnabled) {
                 val sslError = Natives.setuseSSL(true)
                 if (sslError != null) Toast.makeText(context, sslError, Toast.LENGTH_LONG).show()
@@ -738,6 +943,8 @@ fun WebServerSettingsScreen(navController: NavController) {
             Toast.makeText(context, error, Toast.LENGTH_LONG).show()
         } else {
             Toast.makeText(context, context.getString(R.string.saved), Toast.LENGTH_SHORT).show()
+            WebServerCertificate.clearSelfSignedMarker(context)
+            certificate = WebServerCertificate.installed(context)
             if (sslEnabled) {
                 val sslError = Natives.setuseSSL(true)
                 if (sslError != null) Toast.makeText(context, sslError, Toast.LENGTH_LONG).show()
@@ -754,6 +961,13 @@ fun WebServerSettingsScreen(navController: NavController) {
             return false
         }
 
+        val httpPort = httpPortText.toIntOrNull()
+        if (httpPort == null) {
+            if (showErrors) {
+                Toast.makeText(context, "$httpPortText${context.getString(R.string.invalidport)}", Toast.LENGTH_LONG).show()
+            }
+            return false
+        }
         val port = sslPortText.toIntOrNull()
         if (port == null) {
             if (showErrors) {
@@ -762,19 +976,22 @@ fun WebServerSettingsScreen(navController: NavController) {
             return false
         }
         val receivePort = Natives.getreceiveport().toIntOrNull()
-        if (receivePort != null && port == receivePort) {
+        if (receivePort != null && (port == receivePort || httpPort == receivePort)) {
             if (showErrors) {
                 Toast.makeText(context, context.getString(R.string.nomirrorport), Toast.LENGTH_LONG).show()
             }
             return false
         }
-        if (port == 17580) {
+        // The two servers listen at the same time, so they cannot share a port.
+        // This used to compare against the literal 17580 because that was the
+        // only value the HTTP server could ever have.
+        if (port == httpPort) {
             if (showErrors) {
                 Toast.makeText(context, context.getString(R.string.nohttpport), Toast.LENGTH_LONG).show()
             }
             return false
         }
-        if (port !in 1024..65535) {
+        if (port !in 1024..65535 || httpPort !in 1024..65535) {
             if (showErrors) {
                 Toast.makeText(context, context.getString(R.string.portrange), Toast.LENGTH_LONG).show()
             }
@@ -792,6 +1009,10 @@ fun WebServerSettingsScreen(navController: NavController) {
         Natives.setApiSecret(key)
         if (port != Natives.getsslport()) {
             Natives.setsslport(port)
+        }
+        // Rebinds a running server, so only call it when the value moved.
+        if (httpPort != Natives.getxdripport()) {
+            Natives.setxdripport(httpPort)
         }
         Natives.setinterval(interval)
         Natives.setXdripServerLocal(localOnly)
@@ -811,13 +1032,55 @@ fun WebServerSettingsScreen(navController: NavController) {
 
     fun buildBaseUrl(host: String): String {
         val scheme = if (sslEnabled) "https" else "http"
-        val port = if (sslEnabled) sslPortText.toIntOrNull() ?: Natives.getsslport() else 17580
+        val port = if (sslEnabled) {
+            sslPortText.toIntOrNull() ?: Natives.getsslport()
+        } else {
+            httpPortText.toIntOrNull() ?: Natives.getxdripport()
+        }
         val key = apiSecret.trim()
         val keyPrefix = if (key.isEmpty()) "" else "$key/"
         return "$scheme://$host:$port/$keyPrefix"
     }
 
+    /**
+     * Writes a fresh self-signed pair, then hands the server back to whatever
+     * state it was in. Key generation is slow enough to be visible, so it runs
+     * off the main thread and the switch is held disabled meanwhile.
+     */
+    fun generateCertificate(thenEnableSsl: Boolean) {
+        if (generatingCertificate) return
+        generatingCertificate = true
+        scope.launch {
+            val error = withContext(Dispatchers.IO) { WebServerCertificate.generate(context) }
+            certificate = WebServerCertificate.installed(context)
+            generatingCertificate = false
+            if (error != null) {
+                Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            Toast.makeText(context, context.getString(R.string.webserver_cert_created), Toast.LENGTH_SHORT).show()
+            // A running server holds the old certificate open; re-enabling is
+            // what makes it read the new one.
+            if (thenEnableSsl || sslEnabled) {
+                val sslError = Natives.setuseSSL(true)
+                if (sslError != null) {
+                    Toast.makeText(context, sslError, Toast.LENGTH_LONG).show()
+                } else {
+                    sslEnabled = true
+                }
+            }
+        }
+    }
+
     fun setSslEnabled(enabled: Boolean) {
+        // Turning HTTPS on used to fail unless the user had already side-loaded
+        // two PEM files. Nothing about wanting encrypted traffic implies owning
+        // a certificate, so make one.
+        if (enabled && !WebServerCertificate.hasCertificate(context)) {
+            sslExpanded = true
+            generateCertificate(thenEnableSsl = true)
+            return
+        }
         val err = Natives.setuseSSL(enabled)
         if (err != null) {
             Toast.makeText(context, err, Toast.LENGTH_LONG).show()
@@ -834,6 +1097,42 @@ fun WebServerSettingsScreen(navController: NavController) {
         uriHandler.openUri(url)
     }
 
+    /**
+     * Hands the PEMs to the share sheet, which is both halves of what people
+     * want here: send it to the other device, or save it to Files as a backup.
+     */
+    fun exportCertificate(includePrivateKey: Boolean) {
+        showCertificateExport = false
+        val staged = WebServerCertificate.stageForExport(context, includePrivateKey)
+        if (staged.isEmpty()) {
+            Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_LONG).show()
+            return
+        }
+        val uris = ArrayList<Uri>(
+            staged.map {
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", it)
+            }
+        )
+        val intent = if (uris.size == 1) {
+            Intent(Intent.ACTION_SEND).apply {
+                type = PEM_MIME_TYPE
+                putExtra(Intent.EXTRA_STREAM, uris.first())
+            }
+        } else {
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = PEM_MIME_TYPE
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            }
+        }.apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        runCatching {
+            context.startActivity(
+                Intent.createChooser(intent, context.getString(R.string.webserver_cert_export))
+            )
+        }.onFailure {
+            Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_LONG).show()
+        }
+    }
+
     fun shareUrl(url: String) {
         if (!applyCurrentInputs(showErrors = true)) return
         val intent = Intent(Intent.ACTION_SEND).apply {
@@ -843,9 +1142,11 @@ fun WebServerSettingsScreen(navController: NavController) {
         context.startActivity(Intent.createChooser(intent, context.getString(R.string.sendto)))
     }
 
-    val localBaseUrl = remember(apiSecret, sslEnabled, sslPortText) { buildBaseUrl("127.0.0.1") }
-    val lanHost = remember(apiSecret, sslEnabled, sslPortText) { findLocalIpv4Address() }
-    val lanBaseUrl = remember(lanHost, apiSecret, sslEnabled, sslPortText) { lanHost?.let { buildBaseUrl(it) } }
+    val localBaseUrl = remember(apiSecret, sslEnabled, sslPortText, httpPortText) { buildBaseUrl("127.0.0.1") }
+    val lanHost = remember(apiSecret, sslEnabled, sslPortText, httpPortText) { findLocalIpv4Address() }
+    val lanBaseUrl = remember(lanHost, apiSecret, sslEnabled, sslPortText, httpPortText) {
+        lanHost?.let { buildBaseUrl(it) }
+    }
     val primaryUrl = if (localOnly) localBaseUrl else (lanBaseUrl ?: localBaseUrl)
     val rootUrl = primaryUrl
     val currentUrl = remember(primaryUrl) { "${primaryUrl}api/v1/entries/current" }
@@ -857,18 +1158,14 @@ fun WebServerSettingsScreen(navController: NavController) {
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.webserver)) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = null)
-                    }
-                },
+            AppTopBar(
+                title = stringResource(R.string.webserver),
+                onNavigateBack = { navController.popBackStack() },
                 actions = {
                     IconButton(onClick = { showHelp = true }) {
                         Icon(Icons.Filled.Info, contentDescription = stringResource(R.string.helpname))
                     }
-                }
+                },
             )
         }
     ) { padding ->
@@ -877,12 +1174,12 @@ fun WebServerSettingsScreen(navController: NavController) {
                 .fillMaxSize()
                 .padding(padding),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             item("web_master") {
                 MasterSwitchCard(
                     title = stringResource(R.string.active),
-                    subtitle = if (active) "Web server is running" else "Web server is paused",
+                    subtitle = if (active) stringResource(R.string.webserver_running) else stringResource(R.string.webserver_paused),
                     checked = active,
                     onCheckedChange = {
                         active = it
@@ -935,7 +1232,7 @@ fun WebServerSettingsScreen(navController: NavController) {
                 ) {
                     SettingsSwitchItem(
                         title = stringResource(R.string.localonly),
-                        subtitle = "Restrict server to localhost",
+                        subtitle = stringResource(R.string.webserver_local_only_desc),
                         checked = localOnly,
                         icon = Icons.Filled.Devices,
                         iconTint = MaterialTheme.colorScheme.secondary,
@@ -948,8 +1245,34 @@ fun WebServerSettingsScreen(navController: NavController) {
                     )
 
                     SettingsItem(
+                        title = stringResource(R.string.port),
+                        icon = Icons.Filled.SettingsEthernet,
+                        iconTint = MaterialTheme.colorScheme.secondary,
+                        position = CardPosition.MIDDLE,
+                        trailingContent = {
+                            OutlinedTextField(
+                                value = httpPortText,
+                                onValueChange = { httpPortText = it },
+                                enabled = childEnabled,
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.bodyMedium,
+                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                    keyboardType = KeyboardType.Number,
+                                    imeAction = ImeAction.Done
+                                ),
+                                keyboardActions = KeyboardActions(
+                                    onDone = { applyCurrentInputs(showErrors = true) }
+                                ),
+                                modifier = Modifier
+                                    .width(96.dp)
+                                    .heightIn(min = 52.dp)
+                            )
+                        }
+                    )
+
+                    SettingsItem(
                         title = stringResource(R.string.usessl),
-                        subtitle = "HTTPS with certificate files",
+                        subtitle = stringResource(R.string.webserver_https_subtitle),
                         icon = Icons.Filled.Lock,
                         iconTint = MaterialTheme.colorScheme.primary,
                         position = CardPosition.MIDDLE,
@@ -961,7 +1284,7 @@ fun WebServerSettingsScreen(navController: NavController) {
                                     contentDescription = null,
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                Spacer(Modifier.width(10.dp))
+                                Spacer(Modifier.width(8.dp))
                                 StyledSwitch(
                                     checked = sslEnabled,
                                     onCheckedChange = if (childEnabled) ({ setSslEnabled(it) }) else null,
@@ -980,15 +1303,132 @@ fun WebServerSettingsScreen(navController: NavController) {
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
+                                val installed = certificate
+                                // Loopback-only means no LAN name is in play, so
+                                // a certificate that omits this phone's address
+                                // is not a problem worth raising.
+                                val lanAddress = lanHost?.takeIf { !localOnly }
+                                val status = WebServerCertificate.statusOf(
+                                    installed = installed,
+                                    lanAddress = lanAddress,
+                                    nowMillis = System.currentTimeMillis(),
+                                )
+                                val needsAttention = status == WebServerCertificate.Status.ADDRESS_CHANGED ||
+                                    status == WebServerCertificate.Status.EXPIRED
+
+                                Text(
+                                    text = when {
+                                        generatingCertificate ->
+                                            stringResource(R.string.webserver_cert_generating)
+                                        needsAttention ->
+                                            stringResource(R.string.webserver_cert_needs_update)
+                                        else -> stringResource(R.string.webserver_certificate)
+                                    },
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = if (needsAttention && !generatingCertificate) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+
+                                if (!generatingCertificate) {
+                                    Text(
+                                        text = when {
+                                            installed == null -> stringResource(R.string.webserver_cert_none)
+                                            status == WebServerCertificate.Status.EXPIRED ->
+                                                stringResource(R.string.webserver_cert_expired)
+                                            status == WebServerCertificate.Status.ADDRESS_CHANGED ->
+                                                stringResource(
+                                                    R.string.webserver_cert_address_changed,
+                                                    lanAddress.orEmpty()
+                                                )
+                                            installed.selfSigned ->
+                                                stringResource(R.string.webserver_cert_selfsigned)
+                                            else -> stringResource(R.string.webserver_cert_custom)
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = if (needsAttention) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                }
+
+                                if (installed != null && !generatingCertificate) {
+                                    // The names the certificate actually answers
+                                    // to. Spelling them out is what gives
+                                    // Regenerate a meaning the user can act on:
+                                    // remake this for the addresses I have now.
+                                    if (installed.hostnames.isNotEmpty()) {
+                                        Text(
+                                            text = installed.hostnames.joinToString(", "),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    if (status != WebServerCertificate.Status.EXPIRED) {
+                                        Text(
+                                            text = stringResource(
+                                                R.string.webserver_cert_expires,
+                                                formatExpiryDate(installed.notAfterMillis)
+                                            ),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    val primaryLabel = stringResource(
+                                        when (status) {
+                                            WebServerCertificate.Status.MISSING ->
+                                                R.string.webserver_cert_generate
+                                            WebServerCertificate.Status.ADDRESS_CHANGED,
+                                            WebServerCertificate.Status.EXPIRED ->
+                                                R.string.webserver_cert_update
+                                            else -> R.string.webserver_cert_regenerate
+                                        }
+                                    )
+                                    val onPrimary = { generateCertificate(thenEnableSsl = false) }
+                                    val primaryEnabled = childEnabled && !generatingCertificate
+                                    // Filled only while something is actually
+                                    // wrong; the rest of the time reissuing is
+                                    // just one of three equal options.
+                                    if (needsAttention) {
+                                        Button(
+                                            onClick = onPrimary,
+                                            enabled = primaryEnabled,
+                                            modifier = Modifier.weight(1f)
+                                        ) { Text(primaryLabel) }
+                                    } else {
+                                        FilledTonalButton(
+                                            onClick = onPrimary,
+                                            enabled = primaryEnabled,
+                                            modifier = Modifier.weight(1f)
+                                        ) { Text(primaryLabel) }
+                                    }
+                                    OutlinedButton(
+                                        onClick = { showCertificateExport = true },
+                                        enabled = primaryEnabled && installed != null,
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text(stringResource(R.string.webserver_cert_export)) }
+                                    OutlinedButton(
+                                        onClick = { showCertificateImport = true },
+                                        enabled = primaryEnabled,
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text(stringResource(R.string.webserver_cert_import)) }
+                                }
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     Text(
-                                        text = "SSL ${context.getString(R.string.port)}",
+                                        text = stringResource(R.string.ssl_port),
                                         style = MaterialTheme.typography.labelLarge,
                                         modifier = Modifier.weight(1f)
                                     )
@@ -1006,34 +1446,9 @@ fun WebServerSettingsScreen(navController: NavController) {
                                         ),
                                         modifier = Modifier
                                             .width(96.dp)
-                                            .height(52.dp)
+                                            .heightIn(min = 52.dp)
                                     )
                                 }
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    OutlinedButton(
-                                        onClick = { privateKeyPicker.launch(arrayOf("*/*")) },
-                                        enabled = childEnabled,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Icon(Icons.Filled.Key, contentDescription = null)
-                                        Spacer(Modifier.width(8.dp))
-                                        Text(stringResource(R.string.privatekey))
-                                    }
-                                    OutlinedButton(
-                                        onClick = { fullChainPicker.launch(arrayOf("*/*")) },
-                                        enabled = childEnabled,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Icon(Icons.Filled.Shield, contentDescription = null)
-                                        Spacer(Modifier.width(8.dp))
-                                        Text(stringResource(R.string.fullchain))
-                                    }
-                                }
-                                Text(
-                                    text = "Import key files first, then enable Use SSL.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
                             }
                         }
                     }
@@ -1082,7 +1497,7 @@ fun WebServerSettingsScreen(navController: NavController) {
                                 enabled = childEnabled,
                                 modifier = Modifier
                                     .width(82.dp)
-                                    .height(50.dp),
+                                    .heightIn(min = 52.dp),
                                 singleLine = true,
                                 textStyle = MaterialTheme.typography.bodyMedium,
                                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
@@ -1110,7 +1525,7 @@ fun WebServerSettingsScreen(navController: NavController) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 12.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(modifier = Modifier.weight(1f)) {
@@ -1122,13 +1537,13 @@ fun WebServerSettingsScreen(navController: NavController) {
                                 )
                                 if (!localOnly && lanBaseUrl == null) {
                                     Text(
-                                        text = "Wi-Fi IP unavailable, using loopback URL.",
+                                        text = stringResource(R.string.webserver_wifi_unavailable),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.error
                                     )
                                 } else if (!localOnly) {
                                     Text(
-                                        text = "Loopback: $localBaseUrl",
+                                        text = stringResource(R.string.webserver_loopback, localBaseUrl),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -1147,22 +1562,98 @@ fun WebServerSettingsScreen(navController: NavController) {
                                 onClick = { openUrl(currentUrl) },
                                 enabled = childEnabled,
                                 modifier = Modifier.weight(1f)
-                            ) { Text("Current") }
+                            ) { Text(stringResource(R.string.webserver_endpoint_current)) }
                             OutlinedButton(
                                 onClick = { openUrl(entriesUrl) },
                                 enabled = childEnabled,
                                 modifier = Modifier.weight(1f)
-                            ) { Text("Entries") }
+                            ) { Text(stringResource(R.string.webserver_endpoint_entries)) }
                             OutlinedButton(
                                 onClick = { openUrl(reportUrl) },
                                 enabled = childEnabled,
                                 modifier = Modifier.weight(1f)
-                            ) { Text("Report") }
+                            ) { Text(stringResource(R.string.webserver_endpoint_report)) }
                         }
                     }
                 }
             }
         }
+    }
+    if (showCertificateExport) {
+        AlertDialog(
+            onDismissRequest = { showCertificateExport = false },
+            title = { Text(stringResource(R.string.webserver_cert_export)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = stringResource(R.string.webserver_cert_export_hint),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    OutlinedButton(
+                        onClick = { exportCertificate(includePrivateKey = false) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Shield, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.webserver_cert_export_certificate))
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    OutlinedButton(
+                        onClick = { exportCertificate(includePrivateKey = true) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Key, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.webserver_cert_export_with_key))
+                    }
+                    Text(
+                        text = stringResource(R.string.webserver_cert_export_key_warning),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showCertificateExport = false }) {
+                    Text(stringResource(R.string.close))
+                }
+            }
+        )
+    }
+    if (showCertificateImport) {
+        AlertDialog(
+            onDismissRequest = { showCertificateImport = false },
+            title = { Text(stringResource(R.string.webserver_cert_import)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = stringResource(R.string.webserver_cert_import_hint),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    OutlinedButton(
+                        onClick = { privateKeyPicker.launch(arrayOf("*/*")) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Key, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.privatekey))
+                    }
+                    OutlinedButton(
+                        onClick = { fullChainPicker.launch(arrayOf("*/*")) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Shield, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.fullchain))
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showCertificateImport = false }) {
+                    Text(stringResource(R.string.close))
+                }
+            }
+        )
     }
     if (showHelp) {
         AlertDialog(
@@ -1170,10 +1661,10 @@ fun WebServerSettingsScreen(navController: NavController) {
             title = { Text(stringResource(R.string.webserver)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Nightscout-compatible endpoints are served directly from this phone.")
-                    Text("Base URL exposes api/v1/entries/current, api/v1/entries, and x/report paths.")
-                    Text("Use Local only for same-device loopback testing. Disable it for LAN.")
-                    Text("For HTTPS: import Private Key + Full Chain, then enable Use SSL.")
+                    Text(stringResource(R.string.webserver_help_endpoints))
+                    Text(stringResource(R.string.webserver_help_paths))
+                    Text(stringResource(R.string.webserver_help_local))
+                    Text(stringResource(R.string.webserver_help_ssl))
                 }
             },
             confirmButton = {
@@ -1232,11 +1723,25 @@ private fun findLocalIpv4Address(): String? {
     }
 }
 
-private fun formatEpoch(epochMs: Long): String {
-    if (epochMs <= 0L) return "Never"
+/**
+ * Date only. A certificate expires two years out, so the time of day it happens
+ * is noise -- unlike [formatEpoch], whose other callers are showing when the
+ * mirror last sent or received.
+ */
+private fun formatExpiryDate(epochMs: Long): String {
+    if (epochMs <= 0L) return ""
+    return try {
+        DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(epochMs))
+    } catch (_: Throwable) {
+        ""
+    }
+}
+
+private fun formatEpoch(epochMs: Long, never: String): String {
+    if (epochMs <= 0L) return never
     return try {
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(epochMs))
     } catch (_: Throwable) {
-        "Never"
+        never
     }
 }

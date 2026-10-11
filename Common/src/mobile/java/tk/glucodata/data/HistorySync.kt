@@ -1,6 +1,7 @@
 package tk.glucodata.data
 
 import android.util.Log
+import androidx.annotation.Keep
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -10,6 +11,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import tk.glucodata.Applic
 import tk.glucodata.BatteryTrace
+import tk.glucodata.CloneSensorRegistry
+import tk.glucodata.GlucoseReadingSource
 import tk.glucodata.Natives
 import tk.glucodata.SensorIdentity
 import tk.glucodata.UiRefreshBus
@@ -348,6 +351,9 @@ object HistorySync {
         }
 
         val roomSerial = SensorIdentity.resolveRoomStorageSensorId(serial) ?: serial
+        val readingSource = GlucoseReadingSource.forCloneTransport(
+            CloneSensorRegistry.transportForSensor(serial)
+        ).takeIf { CloneSensorRegistry.isCloneSensor(serial) } ?: GlucoseReadingSource.SENSOR
         val readings = ArrayList<HistoryReading>(NATIVE_SYNC_INSERT_CHUNK)
         var parsedCount = 0
         var storedAny = false
@@ -371,22 +377,31 @@ object HistorySync {
                         sensorSerial = roomSerial,
                         value = value,
                         rawValue = rawValue,
-                        rate = null
+                        rate = null,
+                        source = readingSource,
                     )
                 )
                 parsedCount++
                 if (readings.size >= NATIVE_SYNC_INSERT_CHUNK) {
-                    historyRepository.storeReadings(readings)
+                    val stored = historyRepository.storeReadingsReplacingSensorBuckets(
+                        sensorSerial = roomSerial,
+                        readings = readings,
+                        bucketDurationMs = RECENT_SYNC_BUCKET_MS,
+                    )
                     readings.clear()
-                    storedAny = true
+                    storedAny = storedAny || stored
                 }
             }
         }
 
         if (readings.isNotEmpty()) {
-            historyRepository.storeReadings(readings)
+            val stored = historyRepository.storeReadingsReplacingSensorBuckets(
+                sensorSerial = roomSerial,
+                readings = readings,
+                bucketDurationMs = RECENT_SYNC_BUCKET_MS,
+            )
             readings.clear()
-            storedAny = true
+            storedAny = storedAny || stored
         }
         if (storedAny) {
             UiRefreshBus.requestDataRefresh()
@@ -536,6 +551,8 @@ object HistorySync {
         }
     }
 
+    /** Resolved by name from [tk.glucodata.HistorySyncAccess], so the name must survive R8. */
+    @Keep
     fun markSensorReset(serial: String) {
         if (serial.isBlank()) return
         val deadline = System.currentTimeMillis() + RESET_PRESERVE_WINDOW_MS

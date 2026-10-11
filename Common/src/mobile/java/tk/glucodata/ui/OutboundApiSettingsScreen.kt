@@ -15,13 +15,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
@@ -30,12 +32,13 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
-import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -45,19 +48,17 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -68,26 +69,36 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 import tk.glucodata.Applic
 import tk.glucodata.OutboundApi
+import tk.glucodata.OutboundApiInsulinTokens
 import tk.glucodata.OutboundApiSettings
 import tk.glucodata.R
+import tk.glucodata.data.journal.JournalRepository
+import tk.glucodata.sms.SmsWatchdog
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.ui.components.CardPosition
+import tk.glucodata.ui.components.CompactSheetDragHandle
 import tk.glucodata.ui.components.SectionLabel
 import tk.glucodata.ui.components.SettingsItem
+import tk.glucodata.ui.components.StableModalBottomSheet
 import tk.glucodata.ui.components.StyledSwitch
 import tk.glucodata.ui.components.cardShape
 
@@ -134,11 +145,20 @@ fun OutboundApiSettingsScreen(navController: NavController) {
     }
 
     fun sendTest(destination: OutboundApiSettings.Destination) {
-        val result = OutboundApi.enqueueCurrentTest(context, destination.id)
-        val message = when (result) {
-            OutboundApi.TEST_QUEUED -> R.string.outbound_api_test_queued
-            OutboundApi.TEST_NO_CURRENT_READING -> R.string.outbound_api_no_current_reading
-            else -> R.string.outbound_api_not_configured
+        val message = if (destination.isSms()) {
+            when (SmsWatchdog.sendTest(context, destination.id)) {
+                SmsWatchdog.TEST_SENT -> R.string.sms_test_sent
+                SmsWatchdog.TEST_NO_PERMISSION -> R.string.sms_test_no_permission
+                SmsWatchdog.TEST_NO_TELEPHONY -> R.string.sms_test_no_telephony
+                SmsWatchdog.TEST_BUDGET_EXHAUSTED -> R.string.sms_test_budget
+                else -> R.string.sms_test_no_contacts
+            }
+        } else {
+            when (OutboundApi.enqueueCurrentTest(context, destination.id)) {
+                OutboundApi.TEST_QUEUED -> R.string.outbound_api_test_queued
+                OutboundApi.TEST_NO_CURRENT_READING -> R.string.outbound_api_no_current_reading
+                else -> R.string.outbound_api_not_configured
+            }
         }
         Toast.makeText(context, context.getString(message), Toast.LENGTH_SHORT).show()
         config = OutboundApiSettings.load(context)
@@ -188,17 +208,9 @@ fun OutboundApiSettingsScreen(navController: NavController) {
     Scaffold(
         contentWindowInsets = WindowInsets(0.dp),
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.outbound_api_settings_title)) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = stringResource(R.string.navigate_back)
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
+            AppTopBar(
+                title = stringResource(R.string.outbound_api_settings_title),
+                onNavigateBack = { navController.popBackStack() },
             )
         }
     ) { padding ->
@@ -206,12 +218,13 @@ fun OutboundApiSettingsScreen(navController: NavController) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 24.dp),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 100.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item("outbound_destinations") {
                 SectionLabel(stringResource(R.string.outbound_api_destinations), topPadding = 0.dp)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+
                     if (config.destinations.isEmpty()) {
                         EmptyDestinationsCard()
                     } else {
@@ -238,20 +251,17 @@ fun OutboundApiSettingsScreen(navController: NavController) {
                             )
                         }
                     }
-                }
-            }
-
-            item("outbound_add") {
-                FilledTonalButton(
-                    onClick = { showAddSheet = true },
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)
-                ) {
-                    Icon(Icons.Filled.Add, contentDescription = null)
-                    Text(
-                        text = stringResource(R.string.outbound_api_add_destination),
-                        modifier = Modifier.padding(start = 10.dp)
-                    )
+                    FilledTonalButton(
+                        onClick = { showAddSheet = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null)
+                        Text(
+                            text = stringResource(R.string.outbound_api_add_destination),
+                            modifier = Modifier.padding(start = 12.dp)
+                        )
+                    }
                 }
             }
 
@@ -260,7 +270,6 @@ fun OutboundApiSettingsScreen(navController: NavController) {
                 SettingsItem(
                     title = stringResource(R.string.api_source_settings_title),
                     subtitle = stringResource(R.string.api_source_desc),
-                    showArrow = true,
                     icon = Icons.Filled.CloudDownload,
                     iconTint = MaterialTheme.colorScheme.tertiary,
                     position = CardPosition.SINGLE,
@@ -358,7 +367,7 @@ private fun DestinationCard(
                         .fillMaxWidth()
                         .padding(start = 16.dp, end = 16.dp, bottom = 16.dp)
                         .alpha(if (destination.enabled) 1f else 0.68f),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.42f))
                     DestinationEditor(
@@ -369,14 +378,55 @@ private fun DestinationCard(
                         onChangePreset = onChangePreset
                     )
                     DestinationStatus(destination = destination)
+                    var confirmTestSms by remember(destination.id) { mutableStateOf(false) }
+                    if (confirmTestSms) {
+                        val recipientCount = destination.smsPolicy.numbers().size
+                        AlertDialog(
+                            onDismissRequest = { confirmTestSms = false },
+                            icon = { Icon(Icons.Filled.Sms, contentDescription = null) },
+                            title = { Text(stringResource(R.string.sms_test_confirm_title)) },
+                            text = {
+                                Text(
+                                    stringResource(
+                                        R.string.sms_test_confirm_message,
+                                        recipientCount
+                                    )
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = {
+                                    confirmTestSms = false
+                                    onSendTest()
+                                }) {
+                                    Text(stringResource(R.string.sms_send_test))
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { confirmTestSms = false }) {
+                                    Text(stringResource(R.string.cancel))
+                                }
+                            }
+                        )
+                    }
                     Button(
-                        onClick = onSendTest,
+                        // A test SMS is charged and lands on somebody else's phone, so it
+                        // always goes through a confirmation step.
+                        onClick = { if (destination.isSms()) confirmTestSms = true else onSendTest() },
                         enabled = destination.isReady(),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Icon(Icons.Filled.Send, contentDescription = null)
+                        Icon(
+                            if (destination.isSms()) Icons.Filled.Sms else Icons.Filled.Send,
+                            contentDescription = null
+                        )
                         Text(
-                            text = stringResource(R.string.outbound_api_send_test),
+                            text = stringResource(
+                                if (destination.isSms()) {
+                                    R.string.sms_send_test
+                                } else {
+                                    R.string.outbound_api_send_test
+                                }
+                            ),
                             modifier = Modifier.padding(start = 8.dp)
                         )
                     }
@@ -400,6 +450,7 @@ private fun DestinationIcon(preset: String, enabled: Boolean) {
                     OutboundApiSettings.PRESET_TELEGRAM_BOT,
                     OutboundApiSettings.PRESET_GLUCO_WATCH_VK,
                     OutboundApiSettings.PRESET_VK_MESSAGES -> Icons.Filled.Send
+                    OutboundApiSettings.PRESET_SMS -> Icons.Filled.Sms
                     else -> Icons.Filled.CloudUpload
                 },
                 contentDescription = null,
@@ -423,6 +474,7 @@ private fun DestinationEditor(
     val isVk = preset == OutboundApiSettings.PRESET_GLUCO_WATCH_VK ||
         preset == OutboundApiSettings.PRESET_VK_MESSAGES
     val isTelegram = preset == OutboundApiSettings.PRESET_TELEGRAM_BOT
+    val isSms = preset == OutboundApiSettings.PRESET_SMS
     var showPresetSheet by rememberSaveable(destination.id) { mutableStateOf(false) }
 
     if (showPresetSheet) {
@@ -454,6 +506,14 @@ private fun DestinationEditor(
         preset = preset,
         onChangePreset = { showPresetSheet = true }
     )
+
+    if (isSms) {
+        // SMS has no endpoint, headers or trigger thresholds of its own; everything
+        // it needs lives in its policy editor.
+        SmsDestinationEditor(destination = destination, onChange = onChange)
+        TemplateEditor(destination = destination, onChange = onChange)
+        return
+    }
 
     if (isTelegram || isVk) {
         OutlinedTextField(
@@ -552,23 +612,45 @@ private fun DestinationEditor(
         )
     }
 
-    SettingsSubsectionTitle(stringResource(R.string.outbound_api_delivery))
-    OutlinedTextField(
-        value = destination.minIntervalMinutes.toString(),
-        onValueChange = { raw ->
-            onChange(destination.copy(minIntervalMinutes = raw.filter { it.isDigit() }.toIntOrNull() ?: 0))
-        },
-        modifier = Modifier.fillMaxWidth(),
-        singleLine = true,
-        label = { Text(stringResource(R.string.outbound_api_min_interval)) },
-        supportingText = { Text(stringResource(R.string.outbound_api_min_interval_desc)) },
-        keyboardOptions = KeyboardOptions(
-            keyboardType = KeyboardType.Number,
-            imeAction = ImeAction.Next
-        )
-    )
-    TriggerPicker(destination = destination, onChange = onChange)
+    DeliverySection(destination = destination, onChange = onChange)
+    if (isTelegram) {
+        BubbleRefreshSection(destination = destination, onChange = onChange)
+    }
     TemplateEditor(destination = destination, onChange = onChange)
+}
+
+@Composable
+private fun DeliverySection(
+    destination: OutboundApiSettings.Destination,
+    onChange: (OutboundApiSettings.Destination) -> Unit
+) {
+    SettingsSubsectionTitle(stringResource(R.string.outbound_api_delivery))
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = cardShape(CardPosition.SINGLE, radius = 16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedTextField(
+                value = destination.minIntervalMinutes.toString(),
+                onValueChange = { raw ->
+                    onChange(destination.copy(minIntervalMinutes = raw.filter { it.isDigit() }.toIntOrNull() ?: 0))
+                },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text(stringResource(R.string.outbound_api_min_interval)) },
+                supportingText = { Text(stringResource(R.string.outbound_api_min_interval_desc)) },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Next
+                )
+            )
+            TriggerPicker(destination = destination, onChange = onChange)
+        }
+    }
 }
 
 @Composable
@@ -582,7 +664,7 @@ private fun PresetSummaryRow(
         color = MaterialTheme.colorScheme.surfaceContainer
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -619,7 +701,11 @@ private fun TriggerPicker(
     }
 
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 64.dp)
+            .clickable { showSheet = true }
+            .padding(horizontal = 2.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -654,16 +740,16 @@ private fun TriggerEditorSheet(
     var highText by rememberSaveable(destination.id) {
         mutableStateOf(formatThreshold(destination.triggerHighMgdl))
     }
-    ModalBottomSheet(
+    StableModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        dragHandle = { BottomSheetDefaults.DragHandle() }
+        dragHandle = { CompactSheetDragHandle() }
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 16.dp, end = 16.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
                 text = stringResource(R.string.outbound_api_trigger),
@@ -724,6 +810,203 @@ private fun TriggerEditorSheet(
                     imeAction = ImeAction.Done
                 )
             )
+        }
+    }
+}
+
+@Composable
+private fun BubbleRefreshSection(
+    destination: OutboundApiSettings.Destination,
+    onChange: (OutboundApiSettings.Destination) -> Unit
+) {
+    SettingsSubsectionTitle(stringResource(R.string.outbound_api_bubble_title))
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = cardShape(CardPosition.SINGLE, radius = 18.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp)
+        ) {
+            ToggleRow(
+                title = stringResource(R.string.outbound_api_bubble_refresh_title),
+                subtitle = stringResource(R.string.outbound_api_bubble_refresh_desc),
+                checked = destination.refreshInPlaceEnabled,
+                onCheckedChange = { checked ->
+                    onChange(destination.copy(refreshInPlaceEnabled = checked))
+                }
+            )
+            if (destination.refreshInPlaceEnabled) {
+                ControlDivider()
+                NumberStepper(
+                    label = stringResource(R.string.outbound_api_bubble_refresh_window),
+                    value = destination.refreshWindowMinutes,
+                    range = 1..60,
+                    onChange = { onChange(destination.copy(refreshWindowMinutes = it)) }
+                )
+            }
+            ControlDivider()
+            ToggleRow(
+                title = stringResource(R.string.outbound_api_bubble_suppress_title),
+                subtitle = stringResource(R.string.outbound_api_bubble_suppress_desc),
+                checked = destination.suppressDeltaBelowMgdl > 0,
+                onCheckedChange = { checked ->
+                    onChange(
+                        destination.copy(
+                            suppressDeltaBelowMgdl = if (checked) {
+                                OutboundApiSettings.DEFAULT_SUPPRESS_DELTA_BELOW_MGDL
+                            } else 0
+                        )
+                    )
+                }
+            )
+            ControlDivider()
+            ToggleRow(
+                title = stringResource(R.string.outbound_api_bubble_stale_title),
+                subtitle = stringResource(R.string.outbound_api_bubble_stale_desc),
+                checked = destination.staleEnabled,
+                onCheckedChange = { checked ->
+                    onChange(destination.copy(staleEnabled = checked))
+                }
+            )
+            if (destination.staleEnabled) {
+                ControlDivider()
+                NumberStepper(
+                    label = stringResource(R.string.outbound_api_bubble_stale_threshold),
+                    value = destination.staleThresholdMinutes,
+                    range = 1..120,
+                    onChange = { stale ->
+                        val missed = if (destination.missedThresholdMinutes <= stale) stale + 1
+                        else destination.missedThresholdMinutes
+                        onChange(
+                            destination.copy(
+                                staleThresholdMinutes = stale,
+                                missedThresholdMinutes = missed
+                            )
+                        )
+                    }
+                )
+                ControlDivider()
+                NumberStepper(
+                    label = stringResource(R.string.outbound_api_bubble_missed_threshold),
+                    value = destination.missedThresholdMinutes,
+                    range = (destination.staleThresholdMinutes + 1)..240,
+                    onChange = { onChange(destination.copy(missedThresholdMinutes = it)) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun ControlDivider() {
+    HorizontalDivider(
+        modifier = Modifier.padding(horizontal = 16.dp),
+        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.38f)
+    )
+}
+
+@Composable
+internal fun ToggleRow(
+    title: String,
+    subtitle: String?,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = if (subtitle.isNullOrBlank()) 64.dp else 88.dp)
+            .toggleable(
+                value = checked,
+                role = Role.Switch,
+                onValueChange = onCheckedChange
+            )
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        StyledSwitch(
+            checked = checked,
+            onCheckedChange = null
+        )
+    }
+}
+
+@Composable
+internal fun NumberStepper(
+    label: String,
+    value: Int,
+    range: IntRange,
+    onChange: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 72.dp)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
+        Surface(
+            shape = cardShape(CardPosition.SINGLE, radius = 24.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHighest
+        ) {
+            Row(
+                modifier = Modifier.height(48.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = { onChange((value - 1).coerceAtLeast(range.first)) },
+                    enabled = value > range.first,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.Remove,
+                        contentDescription = stringResource(R.string.outbound_api_decrease_value)
+                    )
+                }
+                Text(
+                    text = value.toString(),
+                    modifier = Modifier.widthIn(min = 34.dp),
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.titleMedium.copy(fontFeatureSettings = "tnum"),
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                IconButton(
+                    onClick = { onChange((value + 1).coerceAtMost(range.last)) },
+                    enabled = value < range.last,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.Add,
+                        contentDescription = stringResource(R.string.outbound_api_increase_value)
+                    )
+                }
+            }
         }
     }
 }
@@ -820,6 +1103,48 @@ private fun TemplateEditor(
             )
         }
     }
+
+    // Insulin-type tokens are spelled after the user's own preset names, which
+    // may be in any script — chips are the only practical way to enter them.
+    val insulinTokens = insulinTemplateTokens()
+    if (insulinTokens.isNotEmpty()) {
+        SettingsSubsectionTitle(stringResource(R.string.outbound_api_insulin_tokens))
+        Text(
+            text = stringResource(R.string.outbound_api_insulin_tokens_desc),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            insulinTokens.forEach { token ->
+                AssistChip(
+                    onClick = { replaceSelection(token) },
+                    label = { Text(token) }
+                )
+            }
+        }
+    }
+}
+
+/** Tokens for the insulin types the journal currently has active, in display order. */
+@Composable
+private fun insulinTemplateTokens(): List<String> {
+    val tokens by produceState(initialValue = emptyList<String>()) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                OutboundApiInsulinTokens.tokensForNames(
+                    JournalRepository().getInsulinPresetsSnapshot()
+                        .filterNot { it.isArchived }
+                        .sortedBy { it.sortOrder }
+                        .map { it.displayName }
+                )
+            }.getOrDefault(emptyList())
+        }
+    }
+    return tokens
 }
 
 @Composable
@@ -866,7 +1191,7 @@ private fun DestinationStatus(destination: OutboundApiSettings.Destination) {
 }
 
 @Composable
-private fun SettingsSubsectionTitle(text: String) {
+internal fun SettingsSubsectionTitle(text: String) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
@@ -883,10 +1208,10 @@ private fun PresetPickerSheet(
     onPreset: (String) -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(
+    StableModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        dragHandle = { BottomSheetDefaults.DragHandle() }
+        dragHandle = { CompactSheetDragHandle() }
     ) {
         Column(
             modifier = Modifier
@@ -924,7 +1249,7 @@ private fun PresetSheetRow(
         Row(
             modifier = Modifier.padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Surface(
                 modifier = Modifier.size(42.dp),
@@ -936,7 +1261,7 @@ private fun PresetSheetRow(
                         imageVector = spec.icon,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(24.dp)
                     )
                 }
             }
@@ -988,6 +1313,12 @@ private fun destinationPresetSpecs(): List<PresetSpec> =
             titleRes = R.string.outbound_api_preset_vk,
             descriptionRes = R.string.outbound_api_preset_vk_desc,
             icon = Icons.Filled.Send
+        ),
+        PresetSpec(
+            id = OutboundApiSettings.PRESET_SMS,
+            titleRes = R.string.outbound_api_preset_sms,
+            descriptionRes = R.string.outbound_api_preset_sms_desc,
+            icon = Icons.Filled.Sms
         )
     )
 
@@ -996,6 +1327,7 @@ private fun presetTitle(preset: String): Int =
         OutboundApiSettings.PRESET_TELEGRAM_BOT -> R.string.outbound_api_preset_telegram
         OutboundApiSettings.PRESET_GLUCO_WATCH_VK -> R.string.outbound_api_preset_gluco_watch_vk
         OutboundApiSettings.PRESET_VK_MESSAGES -> R.string.outbound_api_preset_vk
+        OutboundApiSettings.PRESET_SMS -> R.string.outbound_api_preset_sms
         else -> R.string.outbound_api_preset_custom_json
     }
 
@@ -1039,17 +1371,17 @@ private fun triggerSummary(destination: OutboundApiSettings.Destination): String
     }
 }
 
-private fun thresholdUnitLabel(): String =
+internal fun thresholdUnitLabel(): String =
     if (Applic.unit == 1) "mmol/L" else "mg/dL"
 
-private fun formatThreshold(mgdl: Int): String =
+internal fun formatThreshold(mgdl: Int): String =
     if (Applic.unit == 1) {
         String.format(Locale.US, "%.1f", mgdl / MGDL_PER_MMOLL)
     } else {
         mgdl.coerceAtLeast(1).toString()
     }
 
-private fun parseThreshold(raw: String, fallbackMgdl: Int): Int? {
+internal fun parseThreshold(raw: String, fallbackMgdl: Int): Int? {
     val normalized = raw.replace(',', '.').trim()
     if (normalized.isBlank()) return null
     val value = normalized.toFloatOrNull() ?: return null
@@ -1062,7 +1394,7 @@ private fun parseThreshold(raw: String, fallbackMgdl: Int): Int? {
     return mgdl.coerceIn(1, 600).takeIf { it != fallbackMgdl } ?: mgdl.coerceIn(1, 600)
 }
 
-private fun String.filterThresholdInput(): String =
+internal fun String.filterThresholdInput(): String =
     filter { it.isDigit() || it == '.' || it == ',' }
 
 private const val MGDL_PER_MMOLL = 18.0182f
@@ -1089,5 +1421,10 @@ private val templateTokens = listOf(
     "{iob}",
     "{journal_iob}",
     "{cob}",
-    "{journal}"
+    "{journal_cob}",
+    "{journal_events}",
+    "{journal}",
+    "{status}",
+    "{status_emoji}",
+    "{temp}"
 )

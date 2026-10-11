@@ -19,7 +19,6 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,6 +30,8 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.material3.Slider
+import tk.glucodata.ui.components.TabScreenDefaults
+import tk.glucodata.ui.components.TabScreenHeader
 import tk.glucodata.ui.components.StyledSwitch
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
@@ -158,7 +159,6 @@ import tk.glucodata.ui.journal.JournalDoseProfile
 import tk.glucodata.ui.journal.JournalEntrySheet
 import tk.glucodata.ui.journal.JournalInlineChip
 import tk.glucodata.ui.journal.JournalSettingsScreen
-import tk.glucodata.ui.journal.buildActiveInsulinSummary
 import tk.glucodata.ui.journal.buildJournalChartMarkers
 import tk.glucodata.ui.journal.journalTypeColor
 import tk.glucodata.ui.journal.journalTypeSelectedContainerColor
@@ -171,7 +171,6 @@ import androidx.compose.ui.res.stringResource
 import java.util.Locale
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.Icon
@@ -255,21 +254,28 @@ fun SensorScreen(
     viewModel: tk.glucodata.ui.viewmodel.SensorViewModel = viewModel(),
 ) {
     val context = LocalContext.current
-    val sensors by viewModel.sensors.collectAsState()
+    val sensors by viewModel.sensors.collectAsStateWithLifecycle()
     val adaptiveMetrics = rememberAdaptiveWindowMetrics()
     val compactLayout = adaptiveMetrics.isCompact
     val panelPadding = 16.dp
-    val titleInset = 16.dp
-    val panelTopGap = if (compactLayout) 10.dp else 16.dp
-    val panelBottomPadding = if (compactLayout) 88.dp else 100.dp
-    val titleStyle = if (compactLayout) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.displaySmall
-    val titleBottomPadding = if (compactLayout) 16.dp else 24.dp
-    val fabPadding = if (compactLayout) 12.dp else 16.dp
+    val fabPadding = 16.dp
     
-    // Start/stop real-time polling based on screen visibility
-    DisposableEffect(Unit) {
-        viewModel.startPolling() // Start 2-second refresh when screen visible
+    // Start/stop real-time polling based on screen visibility.
+    // Tied to the lifecycle, not just to composition: this screen is a tab, so leaving the
+    // app while it is open keeps it composed. Without ON_START/ON_STOP the refresh loop would
+    // keep polling native sensor state in the background forever.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.startPolling()
+                Lifecycle.Event.ON_STOP -> viewModel.stopPolling()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             viewModel.stopPolling() // Stop when leaving screen
         }
     }
@@ -285,6 +291,7 @@ fun SensorScreen(
     var showICanHealthWizard by remember { mutableStateOf(false) }
     var showMQWizard by remember { mutableStateOf(false) }
     var showAnytimeWizard by remember { mutableStateOf(false) }
+    var showOttaiWizard by remember { mutableStateOf(false) }
 
     // Sensor Type Picker Bottom Sheet
     if (showSensorPicker) {
@@ -302,6 +309,7 @@ fun SensorScreen(
                     tk.glucodata.ui.components.SensorType.ICANHEALTH -> showICanHealthWizard = true
                     tk.glucodata.ui.components.SensorType.MQ -> showMQWizard = true
                     tk.glucodata.ui.components.SensorType.ANYTIME -> showAnytimeWizard = true
+                    tk.glucodata.ui.components.SensorType.OTTAI -> showOttaiWizard = true
                 }
             }
         )
@@ -429,6 +437,19 @@ fun SensorScreen(
         return
     }
 
+
+    // Ottai Setup Wizard
+    if (showOttaiWizard) {
+        tk.glucodata.ui.setup.OttaiSetupWizard(
+            onDismiss = { showOttaiWizard = false },
+            onComplete = {
+                showOttaiWizard = false
+                viewModel.refreshSensors()
+            },
+        )
+        return
+    }
+
     // Use Box instead of Scaffold to avoid double padding from parent nav
     Box(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
         if (sensors.isEmpty()) {
@@ -437,16 +458,11 @@ fun SensorScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = panelPadding)
-                    .padding(bottom = panelBottomPadding)
+                    .padding(horizontal = TabScreenDefaults.Gutter)
+                    .padding(bottom = TabScreenDefaults.BottomPadding)
             ) {
-                Spacer(modifier = Modifier.height(panelTopGap))
-                Text(
-                    text = stringResource(R.string.sensors_title),
-                    style = titleStyle,
-                    modifier = Modifier.padding(start = titleInset, end = titleInset)
-                )
-                Spacer(modifier = Modifier.height(panelTopGap))
+                Spacer(modifier = Modifier.height(TabScreenDefaults.Gutter))
+                TabScreenHeader(title = stringResource(R.string.sensors_title))
                 SensorsCgmReadinessBanner(onOpenReadiness = onNavigateToReadiness)
                 Spacer(modifier = Modifier.height(panelPadding))
                 tk.glucodata.ui.components.SensorsEmptyState(
@@ -461,6 +477,7 @@ fun SensorScreen(
                             tk.glucodata.ui.components.SensorType.ICANHEALTH -> showICanHealthWizard = true
                             tk.glucodata.ui.components.SensorType.MQ -> showMQWizard = true
                             tk.glucodata.ui.components.SensorType.ANYTIME -> showAnytimeWizard = true
+                            tk.glucodata.ui.components.SensorType.OTTAI -> showOttaiWizard = true
                         }
                     }
                 )
@@ -471,20 +488,11 @@ fun SensorScreen(
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(0.dp),
-                contentPadding = PaddingValues(
-                    start = panelPadding,
-                    end = panelPadding,
-                    top = panelPadding,
-                    bottom = panelBottomPadding
-                )
+                contentPadding = TabScreenDefaults.contentPadding(hasFab = true)
             ) {
                 // Scrollable header
                 item {
-                    Text(
-                        text = stringResource(R.string.sensors_title),
-                    style = titleStyle,
-                    modifier = Modifier.padding(start = titleInset, bottom = titleBottomPadding)
-                    )
+                    TabScreenHeader(title = stringResource(R.string.sensors_title))
                 }
                 item {
                     SensorsCgmReadinessBanner(
@@ -493,12 +501,14 @@ fun SensorScreen(
                     )
                 }
                 items(sensors, key = { it.serial }) { sensor ->
-                    SensorCard(
-                        sensor,
-                        viewModel,
-                        sensorCount = sensors.size,
-                        onNavigateToMqAccount = onNavigateToMqAccount,
-                    )
+                    FontScaleCap {
+                        SensorCard(
+                            sensor,
+                            viewModel,
+                            sensorCount = sensors.size,
+                            onNavigateToMqAccount = onNavigateToMqAccount,
+                        )
+                    }
                 }
             }
         }
@@ -509,6 +519,7 @@ fun SensorScreen(
                 onClick = { showSensorPicker = true },
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
                 contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                shape = RoundedCornerShape(20.dp),
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(fabPadding)

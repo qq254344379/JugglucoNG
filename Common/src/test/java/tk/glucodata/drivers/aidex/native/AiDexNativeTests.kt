@@ -9,19 +9,23 @@ package tk.glucodata.drivers.aidex.native
 
 import org.junit.Assert.*
 import org.junit.Test
+import tk.glucodata.drivers.aidex.AiDexSerialIdentity
 import tk.glucodata.drivers.aidex.native.crypto.AesCfb128
 import tk.glucodata.drivers.aidex.native.crypto.Crc16CcittFalse
 import tk.glucodata.drivers.aidex.native.crypto.Crc8Maxim
 import tk.glucodata.drivers.aidex.native.crypto.SerialCrypto
 import tk.glucodata.drivers.aidex.native.ble.aiDexActivationTimeZone
 import tk.glucodata.drivers.aidex.native.ble.aiDexDeviceNameMatchesSerial
+import tk.glucodata.drivers.aidex.native.ble.aiDexDisplayName
 import tk.glucodata.drivers.aidex.native.data.*
 import tk.glucodata.drivers.aidex.native.protocol.AiDexCommandBuilder
 import tk.glucodata.drivers.aidex.native.protocol.AiDexDpCatalogProvider
 import tk.glucodata.drivers.aidex.native.protocol.AiDexDefaultParamProvisioning
 import tk.glucodata.drivers.aidex.native.protocol.AiDexKeyExchange
 import tk.glucodata.drivers.aidex.native.protocol.AiDexOpcodes
+import tk.glucodata.drivers.aidex.native.protocol.AiDexOfficialDpCatalogSnapshot
 import tk.glucodata.drivers.aidex.native.protocol.AiDexParser
+import tk.glucodata.drivers.aidex.native.protocol.AiDexWearProfile
 import java.util.Calendar
 import java.util.TimeZone
 
@@ -232,7 +236,39 @@ class SerialCryptoTests {
         assertEquals("2222267V4E", SerialCrypto.stripPrefix("AiDEX X-2222267V4E"))
         assertEquals("2222267V4E", SerialCrypto.stripPrefix("X-2222267V4E"))
         assertEquals("2222293NWA", SerialCrypto.stripPrefix("AiDEX x-2222293NWA"))
+        assertEquals("22222FZXKT", SerialCrypto.stripPrefix("AiDEX F-22222FZXKT"))
+        assertEquals("22222FZXKT", SerialCrypto.stripPrefix("F-22222FZXKT"))
+        assertEquals("22222GZXKT", SerialCrypto.stripPrefix("AiDEX G-22222GZXKT"))
+        assertEquals("22222QZXKT", SerialCrypto.stripPrefix("Q-22222QZXKT"))
         assertEquals("2222267V4E", SerialCrypto.stripPrefix("2222267V4E"))
+    }
+
+    @Test
+    fun testFGenerationSerialDerivesCapturedChallenge() {
+        val secret = SerialCrypto.deriveSecret(SerialCrypto.stripPrefix("AiDEX F-22222FZXKT"))
+        assertEquals("F0740DC2FA51F24A884F61FC4C14885B", AiDexParser.compactHex(secret))
+    }
+
+    @Test
+    fun testSmartSerialUsesBareSerialChallengeAndIvForNewAndStoredSensors() {
+        val name = "Smart-22222BZTJ3"
+        val canonical = requireNotNull(AiDexSerialIdentity.canonicalFromAdvertisement(name))
+        val recovered = requireNotNull(AiDexSerialIdentity.advertisedProtocolSerialForMacFallback(
+            storedSensorId = "X-6CA0423B65E2",
+            address = "6C:A0:42:3B:65:E2",
+            advertisedName = name,
+        ))
+        // Reference derivation from the reported box SN, not a captured GX-01S handshake.
+        val expectedChallenge = SerialCrypto.deriveSecret("22222BZTJ3")
+        val expectedIv = SerialCrypto.deriveIv("22222BZTJ3")
+        val macChallenge = AiDexKeyExchange("X-6CA0423B65E2").getChallenge()
+        for (serial in listOf(name, canonical, recovered)) {
+            val exchange = AiDexKeyExchange(serial)
+            assertEquals("22222BZTJ3", exchange.bareSerial)
+            assertArrayEquals(expectedChallenge, exchange.getChallenge())
+            assertArrayEquals(expectedIv, exchange.snIv)
+            assertFalse(macChallenge.contentEquals(exchange.getChallenge()))
+        }
     }
 
     @Test
@@ -273,6 +309,55 @@ class DeviceNameMatchingTests {
     @Test
     fun testAiDexDeviceNameRejectsDifferentSerial() {
         assertFalse(aiDexDeviceNameMatchesSerial("AiDEX x-2222293NWA", "X-222228AWH2"))
+    }
+}
+
+class DisplayNameTests {
+
+    @Test
+    fun brandWordIsDroppedFromAdvertisedName() {
+        // The card's family chip already names the brand; the title keeps only the "X-" serial.
+        assertEquals("X-2222293NWA", aiDexDisplayName("AiDEX X-2222293NWA", "C0:AB:12:34:56:78", "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("aidex x-2222293NWA".uppercase(), null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("AiDex-X-2222293NWA", null, "X-2222293NWA"))
+    }
+
+    @Test
+    fun everyKnownRebrandIsDroppedFromAdvertisedName() {
+        assertEquals("X-2222293NWA", aiDexDisplayName("Linx X-2222293NWA", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("GlucoRX AiDEX X-2222293NWA", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("Vista X-2222293NWA", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("Lumiflex LinX X-2222293NWA", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("DiaExpert X-2222293NWA", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("Wellion AiDEX X-2222293NWA", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("CGM X-2222293NWA", null, "X-2222293NWA"))
+    }
+
+    @Test
+    fun unbrandedAdvertisedNameIsKeptVerbatim() {
+        assertEquals("X-2222293NWA", aiDexDisplayName("X-2222293NWA", null, "2222293NWA"))
+        assertEquals("12345678", aiDexDisplayName("Linx 12345678", null, "X-2222293NWA"))
+    }
+
+    @Test
+    fun brandWordAloneCollapsesToSerial() {
+        assertEquals("X-2222293NWA", aiDexDisplayName("AiDEX ", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("LinX", null, "X-2222293NWA"))
+    }
+
+    @Test
+    fun macAddressFallbackCollapsesToSerial() {
+        // SuperGattCallback.mygetDeviceName() returns the MAC before the first connect attempt.
+        assertEquals("X-2222293NWA", aiDexDisplayName("C0:AB:12:34:56:78", "C0:AB:12:34:56:78", "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("c0:ab:12:34:56:78", "C0:AB:12:34:56:78", "X-2222293NWA"))
+    }
+
+    @Test
+    fun placeholderAndBlankCollapseToSerial() {
+        assertEquals("X-2222293NWA", aiDexDisplayName("?", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName("   ", null, "X-2222293NWA"))
+        assertEquals("X-2222293NWA", aiDexDisplayName(null, null, "X-2222293NWA"))
     }
 }
 
@@ -382,7 +467,7 @@ class DataFrameParsingTests {
     @Test
     fun testParseDataFrame_RawrExample() {
         // From rawr.txt: 01 00 02 00 2B 00 3F 84 4F 03 86 0B 43 02 00 7D CE
-        // bytes[1..4] = 00 02 00 2B → u32LE = 0x2B000200 = 721420800 seconds → 12023680 minutes
+        // bytes[4..5] = 2B 00 → u16LE = 43 minutes since sensor start
         // glucose = bytes[6..7] LE with mask 0x03FF = 0x843F & 0x03FF = 63 mg/dL
         // i1 = bytes[8..9] LE = 0x034F / 100 = 8.47
         // i2 = bytes[10..11] LE = 0x0B86 / 100 = 29.50
@@ -396,7 +481,7 @@ class DataFrameParsingTests {
         assertNotNull(parsed)
 
         assertEquals(0x01, parsed!!.opcode)
-        assertEquals(12023680, parsed.timeOffsetMinutes) // 0x2B000200 / 60
+        assertEquals(43, parsed.timeOffsetMinutes) // u16LE(bytes[4..5]) = 0x002B
         // rawGlucosePacked = 0x843F, glucose = 0x843F & 0x03FF = 0x003F = 63
         assertEquals(0x843F, parsed.rawGlucosePacked)
         assertEquals(63.0f, parsed.glucoseMgDl, 0.01f)
@@ -455,18 +540,33 @@ class DataFrameParsingTests {
     fun testParseDataFrame_TimeOffsetMinutes() {
         val frame = ByteArray(17)
         frame[0] = 0xA1.toByte() // valid direct opcode
-        // bytes[1..4]: 900 seconds (15 minutes) = 0x00000384 LE = 84 03 00 00
+        // bytes[4..5]: 15 minutes = 0x000F LE = 0F 00
+        frame[4] = 0x0F
+        frame[5] = 0x00
+        // Bytes 1..3 are not the offset; fill them to prove they are ignored.
         frame[1] = 0x84.toByte()
         frame[2] = 0x03
-        frame[3] = 0x00
-        frame[4] = 0x00
+        frame[3] = 0xFF.toByte()
         frame[6] = 80  // rawGlucose = 80 (valid)
         frame[7] = 0x00
         val parsed = AiDexParser.parseDataFrame(frame)
         assertNotNull(parsed)
-        assertEquals(15, parsed!!.timeOffsetMinutes) // 900 / 60 = 15
+        assertEquals(15, parsed!!.timeOffsetMinutes)
         assertEquals(80.0f, parsed.glucoseMgDl, 0.01f)
         assertTrue(parsed.isValid)
+    }
+
+    @Test
+    fun testParseDataFrame_TimeOffsetUsesBothBytes() {
+        val frame = ByteArray(17)
+        frame[0] = 0xA1.toByte()
+        frame[4] = 0xED.toByte() // 2285 = 0x08ED
+        frame[5] = 0x08
+        frame[6] = 80
+        frame[7] = 0x00
+        val parsed = AiDexParser.parseDataFrame(frame)
+        assertNotNull(parsed)
+        assertEquals(2285, parsed!!.timeOffsetMinutes)
     }
 
     @Test
@@ -723,11 +823,13 @@ class AdvertisementTests {
     fun testIsAiDexDevice_ValidNames() {
         assertTrue(AiDexOpcodes.isAiDexDevice("AiDEX X-2222267V4E"))
         assertTrue(AiDexOpcodes.isAiDexDevice("AiDEX X-22222689WH"))
+        assertTrue(AiDexOpcodes.isAiDexDevice("Smart-22222BZTJ3"))
     }
 
     @Test
     fun testIsAiDexDevice_InvalidNames() {
         assertFalse(AiDexOpcodes.isAiDexDevice("Dexcom G7"))
+        assertFalse(AiDexOpcodes.isAiDexDevice("Smartwatch-22222BZTJ3"))
         assertFalse(AiDexOpcodes.isAiDexDevice(null))
         assertFalse(AiDexOpcodes.isAiDexDevice(""))
     }
@@ -946,6 +1048,45 @@ class StartupMetadataParsingTests {
     }
 
     @Test
+    fun testParseStartupDeviceInfoFrame_stripsOpcodeOnly() {
+        val frame = AiDexParser.dataFromHex("100000010701030F0047582D3031530000")
+
+        val parsed = AiDexParser.parseStartupDeviceInfoFrame(frame)
+
+        assertNotNull(parsed)
+        assertEquals("1.7", parsed!!.firmwareVersion)
+        assertEquals("1.3", parsed.hardwareVersion)
+        assertEquals(15, parsed.wearDays)
+        assertEquals("GX-01S", parsed.modelName)
+    }
+
+    @Test
+    fun testParseStartupDeviceInfoPayload_lumiflex16DayShape() {
+        val payload = AiDexParser.dataFromHex("000001080201100047582D3031530000")
+
+        val parsed = AiDexParser.parseStartupDeviceInfoPayload(payload)
+
+        assertNotNull(parsed)
+        assertEquals("1.8", parsed!!.firmwareVersion)
+        assertEquals("2.1", parsed.hardwareVersion)
+        assertEquals(16, parsed.wearDays)
+        assertEquals("GX-01S", parsed.modelName)
+    }
+
+    @Test
+    fun testParseStartupDeviceInfoFrame_lumiflex16DayShape() {
+        val frame = AiDexParser.dataFromHex("10000001080201100047582D3031530000")
+
+        val parsed = AiDexParser.parseStartupDeviceInfoFrame(frame)
+
+        assertNotNull(parsed)
+        assertEquals("1.8", parsed!!.firmwareVersion)
+        assertEquals("2.1", parsed.hardwareVersion)
+        assertEquals(16, parsed.wearDays)
+        assertEquals("GX-01S", parsed.modelName)
+    }
+
+    @Test
     fun testParseLocalStartTimePayload_acceptsPlausibleDate() {
         val payload = byteArrayOf(
             0xEA.toByte(), 0x07,
@@ -1091,6 +1232,39 @@ class DefaultParamCatalogCompareTests {
     }
 
     @Test
+    fun catalogWearDaysMatchTheModelRating() {
+        assertEquals(15, AiDexWearProfile.ratedDays("GX-01S"))
+        assertEquals(10, AiDexWearProfile.ratedDays("GX-02S"))
+        assertEquals(10, AiDexWearProfile.ratedDays("gx-02s"))
+        assertEquals(8, AiDexWearProfile.ratedDays("GX-03S"))
+        assertEquals(14, AiDexWearProfile.ratedDays("GXXXS14"))
+        assertEquals(16, AiDexWearProfile.ratedDays("GXXXS16"))
+        assertEquals(7, AiDexWearProfile.ratedDays("GXXXS7"))
+        assertNull(AiDexWearProfile.ratedDays("mystery"))
+
+        AiDexOfficialDpCatalogSnapshot.entries.forEach { entry ->
+            assertEquals(
+                "${entry.settingType}@${entry.version}",
+                AiDexWearProfile.catalogWearDays(entry.settingContent),
+                AiDexWearProfile.ratedDays(entry.settingType),
+            )
+        }
+    }
+
+    @Test
+    fun resolveUsesTheRatingOnlyWithoutASensorByte() {
+        assertNull(AiDexWearProfile.resolve(null, null))
+        assertEquals(10, AiDexWearProfile.resolve(null, 10))
+        assertEquals(10, AiDexWearProfile.resolve(10, 10))
+        assertEquals(15, AiDexWearProfile.resolve(15, 10))
+        assertEquals(15, AiDexWearProfile.resolve(15, 8))
+        assertEquals(8, AiDexWearProfile.resolve(0, 8))
+        assertEquals(16, AiDexWearProfile.resolve(16, 15))
+        assertEquals(15, AiDexWearProfile.resolve(15, 15))
+        assertEquals(12, AiDexWearProfile.resolve(12, null))
+    }
+
+    @Test
     fun testWorking171UsesOfficialTrimmedFirmwareKey() {
         val currentRawHex = "010105000080C613008303BFFE68006700650068006B00100E302AD06BB0FFC4FFECFF00000000100E302AD06B0A0000000000C4092800FA00740E2003EE020A000A000800FA0019007D000802AA009CFF640000001100E803B80B32005500D501280046001E0032006400020014002003B004050014001E005A005A00F401F4019033B04F000000000000000000000000000000000000000000000000000000000000000000000000"
 
@@ -1165,9 +1339,15 @@ class DefaultParamCatalogCompareTests {
                 modelName = "GX-01S",
                 firmwareVersion = "1.5.1",
             )
+
             val best = comparisons.first()
-            assertEquals(AiDexDefaultParamProvisioning.CatalogSource.IMPORTED, best.entry.source)
+            assertEquals(
+                AiDexDefaultParamProvisioning.CatalogSource.IMPORTED,
+                best.entry.source
+            )
             assertEquals("parameters_x_contact.ini", best.entry.settingVersion)
+
+
         } finally {
             AiDexDpCatalogProvider.setStorageForTests(null)
         }
@@ -1339,10 +1519,10 @@ class CacheCalibratedEntriesTests {
 
     @Test
     fun testControlValueDeviation_ExactThreshold() {
-        // Deviation of exactly 50 should NOT be skipped (> 50 required)
+        // Deviation of exactly 20 should NOT be skipped (> 20 required)
         val cache = mutableMapOf<Int, Int>()
         val entries = (0 until 120).map { i ->
-            if (i < 119) entry(1000 + i, 80) else entry(1000 + i, 130)  // deviation = 50
+            if (i < 119) entry(1000 + i, 80) else entry(1000 + i, 100)  // deviation = 20
         }
         val (cached, skipped) = HistoryMerge.cacheCalibratedEntries(entries, cache)
         assertEquals(120, cached)
@@ -1351,14 +1531,33 @@ class CacheCalibratedEntriesTests {
 
     @Test
     fun testControlValueDeviation_JustAboveThreshold() {
-        // Deviation of 51 should be skipped
+        // Deviation of 21 should be skipped
         val cache = mutableMapOf<Int, Int>()
         val entries = (0 until 120).map { i ->
-            if (i < 119) entry(1000 + i, 80) else entry(1000 + i, 131)  // deviation = 51
+            if (i < 119) entry(1000 + i, 80) else entry(1000 + i, 101)  // deviation = 21
         }
         val (cached, skipped) = HistoryMerge.cacheCalibratedEntries(entries, cache)
         assertEquals(119, cached)
         assertEquals(1, skipped)
+    }
+
+    @Test
+    fun testSkipsObservedAiDexPageTailBump() {
+        val cache = mutableMapOf<Int, Int>()
+        val entries = (0 until 120).map { i ->
+            when (i) {
+                118 -> entry(6989 + i, 70)
+                119 -> entry(6989 + i, 97)
+                else -> entry(6989 + i, 70)
+            }
+        }
+
+        val (cached, skipped) = HistoryMerge.cacheCalibratedEntries(entries, cache)
+
+        assertEquals(119, cached)
+        assertEquals(1, skipped)
+        assertEquals(70, cache[7107])
+        assertNull(cache[7108])
     }
 }
 
@@ -1393,6 +1592,23 @@ class HistoryMergeEntryTests {
         assertEquals(90f, result.entries[2].glucoseMgDl)
         // Cache should be emptied
         assertTrue(cache.isEmpty())
+    }
+
+    @Test
+    fun testMergeCarriesSkinTemperatureFromI2() {
+        // The 0x24 `i2` channel is skin temperature in °C — the merge must
+        // carry it into the store entry so history backfill feeds the Stats
+        // temperature card.
+        val cache = mutableMapOf(100 to 80, 101 to 85)
+        val adcEntries = listOf(
+            adcEntry(100, i2 = 33.5f),
+            adcEntry(101, i2 = 27.2f),
+        )
+        val result = HistoryMerge.mergeHistoryEntries(adcEntries, cache, null)
+
+        assertEquals(2, result.entries.size)
+        assertEquals(33.5f, result.entries[0].temperatureC, 0.001f)
+        assertEquals(27.2f, result.entries[1].temperatureC, 0.001f)
     }
 
     @Test

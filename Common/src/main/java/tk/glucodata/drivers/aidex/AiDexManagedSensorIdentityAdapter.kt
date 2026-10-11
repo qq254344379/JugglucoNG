@@ -5,9 +5,12 @@ import tk.glucodata.Applic
 import tk.glucodata.SensorIdentity
 import tk.glucodata.SensorBluetooth
 import tk.glucodata.drivers.ManagedSensorIdentityAdapter
+import tk.glucodata.drivers.ManagedSensorUiFamily
 import tk.glucodata.SuperGattCallback
 
 object AiDexManagedSensorIdentityAdapter : ManagedSensorIdentityAdapter {
+    override val uiFamily = ManagedSensorUiFamily.AIDEX
+
     private const val PREFIX = "X-"
     private const val PREFS_NAME = "tk.glucodata_preferences"
     private const val PREF_KEY = "aidex_sensors"
@@ -100,11 +103,7 @@ object AiDexManagedSensorIdentityAdapter : ManagedSensorIdentityAdapter {
         if (!isManagedSensorId(sensorId)) {
             return null
         }
-        return if (AiDexNativeFactory.isNativeModeEnabled(context)) {
-            AiDexNativeFactory.createBleManager(sensorId, dataptr)
-        } else {
-            AiDexSensor(Applic.app ?: context.applicationContext, sensorId, dataptr)
-        }
+        return AiDexNativeFactory.createBleManager(sensorId, dataptr)
     }
 
     override fun removePersistedSensor(context: Context, sensorId: String?) {

@@ -4,7 +4,9 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
 import tk.glucodata.Applic
+import tk.glucodata.GlucoseDelta
 import tk.glucodata.Natives
+import tk.glucodata.SuperGattCallback
 
 /**
  * Repository for loading and saving alert configurations.
@@ -16,10 +18,16 @@ object AlertRepository {
     
     private const val PREFS_NAME = "tk.glucodata.alerts"
     private const val DEFAULT_THRESHOLD_MIGRATION_KEY = "alert_threshold_defaults_v3"
+    private const val KEY_NOTIFICATION_DISMISS_ACTION = "notification_dismiss_action"
+    private const val KEY_SAME_DIRECTION_SUPPRESSION_MINUTES = "same_direction_suppression_min"
+    private const val KEY_ACKNOWLEDGED_HIGH_COVERAGE = "acknowledged_high_coverage"
+    private const val KEY_RETURN_TO_PREVIOUS_APP_AFTER_ALARM = "alarm_return_to_previous_app"
     @Volatile
     private var hiddenLegacyAlertCleanupDone = false
     @Volatile
     private var defaultThresholdMigrationDone = false
+    @Volatile
+    private var cachedNativeLossWaitMinutes: Int? = null
     
     private val prefs: SharedPreferences by lazy {
         Applic.app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -48,6 +56,129 @@ object AlertRepository {
     private fun keyRetryEnabled(type: AlertType) = "alert_${type.id}_retryOn"
     private fun keyRetryInterval(type: AlertType) = "alert_${type.id}_retryInt"
     private fun keyRetryCount(type: AlertType) = "alert_${type.id}_retryCnt"
+    // Delta-counter keys (FALLING_FAST / RISING_FAST)
+    private fun keyDeltaThreshold(type: AlertType) = "alert_${type.id}_deltaThreshold"
+    private fun keyDeltaCount(type: AlertType) = "alert_${type.id}_deltaCount"
+    private fun keyDeltaBorder(type: AlertType) = "alert_${type.id}_deltaBorder"
+    private fun keyDeltaInterval(type: AlertType) = "alert_${type.id}_deltaInterval"
+    private fun keyEarlyTrigger(type: AlertType) = "alert_${type.id}_earlyTrigger"
+
+    // Sound delay ("vibrate first, audio after N seconds")
+    private fun keySoundDelayEnabled(type: AlertType) = "alert_${type.id}_soundDelayEnabled"
+    private fun keySoundDelaySeconds(type: AlertType) = "alert_${type.id}_soundDelay"
+
+    // Rearm hysteresis. 0 is a meaningful stored value (explicit opt-out), so
+    // reads are contains()-guarded instead of takeIf { it > 0 }-normalised.
+    private fun keyRearmMargin(type: AlertType) = "alert_${type.id}_rearmMargin"
+    private fun keyRearmMinInterval(type: AlertType) = "alert_${type.id}_rearmMinIntervalMin"
+
+    private fun readRearmMargin(type: AlertType, default: Float?): Float? {
+        val key = keyRearmMargin(type)
+        if (!prefs.contains(key)) return default
+        return prefs.getFloat(key, 0f).takeIf { it.isFinite() }?.coerceAtLeast(0f) ?: default
+    }
+
+    private fun readRearmMinInterval(type: AlertType, default: Int?): Int? {
+        val key = keyRearmMinInterval(type)
+        if (!prefs.contains(key)) return default
+        return prefs.getInt(key, 0).coerceAtLeast(0)
+    }
+
+    // PRE_HIGH only: IOB coverage factor. 0 = feature off, so contains()-guarded.
+    private fun keyIobCoverage(type: AlertType) = "alert_${type.id}_iobCoverage"
+
+    private fun readIobCoverage(type: AlertType, default: Float?): Float? {
+        val key = keyIobCoverage(type)
+        if (!prefs.contains(key)) return default
+        return prefs.getFloat(key, 0f).takeIf { it.isFinite() }?.coerceAtLeast(0f) ?: default
+    }
+
+    // HIGH: positive = opt in to down-arrow suppression. PERSISTENT_HIGH: configured
+    // fall-rate magnitude (mg/dl/min). 0 = off for either type.
+    private fun keyFallRateSuppress(type: AlertType) = "alert_${type.id}_fallRateSuppress"
+
+    private fun readFallRateSuppress(type: AlertType, default: Float?): Float? {
+        val key = keyFallRateSuppress(type)
+        if (!prefs.contains(key)) return default
+        return prefs.getFloat(key, 0f).takeIf { it.isFinite() }?.coerceAtLeast(0f) ?: default
+    }
+
+    // Cap enforced on every read so a value written by any path (incl. the
+    // apply-to-all bulk edit onto LOW/VERY_LOW) can never exceed the hypo cap.
+    private fun readSoundDelaySeconds(type: AlertType): Int =
+        sanitizeSoundDelaySeconds(type, prefs.getInt(keySoundDelaySeconds(type), 0))
+
+    // Sensor-expiry pre-warning thresholds (minutes), stored as a StringSet.
+    private fun keyExpiryWarnings(type: AlertType) = "alert_${type.id}_expiryWarnings"
+
+    // Thresholds already warned for, entries "endTimeMs:minutes". Saving keeps
+    // only the current sensor's entries, so the set stays bounded.
+    private fun keyExpiryWarned(type: AlertType) = "alert_${type.id}_expiryWarned"
+
+    internal val sensorExpiryWarnedStore: ExpiryWarnedStore = object : ExpiryWarnedStore {
+        override fun load(endTimeMs: Long): Set<Int> {
+            val raw = prefs.getStringSet(keyExpiryWarned(AlertType.SENSOR_EXPIRY), null)
+                ?: return emptySet()
+            val prefix = "$endTimeMs:"
+            return raw.mapNotNull { entry ->
+                entry.takeIf { it.startsWith(prefix) }?.removePrefix(prefix)?.toIntOrNull()
+            }.toSet()
+        }
+
+        override fun save(endTimeMs: Long, thresholds: Set<Int>) {
+            prefs.edit {
+                putStringSet(
+                    keyExpiryWarned(AlertType.SENSOR_EXPIRY),
+                    thresholds.map { "$endTimeMs:$it" }.toSet()
+                )
+            }
+        }
+    }
+
+    /**
+     * A threshold enabled mid-episode whose warning window is already open must
+     * not fire retroactively - not even after a process restart. Persist the
+     * adoption at save time; the runtime baseline then treats it like any
+     * already-warned window. Thresholds that were already configured keep their
+     * state: one that is due but was never warned (process was down at window
+     * entry) stays eligible for the catch-up warning. That includes thresholds
+     * configured while the alert was switched off - toggling the alert off and
+     * on is not a fresh start, and treating it as one silenced every open
+     * window for the rest of the sensor.
+     */
+    private fun adoptOpenWindowsForNewExpiryThresholds(config: AlertConfig) {
+        if (!config.enabled) {
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        val endTimeMs = resolveSensorExpiryEndMs(preferredSensorId = null, nowMs = nowMs)
+        if (endTimeMs <= 0L) {
+            return
+        }
+        val previous = loadConfig(config.type)
+        val newlyOpen = newlyOpenExpiryThresholds(
+            previousMinutes = previous.expiryWarningMinutes,
+            currentMinutes = config.expiryWarningMinutes,
+            endTimeMs = endTimeMs,
+            nowMs = nowMs
+        )
+        if (newlyOpen.isEmpty()) {
+            return
+        }
+        sensorExpiryWarnedStore.save(
+            endTimeMs,
+            sensorExpiryWarnedStore.load(endTimeMs) + newlyOpen
+        )
+    }
+
+    /** Missing key -> default (24h migration); present-but-empty -> no pre-warning. */
+    private fun readExpiryWarnings(type: AlertType, default: Set<Int>): Set<Int> {
+        if (!prefs.contains(keyExpiryWarnings(type))) {
+            return default
+        }
+        val raw = prefs.getStringSet(keyExpiryWarnings(type), null) ?: return default
+        return sanitizeExpiryWarningMinutes(raw.mapNotNull { it.toIntOrNull() }.toSet())
+    }
 
     private inline fun <reified T : Enum<T>> parseEnumPref(value: String?, fallback: T): T {
         return value?.let { raw ->
@@ -62,6 +193,65 @@ object AlertRepository {
             fallback
         }
         return sanitizeAlertDurationSeconds(value)
+    }
+
+    fun loadNotificationDismissAction(): AlertNotificationDismissAction {
+        return parseEnumPref(
+            prefs.getString(KEY_NOTIFICATION_DISMISS_ACTION, null),
+            AlertNotificationDismissAction.DISMISS
+        )
+    }
+
+    fun saveNotificationDismissAction(action: AlertNotificationDismissAction) {
+        prefs.edit {
+            putString(KEY_NOTIFICATION_DISMISS_ACTION, action.name)
+        }
+    }
+
+    /**
+     * Minutes during which, after one trend alert fires, another alert of the
+     * same direction stays quiet (see SameDirectionAlertSuppression). 0 turns
+     * the quiet period off, which is the behaviour before it existed.
+     */
+    fun loadSameDirectionSuppressionMinutes(): Int {
+        return sanitizeSameDirectionSuppressionMinutes(
+            prefs.getInt(KEY_SAME_DIRECTION_SUPPRESSION_MINUTES, AlertDefaults.SAME_DIRECTION_SUPPRESSION_MINUTES)
+        )
+    }
+
+    fun saveSameDirectionSuppressionMinutes(minutes: Int) {
+        prefs.edit {
+            putInt(KEY_SAME_DIRECTION_SUPPRESSION_MINUTES, sanitizeSameDirectionSuppressionMinutes(minutes))
+        }
+    }
+
+    /** Whether acknowledged rising-side alerts may cover HIGH during the quiet period. */
+    fun loadAcknowledgedHighCoverageEnabled(): Boolean {
+        return prefs.getBoolean(
+            KEY_ACKNOWLEDGED_HIGH_COVERAGE,
+            AlertDefaults.ACKNOWLEDGED_HIGH_COVERAGE_ENABLED
+        )
+    }
+
+    fun saveAcknowledgedHighCoverageEnabled(enabled: Boolean) {
+        prefs.edit {
+            putBoolean(KEY_ACKNOWLEDGED_HIGH_COVERAGE, enabled)
+        }
+    }
+
+    private fun sanitizeSameDirectionSuppressionMinutes(minutes: Int): Int {
+        return minutes.coerceIn(0, AlertDefaults.SAME_DIRECTION_SUPPRESSION_MAX_MINUTES)
+    }
+
+    /** After a full-screen alarm is dismissed or snoozed, return to the app that was open (default) instead of opening JugglucoNG. */
+    fun loadReturnToPreviousAppAfterAlarm(): Boolean {
+        return prefs.getBoolean(KEY_RETURN_TO_PREVIOUS_APP_AFTER_ALARM, true)
+    }
+
+    fun saveReturnToPreviousAppAfterAlarm(enabled: Boolean) {
+        prefs.edit {
+            putBoolean(KEY_RETURN_TO_PREVIOUS_APP_AFTER_ALARM, enabled)
+        }
     }
     
     /**
@@ -135,8 +325,7 @@ object AlertRepository {
     private fun legacyDurationMinutesFallback(type: AlertType, base: AlertConfig): Int? {
         return when (type) {
             AlertType.LOSS -> {
-                val nativeSeconds = Natives.readalarmduration(type.id)
-                val nativeMinutes = if (nativeSeconds > 0) (nativeSeconds + 59) / 60 else 0
+                val nativeMinutes = readNativeLossWaitMinutes()
                 nativeMinutes.takeIf { it > 0 } ?: base.durationMinutes
             }
             else -> base.durationMinutes
@@ -144,9 +333,18 @@ object AlertRepository {
     }
 
     private fun applyLegacyOverrides(type: AlertType, base: AlertConfig): AlertConfig {
+        val durationKey = keyDuration(type)
+        val durationFromPrefs = if (prefs.contains(durationKey)) {
+            prefs.getInt(durationKey, 0).takeIf { it > 0 }
+        } else {
+            null
+        }
+        val durationMinutes = durationFromPrefs ?: legacyDurationMinutesFallback(type, base)
+        if (type == AlertType.LOSS && durationFromPrefs != null) {
+            writeNativeLossWaitMinutes(durationFromPrefs)
+        }
         return base.copy(
-            durationMinutes = prefs.getInt(keyDuration(type), legacyDurationMinutesFallback(type, base) ?: 0)
-                .takeIf { it > 0 },
+            durationMinutes = durationMinutes,
             forecastMinutes = prefs.getInt(keyForecast(type), base.forecastMinutes ?: 0)
                 .takeIf { it > 0 },
             deliveryMode = parseEnumPref(prefs.getString(keyDeliveryMode(type), null), base.deliveryMode),
@@ -166,8 +364,33 @@ object AlertRepository {
             activeEndMinute = prefs.getInt(keyActiveEndMinute(type), -1).takeIf { it >= 0 },
             retryEnabled = prefs.getBoolean(keyRetryEnabled(type), false),
             retryIntervalMinutes = prefs.getInt(keyRetryInterval(type), 5),
-            retryCount = prefs.getInt(keyRetryCount(type), 3)
+            retryCount = prefs.getInt(keyRetryCount(type), 3),
+            soundDelayEnabled = prefs.getBoolean(keySoundDelayEnabled(type), false),
+            soundDelaySeconds = readSoundDelaySeconds(type),
+            rearmMargin = readRearmMargin(type, base.rearmMargin),
+            rearmMinIntervalMinutes = readRearmMinInterval(type, base.rearmMinIntervalMinutes),
+            iobCoverageFactor = readIobCoverage(type, base.iobCoverageFactor),
+            // HIGH is a native-backed type and so loads through here, not through
+            // loadFromPrefs. The setting has no native counterpart, so without this
+            // read it is written on save and dropped on every restart.
+            fallRateSuppress = readFallRateSuppress(type, base.fallRateSuppress)
         )
+    }
+
+    private fun readNativeLossWaitMinutes(): Int {
+        cachedNativeLossWaitMinutes?.let { return it }
+        return Natives.readalarmsuspension(AlertType.LOSS.id).toInt().also {
+            cachedNativeLossWaitMinutes = it
+        }
+    }
+
+    private fun writeNativeLossWaitMinutes(durationMinutes: Int) {
+        val waitMinutes = durationMinutes.coerceIn(1, Short.MAX_VALUE.toInt())
+        if (cachedNativeLossWaitMinutes == waitMinutes) {
+            return
+        }
+        Natives.writealarmsuspension(AlertType.LOSS.id, waitMinutes.toShort())
+        cachedNativeLossWaitMinutes = waitMinutes
     }
     
     /**
@@ -200,10 +423,24 @@ object AlertRepository {
             activeEndMinute = prefs.getInt(keyActiveEndMinute(type), -1).takeIf { it >= 0 },
             retryEnabled = prefs.getBoolean(keyRetryEnabled(type), false),
             retryIntervalMinutes = prefs.getInt(keyRetryInterval(type), 5),
-            retryCount = prefs.getInt(keyRetryCount(type), 3)
+            retryCount = prefs.getInt(keyRetryCount(type), 3),
+            deltaThreshold = prefs.getFloat(keyDeltaThreshold(type), default.deltaThreshold ?: 0f).takeIf { it > 0 },
+            deltaCount = prefs.getInt(keyDeltaCount(type), default.deltaCount ?: 0).takeIf { it > 0 },
+            deltaBorder = prefs.getFloat(keyDeltaBorder(type), default.deltaBorder ?: 0f).takeIf { it > 0 },
+            // Missing/0 = follow the Δ readout's global interval.
+            deltaIntervalMinutes = prefs.getInt(keyDeltaInterval(type), 0).takeIf { it > 0 }
+                ?.let { GlucoseDelta.sanitizeIntervalMinutes(it) },
+            earlyTriggerEnabled = prefs.getBoolean(keyEarlyTrigger(type), false),
+            soundDelayEnabled = prefs.getBoolean(keySoundDelayEnabled(type), false),
+            soundDelaySeconds = readSoundDelaySeconds(type),
+            expiryWarningMinutes = readExpiryWarnings(type, default.expiryWarningMinutes),
+            rearmMargin = readRearmMargin(type, default.rearmMargin),
+            rearmMinIntervalMinutes = readRearmMinInterval(type, default.rearmMinIntervalMinutes),
+            iobCoverageFactor = readIobCoverage(type, default.iobCoverageFactor),
+            fallRateSuppress = readFallRateSuppress(type, default.fallRateSuppress)
         )
     }
-    
+
     /**
      * Save configuration for an alert type.
      * For legacy types, writes to both SharedPreferences and Natives.
@@ -218,9 +455,18 @@ object AlertRepository {
         
         // Sync native alarm settings for legacy types
         syncNativeAlarmSettings(config)
+
+        // Both devices raise alerts, so an enable that only lands on one of
+        // them leaves the pair firing different sets. The phone reports the
+        // change; on the watch this is a no-op, since a watch-side change has
+        // already gone through the phone to get here.
+        runCatching { tk.glucodata.WearToggleSync.push() }
     }
     
     private fun saveToPrefs(config: AlertConfig) {
+        if (config.type == AlertType.SENSOR_EXPIRY) {
+            adoptOpenWindowsForNewExpiryThresholds(config)
+        }
         prefs.edit {
             putBoolean(keyEnabled(config.type), config.enabled)
             if (config.threshold != null) putFloat(keyThreshold(config.type), config.threshold) else remove(keyThreshold(config.type))
@@ -248,6 +494,24 @@ object AlertRepository {
             putBoolean(keyRetryEnabled(config.type), config.retryEnabled)
             putInt(keyRetryInterval(config.type), config.retryIntervalMinutes)
             putInt(keyRetryCount(config.type), config.retryCount)
+            if (config.deltaThreshold != null) putFloat(keyDeltaThreshold(config.type), config.deltaThreshold) else remove(keyDeltaThreshold(config.type))
+            if (config.deltaCount != null) putInt(keyDeltaCount(config.type), config.deltaCount) else remove(keyDeltaCount(config.type))
+            if (config.deltaBorder != null) putFloat(keyDeltaBorder(config.type), config.deltaBorder) else remove(keyDeltaBorder(config.type))
+            if (config.deltaIntervalMinutes != null) putInt(keyDeltaInterval(config.type), config.deltaIntervalMinutes) else remove(keyDeltaInterval(config.type))
+            putBoolean(keyEarlyTrigger(config.type), config.earlyTriggerEnabled)
+            putBoolean(keySoundDelayEnabled(config.type), config.soundDelayEnabled)
+            putInt(keySoundDelaySeconds(config.type), sanitizeSoundDelaySeconds(config.type, config.soundDelaySeconds))
+            if (config.rearmMargin != null) putFloat(keyRearmMargin(config.type), config.rearmMargin.coerceAtLeast(0f)) else remove(keyRearmMargin(config.type))
+            if (config.rearmMinIntervalMinutes != null) putInt(keyRearmMinInterval(config.type), config.rearmMinIntervalMinutes.coerceAtLeast(0)) else remove(keyRearmMinInterval(config.type))
+            if (config.iobCoverageFactor != null) putFloat(keyIobCoverage(config.type), config.iobCoverageFactor.coerceAtLeast(0f)) else remove(keyIobCoverage(config.type))
+            if (config.fallRateSuppress != null) putFloat(keyFallRateSuppress(config.type), config.fallRateSuppress.coerceAtLeast(0f)) else remove(keyFallRateSuppress(config.type))
+            // Type-specific: only the sensor-expiry alert carries pre-warnings.
+            if (config.type == AlertType.SENSOR_EXPIRY) {
+                putStringSet(
+                    keyExpiryWarnings(config.type),
+                    sanitizeExpiryWarningMinutes(config.expiryWarningMinutes).map { it.toString() }.toSet()
+                )
+            }
         }
     }
     
@@ -263,18 +527,13 @@ object AlertRepository {
                 config.enabled
             )
 
-            // Sync extra settings (DND, Duration, Sound) which are still per-ID in Natives
+            // Sync extra settings (DND, duration, sound) which are still per-ID in Natives
             Natives.setalarmdisturb(typeId, config.overrideDND)
 
-            // For LOSS (Type 4), 'alarmDuration' in Natives likely controls the Timeout (time until alarm),
-            // not the sound duration. So we sync the durationMinutes (converted to seconds).
-            // For others, it controls Sound Duration.
-            val durationValue = if (config.type == AlertType.LOSS) {
-                (config.durationMinutes ?: 30) * 60
-            } else {
-                sanitizeAlertDurationSeconds(config.alarmDurationSeconds)
+            if (config.type == AlertType.LOSS) {
+                writeNativeLossWaitMinutes(config.durationMinutes ?: AlertDefaults.MISSED_READING_MINUTES)
             }
-            Natives.writealarmduration(typeId, durationValue)
+            Natives.writealarmduration(typeId, sanitizeAlertDurationSeconds(config.alarmDurationSeconds))
             
             Natives.writering(
                 typeId,
@@ -283,6 +542,9 @@ object AlertRepository {
                 config.flashEnabled,
                 config.vibrationEnabled
             );
+            if (config.type == AlertType.LOSS && config.enabled) {
+                SuperGattCallback.glucosealarms?.setLossAlarm()
+            }
         } else if (typeId == AlertType.VERY_LOW.id || typeId == AlertType.VERY_HIGH.id ||
             typeId == AlertType.PRE_LOW.id || typeId == AlertType.PRE_HIGH.id) {
             Natives.setAlertConfig(

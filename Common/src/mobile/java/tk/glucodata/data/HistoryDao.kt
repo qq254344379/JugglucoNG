@@ -21,7 +21,18 @@ interface HistoryDao {
     suspend fun insertAll(readings: List<HistoryReading>)
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAllIgnoring(readings: List<HistoryReading>): List<Long>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertDeletedReadings(readings: List<DeletedHistoryReading>)
+
+    @Query("SELECT * FROM history_deleted_readings WHERE deletedAt >= :startTime ORDER BY deletedAt ASC")
+    suspend fun getDeletedReadingsSince(startTime: Long): List<DeletedHistoryReading>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertDeletedReadingsForRecovery(
+        readings: List<DeletedHistoryReading>,
+    ): List<Long>
 
     // ── Per-sensor queries (used for dashboard, chart, current reading) ──
 
@@ -36,6 +47,25 @@ interface HistoryDao {
 
     @Query("SELECT * FROM history_readings WHERE sensorSerial IN (:serials) AND timestamp >= :startTime ORDER BY timestamp ASC")
     suspend fun getReadingsSinceForSensors(serials: List<String>, startTime: Long): List<HistoryReading>
+
+    @Query("""
+        SELECT * FROM history_readings
+        WHERE sensorSerial = :sensorSerial
+          AND timestamp >= :startTimeInclusive
+          AND timestamp < :endTimeExclusive
+        ORDER BY timestamp ASC
+    """)
+    suspend fun getSensorReadingsInTimeRange(
+        sensorSerial: String,
+        startTimeInclusive: Long,
+        endTimeExclusive: Long
+    ): List<HistoryReading>
+
+    @Query("SELECT * FROM history_readings WHERE sensorSerial = :sensorSerial AND timestamp IN (:timestamps)")
+    suspend fun getSensorReadingsAtTimestamps(
+        sensorSerial: String,
+        timestamps: List<Long>
+    ): List<HistoryReading>
 
     @Query("""
         SELECT timestamp FROM history_readings
@@ -78,9 +108,56 @@ interface HistoryDao {
 
     @Query("SELECT * FROM history_readings WHERE timestamp >= :startTime ORDER BY timestamp ASC")
     fun getHistoryFlow(startTime: Long): Flow<List<HistoryReading>>
+
+    // ── Windowed timeline (the chart, the history and journal screens) ──
+
+    @Query("""
+        SELECT * FROM history_readings
+        WHERE timestamp >= :startTime
+          AND timestamp <= :endTime
+        ORDER BY timestamp ASC
+    """)
+    fun getReadingsBetweenFlow(startTime: Long, endTime: Long): Flow<List<HistoryReading>>
+
+    /** The whole table in four numbers; see [HistoryTimestampIndexTracker]. */
+    @Query("""
+        SELECT COUNT(*) AS rowCount, MAX(id) AS maxId,
+               MIN(timestamp) AS minTimestamp, MAX(timestamp) AS maxTimestamp
+        FROM history_readings
+    """)
+    suspend fun getTableFingerprint(): HistoryTableFingerprint
+
+    @Query("""
+        SELECT COUNT(*) AS rowCount, MAX(id) AS maxId,
+               MIN(timestamp) AS minTimestamp, MAX(timestamp) AS maxTimestamp
+        FROM history_readings
+    """)
+    fun getTableFingerprintFlow(): Flow<HistoryTableFingerprint>
+
+    @Query("SELECT id, timestamp, sensorSerial FROM history_readings WHERE id > :afterId ORDER BY id ASC")
+    suspend fun getIndexRowsAfter(afterId: Long): List<HistoryIndexRow>
+
+    @Query("SELECT id, timestamp, sensorSerial FROM history_readings WHERE timestamp >= :startTime AND timestamp <= :endTime ORDER BY timestamp ASC")
+    suspend fun getIndexRowsBetween(startTime: Long, endTime: Long): List<HistoryIndexRow>
+
+    @Query("""
+        SELECT timestamp FROM history_readings
+        WHERE sensorSerial = :serial AND timestamp > :afterTimestamp
+        ORDER BY timestamp ASC
+        LIMIT :limit
+    """)
+    suspend fun getTimestampsForSensorPage(serial: String, afterTimestamp: Long, limit: Int): List<Long>
     
     @Query("SELECT * FROM history_readings WHERE timestamp >= :startTime ORDER BY timestamp ASC")
     suspend fun getReadingsSince(startTime: Long): List<HistoryReading>
+
+    @Query("""
+        SELECT * FROM history_readings
+        WHERE timestamp >= :startTime
+          AND timestamp <= :endTime
+        ORDER BY timestamp ASC
+    """)
+    suspend fun getReadingsBetween(startTime: Long, endTime: Long): List<HistoryReading>
     
     @Query("SELECT * FROM history_readings ORDER BY timestamp DESC LIMIT 1")
     suspend fun getLatestReading(): HistoryReading?
@@ -97,16 +174,61 @@ interface HistoryDao {
     @Query("SELECT DISTINCT sensorSerial FROM history_readings")
     suspend fun getAllSensorSerials(): List<String>
 
+    @Query(
+        """
+        SELECT * FROM history_readings
+        WHERE id > :afterId
+          AND NOT EXISTS (
+              SELECT 1 FROM history_deleted_readings deleted
+              WHERE deleted.sensorSerial = history_readings.sensorSerial
+                AND deleted.timestamp = history_readings.timestamp
+          )
+        ORDER BY id ASC
+        LIMIT :limit
+        """
+    )
+    suspend fun getRecoveryReadingsPage(afterId: Long, limit: Int): List<HistoryReading>
+
+    @Query(
+        """
+        SELECT * FROM history_deleted_readings
+        WHERE deletedAt > :afterDeletedAt
+           OR (deletedAt = :afterDeletedAt AND timestamp > :afterTimestamp)
+           OR (deletedAt = :afterDeletedAt AND timestamp = :afterTimestamp
+               AND sensorSerial > :afterSensorSerial)
+        ORDER BY deletedAt ASC, timestamp ASC, sensorSerial ASC
+        LIMIT :limit
+        """
+    )
+    suspend fun getRecoveryDeletedReadingsPage(
+        afterDeletedAt: Long,
+        afterTimestamp: Long,
+        afterSensorSerial: String,
+        limit: Int,
+    ): List<DeletedHistoryReading>
+
     // ── Cleanup queries ──
 
     @Query("DELETE FROM history_readings WHERE sensorSerial = :serial")
     suspend fun deleteForSensor(serial: String)
+
+    @Query("DELETE FROM history_readings")
+    suspend fun deleteAllReadings()
+
+    @Query("DELETE FROM history_deleted_readings")
+    suspend fun deleteAllDeletedReadings()
 
     @Query("""
         DELETE FROM history_readings
         WHERE sensorSerial IN (:serials) AND timestamp = :timestamp
     """)
     suspend fun deleteReadingsAtTimestamp(serials: List<String>, timestamp: Long): Int
+
+    @Query("""
+        DELETE FROM history_readings
+        WHERE sensorSerial IN (:serials) AND timestamp > :timestampExclusive
+    """)
+    suspend fun deleteReadingsForSensorsAfter(serials: List<String>, timestampExclusive: Long): Int
 
     @Query("""
         SELECT COUNT(*) FROM history_deleted_readings
@@ -123,19 +245,24 @@ interface HistoryDao {
         timestamps: List<Long>
     ): List<Long>
 
-    @Query("""
-        UPDATE history_readings
-        SET value = :value
-        WHERE sensorSerial = :sensorSerial AND timestamp = :timestamp
-    """)
-    suspend fun updateValueAtTime(sensorSerial: String, timestamp: Long, value: Float): Int
+    @Query(
+        """
+        SELECT DISTINCT (timestamp / 60000) * 60000 FROM history_readings
+        WHERE sensorSerial = :sensorSerial
+          AND (timestamp / 60000) * 60000 IN (:minuteTimestamps)
+        """
+    )
+    suspend fun getExistingMinuteTimestampsForSensor(
+        sensorSerial: String,
+        minuteTimestamps: List<Long>,
+    ): List<Long>
 
-    @Query("""
-        UPDATE history_readings
-        SET rawValue = :rawValue
-        WHERE sensorSerial = :sensorSerial AND timestamp = :timestamp
-    """)
-    suspend fun updateRawValueAtTime(sensorSerial: String, timestamp: Long, rawValue: Float): Int
+    // Deliberately absent: there is no query here that overwrites a stored
+    // reading's `value` or `rawValue`. Those are what the sensor measured, and
+    // the one caller that used to rewrite them — the calibration pass — is what
+    // corrupted stores, because it fed on its own output. What a reading
+    // *displays* is recorded in `reading_display` instead. If you find yourself
+    // wanting an UPDATE here, you almost certainly want ReadingDisplayDao.
 
     @Query("""
         UPDATE history_readings SET sensorSerial = :newSerial 
@@ -146,13 +273,12 @@ interface HistoryDao {
     @Query("""
         DELETE FROM history_readings
         WHERE sensorSerial = :sensorSerial
-          AND (timestamp / :bucketDurationMs) IN (:bucketIds)
-          AND timestamp NOT IN (:protectedTimestamps)
+          AND timestamp >= :startTimeInclusive
+          AND timestamp < :endTimeExclusive
     """)
-    suspend fun deleteConflictingSensorRowsForBuckets(
+    suspend fun deleteSensorRowsInTimeRange(
         sensorSerial: String,
-        bucketDurationMs: Long,
-        bucketIds: List<Long>,
-        protectedTimestamps: List<Long>
+        startTimeInclusive: Long,
+        endTimeExclusive: Long
     ): Int
 }

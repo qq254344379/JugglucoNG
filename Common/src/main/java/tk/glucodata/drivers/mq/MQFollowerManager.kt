@@ -1,5 +1,6 @@
 package tk.glucodata.drivers.mq
 
+import tk.glucodata.drivers.ManagedSensorUiFamily
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
@@ -7,6 +8,7 @@ import android.os.HandlerThread
 import java.util.Locale
 import kotlin.math.abs
 import tk.glucodata.Applic
+import tk.glucodata.GlucoseReadingSource
 import tk.glucodata.HistorySyncAccess
 import tk.glucodata.Log
 import tk.glucodata.R
@@ -459,6 +461,9 @@ class MQFollowerManager(
                 )
             },
             logLabel = "MQ follower",
+            mirrorToNative = true,
+            source = GlucoseReadingSource.MQ_FOLLOWER,
+            nativeFamily = ManagedSensorUiFamily.MQ,
         )
         if (tailMs > 0L) {
             lastImportedHistoryTailMs = tailMs
@@ -504,6 +509,9 @@ class MQFollowerManager(
                 ),
                 sensorGen = MQBleManager.SENSOR_GEN,
                 logLabel = "MQ follower",
+                mirrorToNative = true,
+                source = GlucoseReadingSource.MQ_FOLLOWER,
+                nativeFamily = ManagedSensorUiFamily.MQ,
             )
         } else if (previousTimeMs > 0L && latest.timestampMs == previousTimeMs && previousMgdl != latest.glucoseMgdl) {
             UiRefreshBus.requestDataRefresh()

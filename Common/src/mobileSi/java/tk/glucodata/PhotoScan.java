@@ -47,9 +47,14 @@ import java.util.regex.Pattern;
 public class PhotoScan {
     private static final String LOG_ID = "PhotoScan";
     private static final String GROUP_SEPARATOR = "\u001D";
+    private static final char GROUP_SEPARATOR_CHAR = '\u001D';
     private static final String SIBIONICS_GTIN = "0697283164";
     private static final String SIBIONICS_GTIN_NO_LEADING_ZERO = "697283164";
     private static final int SIBIONICS_PREFIX_PADDING = 43;
+    private static final String ACCUCHEK_MANUFACTURER = "4015630";
+    private static final Pattern ACCUCHEK_GS1_COMPACT = Pattern.compile(
+            "^01([0-9]{14})11[0-9]{6}17[0-9]{6}21[A-Z0-9]{11}$",
+            Pattern.CASE_INSENSITIVE);
     private static final Pattern AI10_PAREN = Pattern.compile("\\(10\\)\\s*([A-Z0-9]{4,40})",
             Pattern.CASE_INSENSITIVE);
     private static final Pattern AI21_PAREN = Pattern.compile("\\(21\\)\\s*([A-Z0-9]{4,40})",
@@ -65,7 +70,7 @@ public class PhotoScan {
             Pattern.CASE_INSENSITIVE);
 
     private static void wrongtag() {
-        Toaster("Wrong QR code");
+        Toaster(R.string.wrongcode);
     }
 
     /*
@@ -195,8 +200,113 @@ public class PhotoScan {
 
     static long wasdataptr = 0L;
 
+    public static String trimOuterScannerWhitespace(String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        int start = 0;
+        int end = value.length();
+        while (start < end && isTrimmableScannerEdge(value.charAt(start))) {
+            start++;
+        }
+        while (end > start && isTrimmableScannerEdge(value.charAt(end - 1))) {
+            end--;
+        }
+        return start == 0 && end == value.length() ? value : value.substring(start, end);
+    }
+
+    private static boolean isTrimmableScannerEdge(char ch) {
+        return ch != GROUP_SEPARATOR_CHAR && (Character.isWhitespace(ch) || Character.isSpaceChar(ch));
+    }
+
     private static boolean isLikelyMirrorPayload(String text) {
         return text.endsWith("MirrorJuggluco") || text.contains("\"port\"");
+    }
+
+    // CareSens Air: optional i-SENS GTIN plus four AIs whose lengths
+    // upstream Juggluco requires exactly. AI 21, 240 and 250 are variable length in GS1,
+    // so decoders that drop the GS separators are handled by these lengths.
+    private static final String CARESENS_AIR_COMPANY = "8806712";
+    private static final String[] CARESENS_AIR_AIS = {"01", "17", "21", "240", "250"};
+    private static final int[] CARESENS_AIR_LENGTHS = {14, 6, 12, 6, 16};
+
+    /**
+     * The canonical form native expects for a CareSens Air code — GS 01 gtin 17 expiry
+     * 21 serial GS 240 pin GS 250 code, the layout of careSenseAirScan_t — or null when
+     * the payload is not one.
+     */
+    static String buildCareSensAirPayload(String input) {
+        if (input == null) {
+            return null;
+        }
+        String text = stripSymbologyPrefix(input.replace(" ", "")).replace("^]", GROUP_SEPARATOR);
+        final String[] values = new String[CARESENS_AIR_AIS.length];
+        int pos = 0;
+        while (pos < text.length()) {
+            if (text.charAt(pos) == GROUP_SEPARATOR_CHAR) {
+                pos++;
+                continue;
+            }
+            int field = -1;
+            for (int i = 0; i < CARESENS_AIR_AIS.length; i++) {
+                if (text.startsWith(CARESENS_AIR_AIS[i], pos)) {
+                    field = i;
+                    break;
+                }
+            }
+            if (field < 0 || values[field] != null) {
+                return null;
+            }
+            pos += CARESENS_AIR_AIS[field].length();
+            final int length = CARESENS_AIR_LENGTHS[field];
+            int end = text.indexOf(GROUP_SEPARATOR_CHAR, pos);
+            if (end < 0) {
+                end = text.length();
+            }
+            if (end - pos < length) {
+                return null;
+            }
+            // Longer than the field means the separator after it was dropped.
+            values[field] = text.substring(pos, pos + length);
+            pos += length;
+        }
+        // Upstream also accepts the 53-byte form containing only AIs 17/21/240/250.
+        for (int i = 1; i < values.length; i++) {
+            if (values[i] == null) {
+                return null;
+            }
+        }
+        final String gtin = values[0];
+        if ((gtin != null && (!gtin.substring(1, 8).equals(CARESENS_AIR_COMPANY) || !isDigits(gtin)))
+                || !isDigits(values[1])
+                || !isPrintable(values[2]) || !isPrintable(values[3]) || !isPrintable(values[4])) {
+            return null;
+        }
+        // Keep the persisted record and PIN offset unchanged. Zeros only pad the
+        // absent GTIN; identity still comes from expiry + serial, as upstream.
+        return GROUP_SEPARATOR + "01" + (gtin != null ? gtin : "00000000000000")
+                + "17" + values[1] + "21" + values[2]
+                + GROUP_SEPARATOR + "240" + values[3] + GROUP_SEPARATOR + "250" + values[4];
+    }
+
+    private static boolean isDigits(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            final char c = value.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isPrintable(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            final char c = value.charAt(i);
+            if (c <= ' ' || c > '~') {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String sanitizeAlnumUpper(String value) {
@@ -346,6 +456,29 @@ public class PhotoScan {
         String out = input.toUpperCase(Locale.ROOT).replace(" ", "");
         out = stripSymbologyPrefix(out);
         return out.replace("^]", GROUP_SEPARATOR);
+    }
+
+    private static String normalizeAccuChekFraming(String input) {
+        if (input == null || input.isEmpty() || isLikelyMirrorPayload(input)) {
+            return input;
+        }
+        String out = stripSymbologyPrefix(input.toUpperCase(Locale.ROOT).replace(" ", ""));
+        if (out == null || out.isEmpty()) {
+            return input;
+        }
+        if (out.startsWith(GROUP_SEPARATOR)) {
+            return out;
+        }
+        Matcher matcher = ACCUCHEK_GS1_COMPACT.matcher(out);
+        if (!matcher.matches()) {
+            return input;
+        }
+        final String gtin = matcher.group(1);
+        if (gtin != null && gtin.contains(ACCUCHEK_MANUFACTURER)) {
+            scanLog("Restored leading GS separator for Accu-Chek SmartGuide QR payload");
+            return GROUP_SEPARATOR + out;
+        }
+        return input;
     }
 
     private static String repairSibionicsPackageAi21Framing(String input) {
@@ -581,11 +714,59 @@ public class PhotoScan {
         return SIBIONICS_GTIN + "0".repeat(paddingLen) + namePart;
     }
 
+    private static String buildSibionicsSensorPayload(String input) {
+        if (input == null) {
+            return null;
+        }
+        final String trimmedInput = input.trim();
+        if (trimmedInput.length() < 3 || countChar(trimmedInput, '/') > 2) {
+            return null;
+        }
+        final String compactRaw = trimmedInput.replaceAll("\\s+", "");
+        final int gtinPos = compactRaw.indexOf(SIBIONICS_GTIN);
+        if (gtinPos >= 0 && gtinPos <= 4 && compactRaw.length() - gtinPos >= 55) {
+            return compactRaw;
+        }
+        final String codeToUse;
+        if (trimmedInput.contains("/")) {
+            final int slash = trimmedInput.lastIndexOf('/');
+            final String extracted = sanitizeAlnumUpper(trimmedInput.substring(slash + 1));
+            codeToUse = extracted.length() >= 3 ? extracted : sanitizeAlnumUpper(trimmedInput);
+        } else {
+            codeToUse = sanitizeAlnumUpper(trimmedInput);
+        }
+        if (codeToUse.isEmpty()) {
+            return null;
+        }
+        if (codeToUse.length() <= 11) {
+            final String shortName = (codeToUse.substring(Math.max(0, codeToUse.length() - 4)) + codeToUse);
+            final String paddedShort = (shortName + "00000000000").substring(0, 11);
+            final String syntheticName16 = "00000" + paddedShort;
+            final String suffix = "X";
+            final int desiredLen = 70;
+            final int prefixLen = desiredLen - syntheticName16.length() - suffix.length();
+            final int prefixPaddingLen = Math.max(0, prefixLen - SIBIONICS_GTIN.length());
+            return SIBIONICS_GTIN + "0".repeat(prefixPaddingLen) + syntheticName16 + suffix;
+        }
+        final int minPrefixLen = 53 - SIBIONICS_GTIN.length();
+        return SIBIONICS_GTIN + "0".repeat(Math.max(0, minPrefixLen)) + codeToUse;
+    }
+
+    private static int countChar(String value, char target) {
+        int count = 0;
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) == target) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     static String normalizeScanPayload(String scanText, int request) {
         if (scanText == null) {
             return "";
         }
-        final String trimmed = scanText.trim();
+        final String trimmed = trimOuterScannerWhitespace(scanText);
 
         if (request == REQUEST_BARCODE_SIB2) {
             final String transmitterPayload = buildSibionics2TransmitterPayload(trimmed);
@@ -596,7 +777,14 @@ public class PhotoScan {
             return trimmed;
         }
 
+        final String careSensAir = buildCareSensAirPayload(trimmed);
+        if (careSensAir != null) {
+            return careSensAir;
+        }
+
         String normalized = trimmed;
+
+        normalized = normalizeAccuChekFraming(normalized);
 
         if (looksLikeSibionicsPayload(normalized)) {
             normalized = normalizeSibionicsFraming(normalized);
@@ -626,6 +814,48 @@ public class PhotoScan {
             return delimited;
         }
         return normalized;
+    }
+
+    public static boolean applyManualPairingCode(Context context, String rawCode) {
+        final String normalizedTag = normalizeScanPayload(rawCode, REQUEST_BARCODE);
+        String name = parseSensorName(normalizedTag);
+        if (name == null || name.isEmpty()) {
+            final String fakeSibionics = buildSibionicsSensorPayload(rawCode);
+            if (fakeSibionics != null && !fakeSibionics.equals(normalizedTag)) {
+                name = parseSensorName(normalizeScanPayload(fakeSibionics, REQUEST_BARCODE));
+            }
+        }
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        return finishManualPairing(context, name);
+    }
+
+    private static String parseSensorName(String normalizedTag) {
+        if (normalizedTag == null || normalizedTag.isEmpty() || isLikelyMirrorPayload(normalizedTag)) {
+            return null;
+        }
+        int[] indexptr = { -1 };
+        String name = Natives.addSIscangetName(normalizedTag, indexptr);
+        if ((name == null || name.isEmpty()) && indexptr[0] < 0 && looksLikeSibionicsPayload(normalizedTag)) {
+            String canonical = buildCanonicalSibionicsPayload(normalizedTag);
+            if (canonical != null && !canonical.equals(normalizedTag)) {
+                int[] canonicalIndexptr = { -1 };
+                name = Natives.addSIscangetName(canonical, canonicalIndexptr);
+            }
+        }
+        return name;
+    }
+
+    private static boolean finishManualPairing(Context context, String name) {
+        if (Natives.getusebluetooth()) {
+            Applic.updateDevices();
+            SuperGattCallback.glucosealarms.setLossAlarm();
+        } else {
+            Natives.updateUsedSensors();
+        }
+        Applic.wakemirrors();
+        return true;
     }
 
     public static void connectSensor(final String scantag, MainActivity act, int request, long sensorptr2) {

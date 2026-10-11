@@ -48,7 +48,18 @@ import tk.glucodata.R
 import java.lang.Math.min
 
 class IconValueDataSourceService: SuspendingComplicationDataSourceService()  {
-private var glview: GlucoseValue? =null
+    /** The number, drawn with the app's palette rather than the legacy colours. */
+    private fun valueBitmap(text: String, timeMillis: Long): android.graphics.Bitmap {
+        val isMmol = ComplicationRenderer.isMmol()
+        val value = GlucoseComplicationData.currentReading()?.value ?: Float.NaN
+        // ICON slots are tinted by the face, so the mask is drawn white; the
+        // SHORT_TEXT and RANGED_VALUE forms carry the value as text instead.
+        return ComplicationRenderer.valueBitmap(
+            256, text, value, isMmol, ComplicationRenderer.ICON_TINT,
+        )
+    }
+
+private var glview: WearComplicationValue? =null
 
     override fun onComplicationActivated( complicationInstanceId: Int, type: ComplicationType) {
         Log.d(LOG_ID, "onComplicationActivated(): $complicationInstanceId")
@@ -56,54 +67,77 @@ private var glview: GlucoseValue? =null
     override fun onComplicationDeactivated(complicationInstanceId: Int) {
         Log.d(LOG_ID, "onComplicationDeactivated(): $complicationInstanceId")
     }
-fun getview(type: ComplicationType):GlucoseValue {
+fun getview(type: ComplicationType):WearComplicationValue {
      if(glview==null) {
         val width:Int = 150
         val height:Int = 150
-         glview= GlucoseValue(width,height)
+         glview= WearComplicationValue(width,height)
          }
-      return glview as GlucoseValue;
+      return glview as WearComplicationValue;
       }
     override fun getPreviewData(type: ComplicationType): ComplicationData {
-        val value: String
-        val time: Long
-        val index: Int
-        val glucose = CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout)
+        val reading = GlucoseComplicationData.previewReading()
+        val tapAction = GlucoseComplicationData.tapAction()
         val now = System.currentTimeMillis()
-        if (glucose != null&&(now-glucose.timeMillis)<tk.glucodata.Notify.glucosetimeout) {
-            time = glucose.timeMillis
-            value = glucose.primaryStr
-            index = glucose.index
-        } else {
-            value = if (Applic.unit == 1) "5.6" else "101"
-	        time=now
-            index = 0
+        return when (type) {
+            MONOCHROMATIC_IMAGE -> {
+                MonochromaticImageComplicationData.Builder(
+                    MonochromaticImage.Builder(
+                        Icon.createWithBitmap(
+                            valueBitmap(reading.text, reading.timeMillis),
+                        ),
+                    ).build(),
+                    contentDescription = PlainComplicationText.Builder(text = "Glucose Value").build(),
+                )
+                    .setTapAction(tapAction)
+                    .build()
+            }
+            SHORT_TEXT -> GlucoseComplicationData.shortValueData(
+                reading,
+                "Glucose Value",
+                tapAction,
+            )
+            RANGED_VALUE -> GlucoseComplicationData.rangedValueData(
+                reading,
+                "Glucose Value",
+                tapAction,
+            )
+            else -> GlucoseComplicationData.shortValueData(null, "Glucose Value", tapAction)
         }
-        return MonochromaticImageComplicationData.Builder(
-             MonochromaticImage.Builder( Icon.createWithBitmap(getview(type).getNumberBitmap(value,time,-1,now))).build(),
-            contentDescription = PlainComplicationText.Builder(text = "Glucose Value").build() )
-            .setTapAction(null)
-            .build()
     }
 
     override suspend fun onComplicationRequest(request: ComplicationRequest): ComplicationData? {
         Log.d(LOG_ID, "onComplicationRequest() id: ${request.complicationInstanceId}")
         val type=        request.complicationType
+        val glucose = GlucoseComplicationData.currentReading()
     if(type== MONOCHROMATIC_IMAGE) {
-            val glucose = CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout)
             val now = System.currentTimeMillis()
             val bitmap= if(glucose==null ||(now-glucose.timeMillis)>=tk.glucodata.Notify.glucosetimeout){
                   Log.i(LOG_ID,"MonochromaticImage novalue")
                  getview(type).getnovalue()
                  } else {
-                     Log.i(LOG_ID,"MonochromaticImage ${glucose.primaryStr}")
-                    getview(type).getNumberBitmap(glucose.primaryStr,glucose.timeMillis,glucose.index,now)
+                     Log.i(LOG_ID,"MonochromaticImage ${glucose.text}")
+                    valueBitmap(glucose.text, glucose.timeMillis)
                      }
              val image=Icon.createWithBitmap(bitmap)
-             val complicationPendingIntent = Notify.mkpending()
+             val complicationPendingIntent = GlucoseComplicationData.tapAction()
             return MonochromaticImageComplicationData.Builder(
                     MonochromaticImage.Builder(image).build(), contentDescription = PlainComplicationText.Builder("Glucose Value").build()).setTapAction(complicationPendingIntent).build()
             } 
+    else if (type == SHORT_TEXT) {
+            return GlucoseComplicationData.shortValueData(
+                glucose,
+                "Glucose Value",
+                GlucoseComplicationData.tapAction(),
+            )
+            }
+    else if (type == RANGED_VALUE) {
+            return GlucoseComplicationData.rangedValueData(
+                glucose,
+                "Glucose Value",
+                GlucoseComplicationData.tapAction(),
+            )
+            }
     else {
                 Log.w(LOG_ID, "Unexpected complication type ${request.complicationType}")
                 return null

@@ -1,7 +1,9 @@
 package tk.glucodata.ui.calibration
 
+import tk.glucodata.ui.StatusPalette
 import android.os.Build
 import android.view.HapticFeedbackConstants
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -61,10 +63,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tk.glucodata.GlucosePoint
 import tk.glucodata.R
+import tk.glucodata.SensorIdentity
 import tk.glucodata.data.HistoryRepository
 import tk.glucodata.data.calibration.CalibrationEntity
 import tk.glucodata.data.calibration.CalibrationManager
 import tk.glucodata.logic.TrendEngine
+import tk.glucodata.ui.components.CompactSheetDragHandle
+import tk.glucodata.ui.components.StableModalBottomSheet
 import tk.glucodata.ui.theme.displayLargeExpressive
 import java.text.SimpleDateFormat
 import java.util.*
@@ -80,7 +85,10 @@ fun CalibrationBottomSheet(
     glucoseHistory: List<GlucosePoint>,
     isMmol: Boolean = true,
     viewMode: Int = 0,
-    onNavigateToHistory: () -> Unit
+    sensorId: String,
+    onNavigateToHistory: () -> Unit,
+    /** Where the sheet is now set to, so the owner of [glucoseHistory] can load around it. */
+    onSelectedTimestampChanged: ((Long) -> Unit)? = null
 ) {
     val view = LocalView.current
     val context = LocalContext.current
@@ -93,8 +101,11 @@ fun CalibrationBottomSheet(
 
     // State
     var editingEntity by remember { mutableStateOf<CalibrationEntity?>(null) }
-    val currentSensor = tk.glucodata.Natives.lastsensorname() ?: ""
+    val currentSensor = SensorIdentity.resolveAppSensorId(sensorId) ?: sensorId
     var selectedTimestamp by remember { mutableLongStateOf(initialTimestamp) }
+    LaunchedEffect(selectedTimestamp, onSelectedTimestampChanged) {
+        onSelectedTimestampChanged?.invoke(selectedTimestamp)
+    }
 
     val nearestHistoryPoint = remember(selectedTimestamp, glucoseHistory) {
         glucoseHistory.minByOrNull { abs(it.timestamp - selectedTimestamp) }
@@ -128,17 +139,6 @@ fun CalibrationBottomSheet(
         else -> selectedAutoValue.takeIf { it > 0f } ?: selectedRawValue.takeIf { it > 0f }
     } ?: initialValueAuto
 
-    fun triggerRewriteOverwrittenHistory(startTimestamp: Long = 0L) {
-        if (!CalibrationManager.shouldOverwriteSensorValues()) return
-        if (currentSensor.isBlank()) return
-        CoroutineScope(Dispatchers.IO).launch {
-            historyRepository.rewriteSensorValuesWithCalibration(
-                sensorSerial = currentSensor,
-                isRawMode = isRawMode,
-                startTimestamp = startTimestamp
-            )
-        }
-    }
 
     // Values
     val startValue = editingEntity?.userValue ?: defaultInputValue
@@ -172,11 +172,11 @@ fun CalibrationBottomSheet(
 
     // Data Flow
     val duplicateThresholdMs = 60_000L
-    val allCalibrations by CalibrationManager.getCalibrationsFlow()?.collectAsState(initial = emptyList())
+    val allCalibrations by CalibrationManager.getCalibrationsFlow()?.collectAsStateWithLifecycle(initialValue = emptyList())
         ?: remember { mutableStateOf(emptyList()) }
     val calibrations = allCalibrations
         .filter { it.isRawMode == isRawMode }
-        .filter { it.sensorId == currentSensor || it.sensorId.isEmpty() }
+        .filter { CalibrationManager.calibrationMatchesSensor(it.sensorId, currentSensor) }
         .sortedByDescending { it.timestamp }
 
     // --- SMART MODE SWITCHING LOGIC ---
@@ -223,10 +223,10 @@ fun CalibrationBottomSheet(
     // Time State
     var isTimeExpanded by remember { mutableStateOf(false) }
 
-    ModalBottomSheet(
+    StableModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        dragHandle = { BottomSheetDefaults.DragHandle() },
+        dragHandle = { CompactSheetDragHandle() },
         containerColor = MaterialTheme.colorScheme.surface,
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
     ) {
@@ -244,11 +244,11 @@ fun CalibrationBottomSheet(
             val headerMinHeight = if (isCompactSheet) 44.dp else 48.dp
             val headerBottomSpacing = if (isCompactSheet) 8.dp else 12.dp
             val timeCardPadding = if (isCompactSheet) 12.dp else 16.dp
-            val timeIconSpacing = if (isCompactSheet) 10.dp else 16.dp
+            val timeIconSpacing = if (isCompactSheet) 8.dp else 16.dp
             val timePickerBottomSpacing = if (isCompactSheet) 12.dp else 16.dp
             val heroBottomSpacing = if (isCompactSheet) 8.dp else 12.dp
-            val statusMinHeight = if (isCompactSheet) 30.dp else 32.dp
-            val actionsTopSpacing = if (isCompactSheet) 14.dp else 24.dp
+            val statusMinHeight = 32.dp
+            val actionsTopSpacing = if (isCompactSheet) 16.dp else 24.dp
             val actionsBottomSpacing = if (isCompactSheet) 12.dp else 24.dp
             val sheetBottomPadding = if (isCompactSheet) 16.dp else 12.dp
 
@@ -286,7 +286,6 @@ fun CalibrationBottomSheet(
                             onClick = {
                                 scope.launch {
                                     CalibrationManager.updateCalibration(editingEntity!!.copy(isEnabled = !editingEntity!!.isEnabled))
-                                    triggerRewriteOverwrittenHistory(editingEntity!!.timestamp)
                                 }
                             },
                             colors = IconButtonDefaults.iconButtonColors(
@@ -311,7 +310,6 @@ fun CalibrationBottomSheet(
                                      CalibrationManager.deleteCalibration(editingEntity!!)
                                      selectedTimestamp = System.currentTimeMillis()
                                      onDismiss()
-                                     triggerRewriteOverwrittenHistory(deletedTimestamp)
                                 }
                             },
                             colors = IconButtonDefaults.iconButtonColors(contentColor = MaterialTheme.colorScheme.error),
@@ -350,9 +348,7 @@ fun CalibrationBottomSheet(
 //                                Text("Time", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text(
                                     text = if (isNow) stringResource(R.string.now) else dateFormatter.format(Date(selectedTimestamp)),
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                    style = MaterialTheme.typography.titleMediumEmphasized,)
                             }
                         }
 
@@ -450,7 +446,7 @@ fun CalibrationBottomSheet(
 
             // --- BADGE ---
             val isStable = abs(trendResult.velocity) < 1.0
-            val statusColor = if (isStable) Color(0xFF4CAF50) else Color(0xFFFFB300)
+            val statusColor = if (isStable) StatusPalette.success() else StatusPalette.warning()
 
             Surface(
                 color = statusColor.copy(alpha = 0.1f),
@@ -468,15 +464,13 @@ fun CalibrationBottomSheet(
                     }
                     Icon(trendIcon, contentDescription = null, tint = statusColor, modifier = Modifier.size(16.dp))
 
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
 
                     val statusText = if (isStable) stringResource(R.string.conditions_optimal) else stringResource(R.string.wait_15m_unstable)
                     Text(
                         text = statusText,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = statusColor,
-                        fontWeight = FontWeight.Bold
-                    )
+                        style = MaterialTheme.typography.labelMediumEmphasized,
+                        color = statusColor,)
                 }
             }
             Spacer(modifier = Modifier.height(actionsTopSpacing))
@@ -511,11 +505,14 @@ fun CalibrationBottomSheet(
                                 CalibrationManager.updateCalibration(
                                     editingEntity!!.copy(
                                         userValue = userValue,
-                                        timestamp = selectedTimestamp
+                                        timestamp = selectedTimestamp,
+                                        // Correcting a journal-derived point makes it the
+                                        // user's own, or the next journal sync would put
+                                        // the entry's value straight back.
+                                        journalEntryId = null
                                     )
                                 )
                                 onDismiss()
-                                triggerRewriteOverwrittenHistory(minOf(previousTimestamp, selectedTimestamp))
                             } else {
                                 // New
                                 CalibrationManager.addCalibration(
@@ -523,15 +520,22 @@ fun CalibrationBottomSheet(
                                     sensorValue = selectedAutoValue,
                                     sensorValueRaw = selectedRawValue,
                                     userValue = userValue,
-                                    isRawMode = isRawMode
+                                    sensorId = currentSensor,
+                                    isRawMode = isRawMode,
+                                    // What the sensor's own model said before the
+                                    // driver folded any correction in. Recorded now
+                                    // because it is only recoverable while this
+                                    // device's source history still reaches back to
+                                    // the reading.
+                                    sensorValueStock = tk.glucodata.IntegratedStockBaseline
+                                        .stockAt(currentSensor, selectedTimestamp)
+                                        .takeIf { it.isFinite() && it > 0f } ?: 0f
                                 )
                                 onDismiss()
-                                triggerRewriteOverwrittenHistory(selectedTimestamp)
                             }
                         }
                     },
                     modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp)
                 ) {
                     Text(if (editingEntity != null) stringResource(R.string.update) else stringResource(R.string.save))
                 }
@@ -668,8 +672,8 @@ private fun CalibrationHistoryList(
 //                        Row(verticalAlignment = Alignment.CenterVertically) {
 //                            Text(
 //                                text = "${String.format(Locale.getDefault(), sFmt, sVal)} → ${String.format(Locale.getDefault(), sFmt, cal.userValue)}",
-//                                style = MaterialTheme.typography.titleMedium,
-//                                fontWeight = FontWeight.SemiBold
+//                                style = MaterialTheme.typography.titleMediumEmphasized,
+//
 //                            )
 //                            if (!cal.isEnabled) {
 //                                Spacer(modifier = Modifier.width(8.dp))
@@ -734,7 +738,7 @@ private fun CalibrationHeroSection(
     val valuesMatch = kotlin.math.abs(userValue - originalValue) < 0.01f
     val valueButtonSize = if (compact) 56.dp else 64.dp
     val valueIconSize = if (compact) 28.dp else 32.dp
-    val valueGap = if (compact) 10.dp else 16.dp
+    val valueGap = if (compact) 8.dp else 16.dp
     val valueFontSize = if (compact) 48.sp else 56.sp
     val valueMinWidth = if (compact) 68.dp else 80.dp
     val valueMaxWidth = if (compact) 132.dp else 180.dp

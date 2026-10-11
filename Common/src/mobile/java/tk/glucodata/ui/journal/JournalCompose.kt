@@ -2,14 +2,21 @@
 
 package tk.glucodata.ui.journal
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -22,6 +29,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -39,16 +47,19 @@ import androidx.compose.material.icons.automirrored.filled.Label
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.Bloodtype
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Event
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Restaurant
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Vaccines
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.BottomSheetDefaults
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
@@ -58,17 +69,20 @@ import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TimePicker
 import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -79,8 +93,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -88,10 +105,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import java.text.DateFormat
 import java.text.DecimalFormat
@@ -103,9 +125,10 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import tk.glucodata.Applic
 import tk.glucodata.R
-import tk.glucodata.data.journal.JournalActiveInsulinSummary
 import tk.glucodata.data.journal.JournalChartMarker
 import tk.glucodata.data.journal.JournalCurvePoint
+import tk.glucodata.data.journal.JournalDoseCalculator
+import tk.glucodata.data.journal.JournalDosePresetPolicy
 import tk.glucodata.data.journal.JournalEntry
 import tk.glucodata.data.journal.JournalEntryInput
 import tk.glucodata.data.journal.JournalEntryType
@@ -113,9 +136,11 @@ import tk.glucodata.data.journal.JournalFood
 import tk.glucodata.data.journal.JournalFoodInput
 import tk.glucodata.data.journal.JournalInsulinPreset
 import tk.glucodata.data.journal.JournalIntensity
+import tk.glucodata.data.prediction.PredictionModelProfile
 import tk.glucodata.data.journal.LegacyJournalFoodDatabase
-import tk.glucodata.data.journal.journalFoodDoseCarbs
 import tk.glucodata.ui.GlucosePoint
+import tk.glucodata.ui.components.CompactSheetDragHandle
+import tk.glucodata.ui.components.StableModalBottomSheet
 import tk.glucodata.ui.util.ConnectedButtonGroup
 import tk.glucodata.ui.util.GlucoseFormatter
 import kotlinx.coroutines.Dispatchers
@@ -157,8 +182,18 @@ data class JournalDoseProfile(
     val carbRatioGramsPerUnit: Float,
     val insulinSensitivityMgDlPerUnit: Float,
     val foodMacrosEnabled: Boolean = false,
-    val targetHighMgDl: Float
-)
+    val targetMgDl: Float,
+    val modelProfile: PredictionModelProfile? = null
+) {
+    fun at(timestamp: Long): JournalDoseProfile {
+        val resolved = modelProfile?.parametersAt(timestamp) ?: return this
+        return copy(
+            carbRatioGramsPerUnit = resolved.carbRatioGramsPerUnit,
+            insulinSensitivityMgDlPerUnit = resolved.insulinSensitivityMgDlPerUnit,
+            modelProfile = null
+        )
+    }
+}
 
 private enum class JournalMealShape(val durationMinutes: Int, val labelRes: Int) {
     FAST(45, R.string.journal_meal_shape_fast),
@@ -171,7 +206,6 @@ fun buildJournalChartMarkers(
     entries: List<JournalEntry>,
     presetsById: Map<Long, JournalInsulinPreset>,
     unit: String,
-    history: List<GlucosePoint> = emptyList(),
     foodsById: Map<Long, JournalFood> = emptyMap()
 ): List<JournalChartMarker> {
     val isMmol = GlucoseFormatter.isMmol(unit)
@@ -205,7 +239,11 @@ fun buildJournalChartMarkers(
             entryId = entry.id,
             timestamp = entry.timestamp,
             type = entry.type,
-            title = entry.title,
+            title = if (entry.type == JournalEntryType.INSULIN) {
+                preset?.displayName ?: entry.title
+            } else {
+                entry.title
+            },
             accentColor = preset?.accentColor ?: food?.accentColor ?: journalTypeColor(entry.type).toArgb(),
             badgeText = journalMarkerBadge(entry.type),
             detailText = journalMarkerDetail(entry, preset, unit),
@@ -214,7 +252,8 @@ fun buildJournalChartMarkers(
             chartYFraction = chartYFraction,
             durationMinutes = entry.durationMinutes,
             curvePoints = if (entry.type == JournalEntryType.INSULIN && preset != null) {
-                preset.curvePoints
+                val snapshot = tk.glucodata.data.journal.parseJournalCurve(entry.insulinCurveJsonSnapshot)
+                if (snapshot.size >= 2) snapshot else preset.curvePoints
             } else {
                 emptyList()
             },
@@ -224,7 +263,9 @@ fun buildJournalChartMarkers(
                 null
             },
             activeEndMillis = if (entry.type == JournalEntryType.INSULIN && preset != null) {
-                preset.activeEndAt(entry.timestamp)
+                val snapshot = tk.glucodata.data.journal.parseJournalCurve(entry.insulinCurveJsonSnapshot)
+                val points = if (snapshot.size >= 2) snapshot else preset.curvePoints
+                entry.timestamp + ((points.lastOrNull()?.minute ?: 0).coerceAtLeast(0) * 60_000L)
             } else if (entry.type == JournalEntryType.ACTIVITY && entry.durationMinutes != null) {
                 entry.timestamp + (entry.durationMinutes.coerceAtLeast(1) * 60_000L)
             } else if (entry.type == JournalEntryType.CARBS && entry.durationMinutes != null) {
@@ -234,32 +275,6 @@ fun buildJournalChartMarkers(
             }
         )
     }
-}
-
-fun buildActiveInsulinSummary(
-    entries: List<JournalEntry>,
-    presetsById: Map<Long, JournalInsulinPreset>,
-    atMillis: Long
-): JournalActiveInsulinSummary? {
-    val activeEntries = entries.mapNotNull { entry ->
-        val preset = entry.insulinPresetId?.let(presetsById::get) ?: return@mapNotNull null
-        if (entry.type != JournalEntryType.INSULIN) return@mapNotNull null
-        if (!preset.countsTowardIob) return@mapNotNull null
-        val amount = entry.amount ?: return@mapNotNull null
-        val activity = preset.activityFractionAt(entry.timestamp, atMillis)
-        if (activity <= 0.01f) return@mapNotNull null
-        Triple(entry, preset, amount to activity)
-    }
-    if (activeEntries.isEmpty()) return null
-
-    val totalUnits = activeEntries.sumOf { it.third.first.toDouble() }.toFloat()
-    val weightedActivity = activeEntries.sumOf { (it.third.first * it.third.second).toDouble() }.toFloat()
-    return JournalActiveInsulinSummary(
-        activeEntryCount = activeEntries.size,
-        totalUnits = totalUnits,
-        weightedActivityPercent = ((weightedActivity / totalUnits) * 100f).roundToInt().coerceIn(0, 100),
-        nextEndingAt = activeEntries.minOfOrNull { it.second.activeEndAt(it.first.timestamp) }
-    )
 }
 
 @Composable
@@ -272,11 +287,12 @@ fun JournalQuickDock(
     onEditEntry: (JournalEntry) -> Unit,
     onCalibrate: (() -> Unit)? = null
 ) {
-    val primaryActions = remember(onCalibrate) {
+    val topActions = remember(onCalibrate) {
         buildList {
             if (onCalibrate != null) add(JournalTrayAction.CALIBRATE)
-            add(JournalTrayAction.INSULIN)
-            add(JournalTrayAction.CARBS)
+            add(JournalTrayAction.FINGERSTICK)
+            add(JournalTrayAction.ACTIVITY)
+            add(JournalTrayAction.NOTE)
         }
     }
     Column(
@@ -284,24 +300,10 @@ fun JournalQuickDock(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         JournalActionRow(
-            actions = primaryActions,
+            actions = topActions,
             onAction = { action ->
                 when (action) {
                     JournalTrayAction.CALIBRATE -> onCalibrate?.invoke()
-                    JournalTrayAction.INSULIN -> onTypeSelected(JournalEntryType.INSULIN)
-                    JournalTrayAction.CARBS -> onTypeSelected(JournalEntryType.CARBS)
-                    else -> Unit
-                }
-            }
-        )
-        JournalActionRow(
-            actions = listOf(
-                JournalTrayAction.FINGERSTICK,
-                JournalTrayAction.ACTIVITY,
-                JournalTrayAction.NOTE
-            ),
-            onAction = { action ->
-                when (action) {
                     JournalTrayAction.FINGERSTICK -> onTypeSelected(JournalEntryType.FINGERSTICK)
                     JournalTrayAction.ACTIVITY -> onTypeSelected(JournalEntryType.ACTIVITY)
                     JournalTrayAction.NOTE -> onTypeSelected(JournalEntryType.NOTE)
@@ -309,11 +311,24 @@ fun JournalQuickDock(
                 }
             }
         )
+        JournalActionRow(
+            actions = listOf(
+                JournalTrayAction.CARBS,
+                JournalTrayAction.INSULIN
+            ),
+            onAction = { action ->
+                when (action) {
+                    JournalTrayAction.CARBS -> onTypeSelected(JournalEntryType.CARBS)
+                    JournalTrayAction.INSULIN -> onTypeSelected(JournalEntryType.INSULIN)
+                    else -> Unit
+                }
+            }
+        )
 
         if (visibleEntries.isNotEmpty()) {
             FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 visibleEntries.forEach { entry ->
                     JournalEntryChip(
@@ -352,6 +367,9 @@ fun JournalEntrySheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val context = LocalContext.current
     val activeInsulinPresets = remember(insulinPresets) { insulinPresets.filter { !it.isArchived } }
+    val calculationInsulinPresets = remember(activeInsulinPresets) {
+        activeInsulinPresets.filter { it.useForCalculation }
+    }
     val presetsById = remember(insulinPresets) { insulinPresets.associateBy { it.id } }
     val activeFoods = remember(foods) { foods.filter { !it.isArchived } }
     val initialDraft = remember(
@@ -388,23 +406,25 @@ fun JournalEntrySheet(
     }
     var showDatePicker by remember(existingEntry?.id, initialType, selectedTimestamp) { mutableStateOf(false) }
     var showTimePicker by remember(existingEntry?.id, initialType, selectedTimestamp) { mutableStateOf(false) }
+    var noteFieldFocused by remember(existingEntry?.id) { mutableStateOf(false) }
+    val selectedInsulinPreset = draft.insulinPresetId?.let(presetsById::get)
     val saveInputs = draft.toInputs(unit, sensorSerialProvider(), presetsById, foodMacrosEnabled)
     val canSave = saveInputs.isNotEmpty()
-    val calculatorProfile = remember(doseProfile) {
-        doseProfile?.takeIf {
+    val calculatorProfile = remember(doseProfile, draft.timestamp) {
+        doseProfile?.at(draft.timestamp)?.takeIf {
             it.enabled &&
                     it.carbRatioGramsPerUnit > 0f &&
                     it.insulinSensitivityMgDlPerUnit > 0f
         }
     }
     val activeInsulinUnits = remember(doseJournalEntries, presetsById, draft.timestamp) {
-        activeInsulinRemainingUnitsAt(
+        JournalDosePresetPolicy.activeInsulinUnitsAt(
             entries = doseJournalEntries,
             presetsById = presetsById,
             atMillis = draft.timestamp
         )
     }
-    LaunchedEffect(existingEntry?.id, draft.type, draft.pairWithDose, activeInsulinPresets) {
+    LaunchedEffect(existingEntry?.id, draft.type, draft.pairWithDose, calculationInsulinPresets) {
         if (
             existingEntry != null ||
             draft.insulinPresetId != null ||
@@ -412,7 +432,7 @@ fun JournalEntrySheet(
         ) {
             return@LaunchedEffect
         }
-        preferredInsulinPreset(activeInsulinPresets)?.let { preset ->
+        JournalDosePresetPolicy.preferredPreset(calculationInsulinPresets)?.let { preset ->
             draft = draft.copy(
                 insulinPresetId = preset.id,
                 title = preset.displayName
@@ -427,8 +447,18 @@ fun JournalEntrySheet(
         draft.doseGlucoseMgDl,
         draft.pairWithDose,
         calculatorProfile,
-        activeInsulinUnits
+        activeInsulinUnits,
+        selectedInsulinPreset?.useForCalculation
     ) {
+        if (
+            draft.type == JournalEntryType.INSULIN &&
+            selectedInsulinPreset?.useForCalculation != true
+        ) {
+            if (draft.pairWithDose || draft.pairedAmountText.isNotEmpty()) {
+                draft = draft.copy(pairWithDose = false, pairedAmountText = "")
+            }
+            return@LaunchedEffect
+        }
         if (!draft.pairWithDose || calculatorProfile == null) return@LaunchedEffect
         val suggestedPair = when (draft.type) {
             JournalEntryType.CARBS -> calculateInsulinForCarbs(
@@ -454,20 +484,21 @@ fun JournalEntrySheet(
         }
     }
 
-    ModalBottomSheet(
+    StableModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        dragHandle = { BottomSheetDefaults.DragHandle() },
+        dragHandle = { CompactSheetDragHandle() },
         containerColor = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+        contentKey = draft.type,
     ) {
         LazyColumn(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp)
+                .padding(horizontal = 20.dp)
                 .navigationBarsPadding(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 6.dp, bottom = 20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 4.dp, bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item(key = "header") {
                 Row(
@@ -479,13 +510,32 @@ fun JournalEntrySheet(
                             text = stringResource(
                                 when (draft.type) {
                                     JournalEntryType.FINGERSTICK -> R.string.journal_type_bg_short
-                                    JournalEntryType.CARBS -> if (foodMacrosEnabled) R.string.journal_type_food else R.string.carbo
+                                    JournalEntryType.CARBS -> R.string.journal_type_food
                                     else -> draft.type.labelRes()
                                 }
                             ),
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.SemiBold
+                            style = MaterialTheme.typography.headlineSmallEmphasized
                         )
+                        existingEntry?.source?.presentation()?.let { source ->
+                            // The icon on the row only explains itself for NFC; here the
+                            // origin is spelled out.
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = source.icon,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = stringResource(source.labelRes),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
 //                        Text(
 //                            text = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
 //                                .format(Date(draft.timestamp)),
@@ -515,63 +565,36 @@ fun JournalEntrySheet(
             }
 
             item(key = "date_time") {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    JournalMetaCard(
-                        modifier = Modifier.weight(1f),
-                        icon = Icons.Default.Event,
-                        title = stringResource(R.string.date),
-                        value = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(draft.timestamp)),
-                        onClick = { showDatePicker = true }
-                    )
-                    JournalMetaCard(
-                        modifier = Modifier.weight(1f),
-                        icon = Icons.Default.AccessTime,
-                        title = stringResource(R.string.time),
-                        value = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(draft.timestamp)),
-                        onClick = { showTimePicker = true }
-                    )
-                }
+                JournalDateTimeCard(
+                    date = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(draft.timestamp)),
+                    time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(draft.timestamp)),
+                    onDateClick = { showDatePicker = true },
+                    onTimeClick = { showTimePicker = true }
+                )
             }
 
             when (draft.type) {
                 JournalEntryType.INSULIN -> {
                     item(key = "insulin_presets") {
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            activeInsulinPresets.forEach { preset ->
-                                JournalPresetPill(
-                                    preset = preset,
-                                    selected = draft.insulinPresetId == preset.id,
-                                    onClick = {
-                                        draft = draft.copy(
-                                            insulinPresetId = preset.id,
-                                            title = preset.displayName
-                                        )
-                                    }
+                        JournalInsulinPresetSelector(
+                            presets = activeInsulinPresets,
+                            selectedPresetId = draft.insulinPresetId,
+                            onPresetSelected = { preset ->
+                                draft = draft.copy(
+                                    insulinPresetId = preset.id,
+                                    title = preset.displayName,
+                                    pairWithDose = draft.pairWithDose && preset.useForCalculation,
+                                    pairedAmountText = draft.pairedAmountText.takeIf {
+                                        preset.useForCalculation
+                                    }.orEmpty()
                                 )
                             }
-                        }
+                        )
                     }
                     draft.insulinPresetId?.let { presetId ->
                         presetsById[presetId]?.let { preset ->
                             item(key = "insulin_window") {
-                                Surface(
-                                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                                    shape = RoundedCornerShape(18.dp)
-                                ) {
-                                    Text(
-                                        text = stringResource(
-                                            R.string.journal_active_window,
-                                            stringResource(R.string.minutes_short_format, preset.onsetMinutes),
-                                            stringResource(R.string.minutes_short_format, preset.durationMinutes)
-                                        ),
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                                    )
-                                }
+                                JournalInsulinWindowCard(preset = preset)
                             }
                         }
                     }
@@ -583,16 +606,20 @@ fun JournalEntrySheet(
                                 draft = draft.copy(amountText = adjustDecimalDraft(draft.amountText, delta, step = 0.5f))
                             },
                             label = stringResource(R.string.journal_type_insulin),
-                            suffix = "U",
+                            suffix = stringResource(R.string.unit_insulin_short),
                             prominent = true
                         )
                     }
-                    if (existingEntry == null && calculatorProfile != null) {
+                    if (
+                        existingEntry == null &&
+                        calculatorProfile != null &&
+                        selectedInsulinPreset?.useForCalculation == true
+                    ) {
                         item(key = "insulin_dose_assist") {
                             JournalDoseAssistCard(
                                 draft = draft,
                                 profile = calculatorProfile,
-                                activeInsulinPresets = activeInsulinPresets,
+                                calculationInsulinPresets = calculationInsulinPresets,
                                 activeInsulinUnits = activeInsulinUnits,
                                 unit = unit,
                                 onDraftChange = { draft = it }
@@ -632,8 +659,8 @@ fun JournalEntrySheet(
                             onStep = { delta ->
                                 draft = draft.copy(amountText = adjustDecimalDraft(draft.amountText, delta, step = 5f))
                             },
-                            label = stringResource(if (foodMacrosEnabled) R.string.journal_type_food else R.string.carbo),
-                            suffix = "g",
+                            label = stringResource(R.string.journal_type_food),
+                            suffix = stringResource(R.string.unit_carbs_short),
                             prominent = true
                         )
                     }
@@ -655,12 +682,16 @@ fun JournalEntrySheet(
                             )
                         }
                     }
-                    if (existingEntry == null && calculatorProfile != null) {
+                    if (
+                        existingEntry == null &&
+                        calculatorProfile != null &&
+                        calculationInsulinPresets.isNotEmpty()
+                    ) {
                         item(key = "carbs_dose_assist") {
                             JournalDoseAssistCard(
                                 draft = draft,
                                 profile = calculatorProfile,
-                                activeInsulinPresets = activeInsulinPresets,
+                                calculationInsulinPresets = calculationInsulinPresets,
                                 activeInsulinUnits = activeInsulinUnits,
                                 unit = unit,
                                 onDraftChange = { draft = it }
@@ -729,20 +760,46 @@ fun JournalEntrySheet(
             }
 
             item(key = "note_field") {
-                OutlinedTextField(
+                val noteFieldExpanded = draft.type == JournalEntryType.NOTE ||
+                        noteFieldFocused ||
+                        draft.note.contains('\n')
+                val noteFieldMinHeight by animateDpAsState(
+                    targetValue = when {
+                        draft.type == JournalEntryType.NOTE -> 132.dp
+                        noteFieldExpanded -> 96.dp
+                        else -> 56.dp
+                    },
+                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                    label = "journalNoteFieldHeight"
+                )
+                TextField(
                     value = draft.note,
                     onValueChange = { draft = draft.copy(note = it) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = if (draft.type == JournalEntryType.NOTE) 132.dp else 96.dp),
+                        .heightIn(min = noteFieldMinHeight)
+                        .onFocusChanged { noteFieldFocused = it.isFocused },
                     label = { Text(stringResource(R.string.journal_note_label)) },
-                    singleLine = false,
-                    maxLines = if (draft.type == JournalEntryType.NOTE) 5 else 3
+                    singleLine = !noteFieldExpanded,
+                    maxLines = when {
+                        draft.type == JournalEntryType.NOTE -> 5
+                        noteFieldExpanded -> 3
+                        else -> 1
+                    },
+                    shape = RoundedCornerShape(16.dp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                        disabledIndicatorColor = Color.Transparent,
+                        errorIndicatorColor = Color.Transparent
+                    )
                 )
             }
 
             item(key = "save_button") {
-                FilledTonalButton(
+                Button(
                     onClick = {
                         if (canSave) {
                             if (saveInputs.size > 1) {
@@ -753,17 +810,16 @@ fun JournalEntrySheet(
                         }
                     },
                     enabled = canSave,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp)
                 ) {
                     Icon(
                         imageVector = journalTypeIcon(draft.type),
                         contentDescription = null
                     )
-                    Spacer(modifier = Modifier.width(10.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(text = stringResource(R.string.save))
                 }
             }
@@ -771,7 +827,9 @@ fun JournalEntrySheet(
     }
 
     if (showDatePicker) {
-        val datePickerState = rememberDatePickerState(initialSelectedDateMillis = draft.timestamp)
+        val datePickerState = rememberDatePickerState(
+            initialSelectedDateMillis = journalTimestampToPickerUtcDateMillis(draft.timestamp)
+        )
         DatePickerDialog(
             onDismissRequest = { showDatePicker = false },
             confirmButton = {
@@ -886,13 +944,6 @@ private fun buildDraft(
         chartAnchorGlucoseMgDl = existingEntry.glucoseValueMgDl,
         doseGlucoseMgDl = existingEntry.glucoseValueMgDl
     )
-}
-
-private fun preferredInsulinPreset(
-    presets: List<JournalInsulinPreset>
-): JournalInsulinPreset? {
-    val sortedPresets = presets.sortedBy { it.sortOrder }
-    return sortedPresets.firstOrNull { it.countsTowardIob } ?: sortedPresets.firstOrNull()
 }
 
 private fun JournalEntryDraft.withFood(
@@ -1103,7 +1154,7 @@ private fun JournalEntryDraft.toInput(
             val grams = amountText.parseFloatOrNull() ?: return null
             val absorptionMinutes = durationText.parseIntOrNull()?.coerceIn(15, 480)
             val titleValue = title.trim().takeIf { it.isNotBlank() }
-                ?: Applic.app.getString(if (foodMacrosEnabled) R.string.journal_type_food else R.string.carbo)
+                ?: Applic.app.getString(R.string.journal_type_food)
             JournalEntryInput(
                 id = entryId,
                 timestamp = timestamp,
@@ -1198,7 +1249,7 @@ private fun JournalEntryDraft.toInputs(
                 timestamp = timestamp,
                 sensorSerial = sensorSerial,
                 type = JournalEntryType.CARBS,
-                title = Applic.app.getString(if (foodMacrosEnabled) R.string.journal_type_food else R.string.carbo),
+                title = Applic.app.getString(R.string.journal_type_food),
                 amount = grams,
                 glucoseValueMgDl = chartAnchorGlucoseMgDl,
                 durationMinutes = durationText.parseIntOrNull()?.coerceIn(15, 480),
@@ -1217,7 +1268,7 @@ private fun JournalEntryDraft.toInputs(
 private fun JournalDoseAssistCard(
     draft: JournalEntryDraft,
     profile: JournalDoseProfile,
-    activeInsulinPresets: List<JournalInsulinPreset>,
+    calculationInsulinPresets: List<JournalInsulinPreset>,
     activeInsulinUnits: Float,
     unit: String,
     onDraftChange: (JournalEntryDraft) -> Unit
@@ -1266,7 +1317,7 @@ private fun JournalDoseAssistCard(
                 pairedAmountText = if (enabled) pairAmount.orEmpty() else "",
                 insulinPresetId = when {
                     draft.type == JournalEntryType.CARBS && enabled -> draft.insulinPresetId
-                        ?: preferredInsulinPreset(activeInsulinPresets)?.id
+                        ?: JournalDosePresetPolicy.preferredPreset(calculationInsulinPresets)?.id
                     draft.type == JournalEntryType.CARBS -> null
                     else -> draft.insulinPresetId
                 }
@@ -1277,17 +1328,16 @@ private fun JournalDoseAssistCard(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.68f),
-        shape = RoundedCornerShape(22.dp)
+        shape = RoundedCornerShape(20.dp)
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(9.dp)
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = stringResource(R.string.journal_dose_math_title),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.labelLargeEmphasized,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
                 )
@@ -1306,8 +1356,7 @@ private fun JournalDoseAssistCard(
                             R.string.journal_dose_suggested_insulin,
                             suggestion?.totalInsulinUnits?.let(::formatInsulinDose) ?: "—"
                         ),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleMediumEmphasized,
                         color = if (suggestion != null) {
                             MaterialTheme.colorScheme.onSurface
                         } else {
@@ -1321,21 +1370,21 @@ private fun JournalDoseAssistCard(
                         JournalDoseMetric(
                             label = stringResource(
                                 R.string.journal_dose_food_component,
-                                "${suggestion?.foodInsulinUnits?.let(::formatInsulinComponent) ?: "—"} U"
+                                stringResource(R.string.unit_insulin_value, suggestion?.foodInsulinUnits?.let(::formatInsulinComponent) ?: "—")
                             )
                         )
                         if (suggestion != null && suggestion.correctionInsulinUnits > 0f) {
                             JournalDoseMetric(
                                 label = stringResource(
                                     R.string.journal_dose_correction_component,
-                                    "${formatInsulinComponent(suggestion.correctionInsulinUnits)} U"
+                                    stringResource(R.string.unit_insulin_value, formatInsulinComponent(suggestion.correctionInsulinUnits))
                                 )
                             )
                         }
                         if (suggestion != null && suggestion.activeInsulinCreditUnits > 0f) {
                             JournalDoseMetric(
                                 label = "${stringResource(R.string.IOB)} -" +
-                                        "${formatInsulinComponent(suggestion.activeInsulinCreditUnits)} U"
+                                        stringResource(R.string.unit_insulin_value, formatInsulinComponent(suggestion.activeInsulinCreditUnits))
                             )
                         }
                         draft.doseGlucoseMgDl?.let { glucose ->
@@ -1350,8 +1399,7 @@ private fun JournalDoseAssistCard(
                             R.string.journal_dose_covers_carbs,
                             coveredCarbsSuggestion?.let(::formatCarbDose) ?: "—"
                         ),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleMediumEmphasized,
                         color = if (coveredCarbsSuggestion != null) {
                             MaterialTheme.colorScheme.onSurface
                         } else {
@@ -1396,7 +1444,7 @@ private fun JournalDoseAssistCard(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        activeInsulinPresets.forEach { preset ->
+                        calculationInsulinPresets.forEach { preset ->
                             JournalPresetPill(
                                 preset = preset,
                                 selected = draft.insulinPresetId == preset.id,
@@ -1426,9 +1474,9 @@ private fun JournalDoseAssistCard(
                     label = if (draft.type == JournalEntryType.CARBS) {
                         stringResource(R.string.journal_type_insulin)
                     } else {
-                        stringResource(R.string.carbo)
+                        stringResource(R.string.journal_type_food)
                     },
-                    suffix = if (draft.type == JournalEntryType.CARBS) "U" else "g"
+                    suffix = if (draft.type == JournalEntryType.CARBS) stringResource(R.string.unit_insulin_short) else stringResource(R.string.unit_carbs_short)
                 )
             }
         }
@@ -1580,7 +1628,7 @@ private fun JournalFoodLibrarySelector(
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         expanded = true
                     }
-                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
@@ -1590,12 +1638,11 @@ private fun JournalFoodLibrarySelector(
                         ?: MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(28.dp)
                 )
-                Spacer(modifier = Modifier.width(14.dp))
+                Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = visibleItems.singleOrNull()?.displayName ?: stringResource(R.string.journal_add_food),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleMediumEmphasized,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -1621,7 +1668,7 @@ private fun JournalFoodLibrarySelector(
             }
         } else {
             Column(
-                modifier = Modifier.padding(14.dp),
+                modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Surface(
@@ -1633,7 +1680,7 @@ private fun JournalFoodLibrarySelector(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 62.dp)
-                            .padding(start = 14.dp, end = 4.dp),
+                            .padding(start = 16.dp, end = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
@@ -1695,8 +1742,8 @@ private fun JournalFoodLibrarySelector(
                                 query = ""
                                 expanded = false
                             },
-                            shape = RoundedCornerShape(22.dp),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+                            shape = RoundedCornerShape(20.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
                         ) {
                             Text(
                                 text = stringResource(R.string.close),
@@ -1739,7 +1786,7 @@ private fun JournalFoodLibrarySelector(
                         shrinkTowards = Alignment.Top
                     ) + fadeOut()
                 ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         filteredFoods.forEach { food ->
                             val rowExpanded = expandedFoodId == food.id
                             val rowPortionGrams = parseFoodPortionGrams(expandedPortionText)
@@ -1862,10 +1909,10 @@ private fun JournalSelectedFoodChip(
     val color = Color(item.accentColor)
     Surface(
         color = color.copy(alpha = 0.18f),
-        shape = RoundedCornerShape(18.dp)
+        shape = RoundedCornerShape(16.dp)
     ) {
         Row(
-            modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
+            modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
@@ -1877,8 +1924,7 @@ private fun JournalSelectedFoodChip(
             Column(modifier = Modifier.widthIn(max = 180.dp)) {
                 Text(
                     text = item.displayName,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.labelLargeEmphasized,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -1917,7 +1963,7 @@ private fun JournalFoodPickerRow(
     detailsContent: (@Composable () -> Unit)? = null,
     trailingContent: (@Composable () -> Unit)? = null
 ) {
-    val shape = RoundedCornerShape(18.dp)
+    val shape = RoundedCornerShape(16.dp)
     Surface(
         color = if (selected) color.copy(alpha = 0.18f) else unselectedContainerColor,
         shape = shape
@@ -1936,7 +1982,7 @@ private fun JournalFoodPickerRow(
                         stiffness = Spring.StiffnessMediumLow
                     )
                 )
-                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
@@ -1944,12 +1990,11 @@ private fun JournalFoodPickerRow(
                         .size(10.dp)
                         .background(color, CircleShape)
                 )
-                Spacer(modifier = Modifier.width(10.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = title,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.labelLargeEmphasized,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -1974,7 +2019,7 @@ private fun JournalFoodPickerRow(
                     shrinkTowards = Alignment.Top
                 ) + fadeOut()
             ) {
-                Column(modifier = Modifier.padding(top = 10.dp)) {
+                Column(modifier = Modifier.padding(top = 8.dp)) {
                     detailsContent?.invoke()
                 }
             }
@@ -2019,8 +2064,7 @@ internal fun JournalFoodCompositionDetails(
                     )
                     Text(
                         text = formatFoodComponentValue(component.rawValue),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.labelSmallEmphasized,
                         textAlign = TextAlign.End,
                         modifier = Modifier.widthIn(min = 46.dp)
                     )
@@ -2036,11 +2080,11 @@ internal fun JournalFoodCompositionDetails(
         }
         Surface(
             color = color.copy(alpha = 0.10f),
-            shape = RoundedCornerShape(24.dp),
+            shape = RoundedCornerShape(28.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
             Row(
-                modifier = Modifier.padding(6.dp),
+                modifier = Modifier.padding(8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -2062,14 +2106,13 @@ internal fun JournalFoodCompositionDetails(
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.onSurface),
-                    textStyle = MaterialTheme.typography.titleLarge.copy(
+                    textStyle = MaterialTheme.typography.titleLargeEmphasized.copy(
                         color = MaterialTheme.colorScheme.onSurface,
-                        fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.Center
                     ),
                     modifier = Modifier
                         .weight(1f)
-                        .padding(horizontal = 6.dp),
+                        .padding(horizontal = 8.dp),
                     decorationBox = { innerTextField ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -2082,7 +2125,7 @@ internal fun JournalFoodCompositionDetails(
                                 innerTextField()
                             }
                             Text(
-                                text = "g",
+                                text = stringResource(R.string.unit_carbs_short),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -2112,7 +2155,7 @@ internal fun JournalFoodCompositionDetails(
                         contentDescription = null,
                         modifier = Modifier.size(16.dp)
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(text = stringResource(R.string.journal_food_save_to_library))
                 }
             }
@@ -2209,10 +2252,10 @@ private fun JournalFoodPill(
     Surface(
         onClick = onClick,
         color = if (selected) color.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = RoundedCornerShape(18.dp)
+        shape = RoundedCornerShape(16.dp)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
@@ -2255,21 +2298,21 @@ private fun JournalMacroFields(
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         JournalStepperField(
             value = proteinText,
             onValueChange = onProteinChange,
             onStep = { delta -> onProteinChange(adjustDecimalDraft(proteinText, delta, step = 5f)) },
             label = stringResource(R.string.journal_food_protein),
-            suffix = "g"
+            suffix = stringResource(R.string.unit_carbs_short)
         )
         JournalStepperField(
             value = fatText,
             onValueChange = onFatChange,
             onStep = { delta -> onFatChange(adjustDecimalDraft(fatText, delta, step = 5f)) },
             label = stringResource(R.string.journal_food_fat),
-            suffix = "g"
+            suffix = stringResource(R.string.unit_carbs_short)
         )
     }
 }
@@ -2284,17 +2327,10 @@ private fun JournalDoseMetric(label: String) {
             text = label,
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
         )
     }
 }
-
-private data class JournalInsulinDoseSuggestion(
-    val foodInsulinUnits: Float,
-    val correctionInsulinUnits: Float,
-    val activeInsulinCreditUnits: Float,
-    val totalInsulinUnits: Float
-)
 
 private fun calculateInsulinForCarbs(
     carbs: Float?,
@@ -2303,24 +2339,17 @@ private fun calculateInsulinForCarbs(
     glucoseMgDl: Float?,
     profile: JournalDoseProfile,
     activeInsulinUnits: Float
-): JournalInsulinDoseSuggestion? {
-    val foodDoseCarbs = journalFoodDoseCarbs(
+): JournalDoseCalculator.InsulinSuggestion? {
+    return JournalDoseCalculator.insulinForCarbs(
         carbsGrams = carbs,
         proteinGrams = protein,
         fatGrams = fat,
-        macrosEnabled = profile.foodMacrosEnabled
-    ) ?: return null
-    val food = foodDoseCarbs / profile.carbRatioGramsPerUnit
-    val rawCorrection = glucoseMgDl
-        ?.let { ((it - profile.targetHighMgDl) / profile.insulinSensitivityMgDlPerUnit).coerceAtLeast(0f) }
-        ?: 0f
-    val activeCredit = minOf(rawCorrection, activeInsulinUnits.coerceAtLeast(0f))
-    val correction = (rawCorrection - activeCredit).coerceAtLeast(0f)
-    return JournalInsulinDoseSuggestion(
-        foodInsulinUnits = food,
-        correctionInsulinUnits = correction,
-        activeInsulinCreditUnits = activeCredit,
-        totalInsulinUnits = roundInsulinDose(food + correction)
+        macrosEnabled = profile.foodMacrosEnabled,
+        glucoseMgDl = glucoseMgDl,
+        carbRatioGramsPerUnit = profile.carbRatioGramsPerUnit,
+        insulinSensitivityMgDlPerUnit = profile.insulinSensitivityMgDlPerUnit,
+        targetMgDl = profile.targetMgDl,
+        activeInsulinUnits = activeInsulinUnits
     )
 }
 
@@ -2330,64 +2359,17 @@ private fun calculateCoveredCarbsForInsulin(
     profile: JournalDoseProfile,
     activeInsulinUnits: Float
 ): Float? {
-    val insulinValue = insulinUnits?.takeIf { it > 0f } ?: return null
-    val rawCorrection = glucoseMgDl
-        ?.let { ((it - profile.targetHighMgDl) / profile.insulinSensitivityMgDlPerUnit).coerceAtLeast(0f) }
-        ?: 0f
-    val correction = (rawCorrection - minOf(rawCorrection, activeInsulinUnits.coerceAtLeast(0f))).coerceAtLeast(0f)
-    return ((insulinValue - correction).coerceAtLeast(0f) * profile.carbRatioGramsPerUnit)
-        .let { (it / 5f).roundToInt() * 5f }
-        .takeIf { it > 0f }
+    return JournalDoseCalculator.carbsCoveredByInsulin(
+        insulinUnits = insulinUnits,
+        glucoseMgDl = glucoseMgDl,
+        carbRatioGramsPerUnit = profile.carbRatioGramsPerUnit,
+        insulinSensitivityMgDlPerUnit = profile.insulinSensitivityMgDlPerUnit,
+        targetMgDl = profile.targetMgDl,
+        activeInsulinUnits = activeInsulinUnits
+    )
 }
 
-private fun activeInsulinRemainingUnitsAt(
-    entries: List<JournalEntry>,
-    presetsById: Map<Long, JournalInsulinPreset>,
-    atMillis: Long
-): Float {
-    if (entries.isEmpty()) return 0f
-    return entries.sumOf { entry ->
-        val preset = entry.insulinPresetId?.let(presetsById::get) ?: return@sumOf 0.0
-        if (entry.type != JournalEntryType.INSULIN || !preset.countsTowardIob) return@sumOf 0.0
-        val amount = entry.amount?.takeIf { it > 0f } ?: return@sumOf 0.0
-        val remaining = remainingCurveFraction(preset.curvePoints, entry.timestamp, atMillis)
-        (amount * remaining).toDouble()
-    }.toFloat()
-}
-
-private fun remainingCurveFraction(points: List<JournalCurvePoint>, doseTimestamp: Long, atMillis: Long): Float {
-    if (points.size < 2 || atMillis < doseTimestamp) return 0f
-    val elapsedMinutes = ((atMillis - doseTimestamp) / 60_000f).coerceAtLeast(0f)
-    val total = integrateCurveArea(points, points.last().minute.toFloat())
-    if (total <= 0.0001f) return 0f
-    val delivered = (integrateCurveArea(points, elapsedMinutes) / total).coerceIn(0f, 1f)
-    return (1f - delivered).coerceIn(0f, 1f)
-}
-
-private fun integrateCurveArea(points: List<JournalCurvePoint>, upToMinute: Float): Float {
-    if (points.size < 2 || upToMinute <= points.first().minute) return 0f
-    var area = 0f
-    for (index in 0 until points.lastIndex) {
-        val start = points[index]
-        val end = points[index + 1]
-        if (upToMinute <= start.minute) break
-        val segmentEndMinute = minOf(upToMinute, end.minute.toFloat())
-        val segmentWidth = segmentEndMinute - start.minute
-        if (segmentWidth <= 0f) continue
-        val fullWidth = (end.minute - start.minute).coerceAtLeast(1).toFloat()
-        val endFraction = ((segmentEndMinute - start.minute) / fullWidth).coerceIn(0f, 1f)
-        val segmentEndActivity = start.activity + ((end.activity - start.activity) * endFraction)
-        area += ((start.activity + segmentEndActivity) * 0.5f) * segmentWidth
-        if (upToMinute <= end.minute) break
-    }
-    return area
-}
-
-private fun roundInsulinDose(value: Float): Float {
-    return ((value / 0.5f).roundToInt() * 0.5f).coerceAtLeast(0.5f)
-}
-
-private fun formatInsulinDose(value: Float): String = formatFloatForEditor(roundInsulinDose(value))
+private fun formatInsulinDose(value: Float): String = formatFloatForEditor(value)
 
 private fun formatInsulinComponent(value: Float): String {
     return formatFloatForEditor(((value / 0.1f).roundToInt() * 0.1f).coerceAtLeast(0f))
@@ -2413,13 +2395,13 @@ private fun JournalActionRow(
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         actions.forEach { action ->
             FilledTonalButton(
                 onClick = { onAction(action) },
                 modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.filledTonalButtonColors(
                     containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                     contentColor = MaterialTheme.colorScheme.onSurface
@@ -2442,7 +2424,7 @@ private fun JournalActionRow(
                     text = when (action) {
                         JournalTrayAction.CALIBRATE -> stringResource(R.string.calibrate_action)
                         JournalTrayAction.INSULIN -> stringResource(R.string.journal_type_insulin)
-                        JournalTrayAction.CARBS -> stringResource(R.string.carbo)
+                        JournalTrayAction.CARBS -> stringResource(R.string.journal_type_food)
                         JournalTrayAction.FINGERSTICK -> stringResource(R.string.journal_type_bg_short)
                         JournalTrayAction.ACTIVITY -> stringResource(R.string.journal_type_activity)
                         JournalTrayAction.NOTE -> stringResource(R.string.journal_type_note)
@@ -2498,35 +2480,127 @@ private fun JournalIntensitySelector(
 }
 
 @Composable
+private fun JournalInsulinPresetSelector(
+    presets: List<JournalInsulinPreset>,
+    selectedPresetId: Long?,
+    onPresetSelected: (JournalInsulinPreset) -> Unit
+) {
+    if (presets.size == 2) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            presets.forEach { preset ->
+                JournalPresetPill(
+                    modifier = Modifier.weight(1f),
+                    preset = preset,
+                    selected = selectedPresetId == preset.id,
+                    onClick = { onPresetSelected(preset) }
+                )
+            }
+        }
+    } else {
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            presets.forEach { preset ->
+                JournalPresetPill(
+                    preset = preset,
+                    selected = selectedPresetId == preset.id,
+                    onClick = { onPresetSelected(preset) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun JournalPresetPill(
+    modifier: Modifier = Modifier,
     preset: JournalInsulinPreset,
     selected: Boolean,
     onClick: () -> Unit
 ) {
-    Surface(
-        onClick = onClick,
-        color = if (selected) {
-            Color(preset.accentColor).copy(alpha = 0.18f)
+    val accent = Color(preset.accentColor)
+    val containerColor by animateColorAsState(
+        targetValue = if (selected) {
+            accent.copy(alpha = 0.30f)
         } else {
             MaterialTheme.colorScheme.surfaceContainerHigh
         },
-        shape = RoundedCornerShape(18.dp)
+        animationSpec = tween(durationMillis = 180),
+        label = "journalPresetContainer"
+    )
+    val borderColor by animateColorAsState(
+        targetValue = if (selected) accent.copy(alpha = 0.9f) else Color.Transparent,
+        animationSpec = tween(durationMillis = 180),
+        label = "journalPresetBorder"
+    )
+    val indicatorColor by animateColorAsState(
+        targetValue = if (selected) accent else accent.copy(alpha = 0.18f),
+        animationSpec = tween(durationMillis = 180),
+        label = "journalPresetIndicator"
+    )
+    val tonalElevation by animateDpAsState(
+        targetValue = if (selected) 2.dp else 0.dp,
+        animationSpec = tween(durationMillis = 180),
+        label = "journalPresetElevation"
+    )
+    Surface(
+        modifier = modifier,
+        onClick = onClick,
+        color = containerColor,
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, borderColor),
+        tonalElevation = tonalElevation
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .background(Color(preset.accentColor), CircleShape)
-            )
+            Surface(
+                modifier = Modifier.size(20.dp),
+                shape = CircleShape,
+                color = indicatorColor
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    AnimatedContent(
+                        targetState = selected,
+                        transitionSpec = {
+                            fadeIn(animationSpec = tween(durationMillis = 140))
+                                .togetherWith(fadeOut(animationSpec = tween(durationMillis = 90)))
+                        },
+                        label = "journalPresetIndicatorContent"
+                    ) { isSelected ->
+                        if (isSelected) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(12.dp)
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(accent, CircleShape)
+                            )
+                        }
+                    }
+                }
+            }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = preset.displayName,
-                style = MaterialTheme.typography.labelLarge,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
             )
         }
     }
@@ -2537,40 +2611,212 @@ fun JournalInlineChip(
     entry: JournalEntry,
     unit: String,
     insulinPreset: JournalInsulinPreset?,
+    food: JournalFood? = null,
     expanded: Boolean = false,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
-    val tint = insulinPreset?.let { Color(it.accentColor) } ?: journalTypeColor(entry.type)
-    val inlineLabel = journalMarkerDetail(entry, insulinPreset, unit).ifBlank { entry.title }
-    Surface(
-        modifier = modifier,
-        onClick = onClick,
-        color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.94f),
-        shape = RoundedCornerShape(if (expanded) 16.dp else 14.dp)
+    val tint = food?.let { Color(it.accentColor) }
+        ?: insulinPreset?.let { Color(it.accentColor) }
+        ?: journalTypeColor(entry.type)
+    val chipContent = journalInlineChipContent(entry, insulinPreset, food, unit, expanded)
+    val inheritedMinimumInteractiveSize = LocalMinimumInteractiveComponentSize.current
+    CompositionLocalProvider(
+        LocalMinimumInteractiveComponentSize provides if (expanded) {
+            inheritedMinimumInteractiveSize
+        } else {
+            // Compact ledger chips keep their visual bounds for flow measurement. Compose's
+            // pointer hit expansion still supplies the platform minimum touch target without
+            // inserting invisible vertical space between wrapped chip lines.
+            Dp.Unspecified
+        }
     ) {
-        Row(
-            modifier = Modifier.padding(
-                horizontal = if (expanded) 12.dp else 10.dp,
-                vertical = if (expanded) 8.dp else 7.dp
-            ),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        // ui-guardrails: allow-begin offgrid_spacing, offscale_radius - journal chip metrics as tuned in #572; the chart's chip layout measures them
+        Surface(
+            modifier = modifier.widthIn(max = if (expanded) 320.dp else 180.dp),
+            onClick = onClick,
+            color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.94f),
+            shape = RoundedCornerShape(if (expanded) 18.dp else 14.dp)
         ) {
-            Icon(
-                imageVector = journalTypeIcon(entry.type),
-                contentDescription = null,
-                tint = tint,
-                modifier = Modifier.size(if (expanded) 16.dp else 14.dp)
+            Row(
+                modifier = Modifier.padding(
+                    horizontal = if (expanded) 11.dp else 10.dp,
+                    vertical = if (expanded) 9.dp else 7.dp
+                ),
+                verticalAlignment = if (expanded) Alignment.Top else Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(if (expanded) 10.dp else 8.dp)
+            ) {
+                Icon(
+                    imageVector = journalTypeIcon(entry.type),
+                    contentDescription = null,
+                    tint = tint,
+                    modifier = Modifier
+                        .padding(top = if (expanded) 2.dp else 0.dp)
+                        .size(if (expanded) 18.dp else 14.dp)
+                )
+                if (expanded) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(7.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = chipContent.label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (chipContent.value == null) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            fontWeight = if (chipContent.value == null) FontWeight.SemiBold else FontWeight.Medium,
+                            maxLines = 2,
+                            softWrap = true,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        chipContent.value?.let { value ->
+                            Text(
+                                text = value,
+                                style = MaterialTheme.typography.titleSmall.copy(fontFeatureSettings = "tnum"),
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        chipContent.detail?.let { detail ->
+                            Text(
+                                text = detail,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                } else {
+                    Text(
+                        text = chipContent.label,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                (entry.originSource ?: entry.source).presentation()?.let { source ->
+                    // Where the number came from, in the colour of secondary text so it never
+                    // competes with the amount. For mirrored rows this is the sender's
+                    // authoritative origin; the ingress transport remains beside the time.
+                    Icon(
+                        imageVector = source.icon,
+                        contentDescription = stringResource(source.labelRes),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .padding(top = if (expanded) 3.dp else 0.dp)
+                            .size(if (expanded) 14.dp else 12.dp)
+                    )
+                // ui-guardrails: allow-end
+                }
+            }
+        }
+    }
+}
+
+private data class JournalInlineChipContent(
+    val label: String,
+    val value: String? = null,
+    val detail: String? = null
+)
+
+private fun journalInlineChipContent(
+    entry: JournalEntry,
+    insulinPreset: JournalInsulinPreset?,
+    food: JournalFood?,
+    unit: String,
+    expanded: Boolean
+): JournalInlineChipContent {
+    if (!expanded) {
+        return JournalInlineChipContent(
+            journalMarkerDetail(entry, insulinPreset, unit).ifBlank { entry.title }
+        )
+    }
+    return when (entry.type) {
+        JournalEntryType.INSULIN -> {
+            val amount = entry.amount?.let { Applic.app.getString(R.string.unit_insulin_value, formatFloatForEditor(it)) }
+            val label = insulinPreset?.displayName.cleanJournalChipText()
+                ?: entry.title.cleanJournalChipText()
+                ?: journalMarkerDetail(entry, insulinPreset, unit)
+            JournalInlineChipContent(
+                label = label,
+                value = amount?.takeUnless { it == label }
             )
-            Text(
-                text = inlineLabel,
-                style = if (expanded) MaterialTheme.typography.labelLarge else MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+        }
+
+        JournalEntryType.CARBS -> {
+            val amount = entry.amount?.let { Applic.app.getString(R.string.unit_carbs_value, formatFloatForEditor(it)) }
+            val label = food?.displayName.cleanJournalChipText()
+                ?: entry.title.cleanJournalChipText()
+                    ?.takeUnless(::isGenericCarbsChipTitle)
+                ?: Applic.app.getString(R.string.journal_type_food)
+            val macros = listOfNotNull(
+                entry.proteinGrams?.takeIf { it > 0f }?.let {
+                    Applic.app.getString(R.string.journal_food_protein_short, formatFloatForEditor(it))
+                },
+                entry.fatGrams?.takeIf { it > 0f }?.let {
+                    Applic.app.getString(R.string.journal_food_fat_short, formatFloatForEditor(it))
+                }
+            ).joinToString(" · ").takeIf { it.isNotBlank() }
+            JournalInlineChipContent(
+                label = label,
+                value = amount?.takeUnless { it == label },
+                detail = macros
+            )
+        }
+
+        JournalEntryType.FINGERSTICK -> {
+            val glucose = entry.glucoseValueMgDl?.let { formatGlucoseForEditor(it, unit) }
+            val label = entry.title.cleanJournalChipText()
+                ?: entry.note.cleanJournalChipText()
+                ?: Applic.app.getString(R.string.journal_type_bg_short)
+            JournalInlineChipContent(
+                label = label,
+                value = glucose?.takeUnless { it == label },
+                detail = entry.note.cleanJournalChipText()?.takeUnless { it == label }
+            )
+        }
+
+        JournalEntryType.ACTIVITY -> {
+            val duration = entry.durationMinutes?.let { Applic.app.getString(R.string.minutes_short_format, it) }
+            val label = entry.title.cleanJournalChipText()
+                ?: Applic.app.getString(R.string.journal_type_activity)
+            val intensity = entry.intensity?.let { Applic.app.getString(it.labelRes()) }
+            JournalInlineChipContent(
+                label = label,
+                value = duration?.takeUnless { it == label },
+                detail = intensity.takeIf { it != null && it != label }
+            )
+        }
+
+        JournalEntryType.NOTE -> {
+            val label = entry.title.cleanJournalChipText()
+                ?: entry.note.cleanJournalChipText()
+                ?: journalMarkerDetail(entry, insulinPreset, unit)
+            JournalInlineChipContent(
+                label = label,
+                detail = entry.note.cleanJournalChipText()
+                    ?.takeUnless { it == label }
             )
         }
     }
+}
+
+private fun String?.cleanJournalChipText(): String? =
+    this?.trim()?.takeIf { it.isNotBlank() }
+
+private fun isGenericCarbsChipTitle(value: String): Boolean {
+    val normalized = value.trim().lowercase(Locale.ROOT)
+    return normalized == "carbohydrate" ||
+        normalized == "carbohydrates" ||
+        normalized == "carb" ||
+        normalized == "carbs" ||
+        normalized == "food"
 }
 
 @Composable
@@ -2581,6 +2827,7 @@ private fun JournalEntryChip(
     onClick: () -> Unit
 ) {
     val tint = insulinPreset?.let { Color(it.accentColor) } ?: journalTypeColor(entry.type)
+    // ui-guardrails: allow-begin offgrid_spacing, offscale_radius - journal chip metrics as tuned in #572; the chart's chip layout measures them
     Surface(
         onClick = onClick,
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -2608,8 +2855,13 @@ private fun JournalEntryChip(
             }
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
+                // ui-guardrails: allow-end
                 Text(
-                    text = entry.title,
+                    text = if (entry.type == JournalEntryType.INSULIN) {
+                        insulinPreset?.displayName ?: entry.title
+                    } else {
+                        entry.title
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -2623,6 +2875,15 @@ private fun JournalEntryChip(
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
+            entry.source.presentation()?.let { source ->
+                Icon(
+                    imageVector = source.icon,
+                    contentDescription = stringResource(source.labelRes),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+            }
             Text(
                 text = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(entry.timestamp)),
                 style = MaterialTheme.typography.labelMedium,
@@ -2634,42 +2895,327 @@ private fun JournalEntryChip(
 }
 
 @Composable
-private fun JournalMetaCard(
-    modifier: Modifier = Modifier,
-    icon: ImageVector,
-    title: String,
-    value: String,
-    onClick: () -> Unit
+private fun JournalDateTimeCard(
+    date: String,
+    time: String,
+    onDateClick: () -> Unit,
+    onTimeClick: () -> Unit
 ) {
     Surface(
-        modifier = modifier,
-        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = RoundedCornerShape(18.dp)
+        shape = RoundedCornerShape(16.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 14.dp),
+                .heightIn(min = 56.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary
+            JournalDateTimeSegment(
+                modifier = Modifier.weight(1f),
+                icon = Icons.Default.Event,
+                contentDescription = stringResource(R.string.date),
+                value = date,
+                onClick = onDateClick
             )
-            Spacer(modifier = Modifier.width(10.dp))
-            Column {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(32.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+            )
+            JournalDateTimeSegment(
+                modifier = Modifier.weight(1f),
+                icon = Icons.Default.AccessTime,
+                contentDescription = stringResource(R.string.time),
+                value = time,
+                onClick = onTimeClick
+            )
+        }
+    }
+}
+
+@Composable
+private fun JournalDateTimeSegment(
+    modifier: Modifier,
+    icon: ImageVector,
+    contentDescription: String,
+    value: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = modifier
+            .heightIn(min = 56.dp)
+            .semantics(mergeDescendants = true) {
+                this.contentDescription = "$contentDescription, $value"
+                role = Role.Button
+            }
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun JournalInsulinWindowCard(
+    preset: JournalInsulinPreset
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val accent by animateColorAsState(
+        targetValue = Color(preset.accentColor),
+        animationSpec = tween(durationMillis = 220),
+        label = "journalInsulinWindowAccent"
+    )
+    val onset = formatJournalWindowEndpoint(preset.onsetMinutes)
+    val duration = formatJournalWindowEndpoint(preset.durationMinutes)
+    val summary = "$onset – $duration"
+    val windowDescription = stringResource(
+        R.string.journal_active_window,
+        stringResource(R.string.minutes_short_format, preset.onsetMinutes),
+        stringResource(R.string.minutes_short_format, preset.durationMinutes)
+    )
+
+    Surface(
+        modifier = Modifier
+            .animateContentSize(
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMediumLow
                 )
+            )
+            .then(
+                if (expanded) Modifier.fillMaxWidth() else Modifier.wrapContentWidth()
+            ),
+        color = if (expanded) {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        } else {
+            Color.Transparent
+        },
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .then(
+                        if (expanded) {
+                            Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                        } else {
+                            // The compact visual row keeps the sheet dense; Compose expands its
+                            // pointer hit area to the platform minimum within the surrounding gap.
+                            Modifier.height(32.dp)
+                        }
+                    )
+                    .semantics(mergeDescendants = true) {
+                        this.contentDescription = windowDescription
+                        role = Role.Button
+                    }
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Schedule,
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                AnimatedContent(
+                    targetState = summary,
+                    transitionSpec = {
+                        fadeIn(animationSpec = tween(durationMillis = 220))
+                            .togetherWith(fadeOut(animationSpec = tween(durationMillis = 120)))
+                    },
+                    label = "journalInsulinWindowSummary"
+                ) { value ->
+                    Text(
+                        text = value,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+            if (expanded) {
+                AnimatedContent(
+                    targetState = preset,
+                    transitionSpec = {
+                        fadeIn(animationSpec = tween(durationMillis = 220))
+                            .togetherWith(fadeOut(animationSpec = tween(durationMillis = 140)))
+                    },
+                    contentKey = { it.id },
+                    label = "journalInsulinWindowChart"
+                ) { visiblePreset ->
+                    JournalInsulinActivityCurve(
+                        points = visiblePreset.curvePoints,
+                        durationMinutes = visiblePreset.durationMinutes,
+                        color = Color(visiblePreset.accentColor),
+                        contentDescription = windowDescription,
+                        modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun formatJournalWindowEndpoint(minutes: Int): String {
+    val safeMinutes = minutes.coerceAtLeast(0)
+    if (safeMinutes < 720) {
+        return stringResource(R.string.minutes_short_format, safeMinutes)
+    }
+    return formatJournalWindowAxisTime(safeMinutes)
+}
+
+@Composable
+private fun formatJournalWindowAxisTime(minutes: Int): String {
+    val safeMinutes = minutes.coerceAtLeast(0)
+    if (safeMinutes == 0) return "0"
+    if (safeMinutes < 120) {
+        return stringResource(R.string.minutes_short_format, safeMinutes)
+    }
+    val hours = safeMinutes / 60
+    val remainingMinutes = safeMinutes % 60
+    return if (remainingMinutes == 0) {
+        stringResource(R.string.stats_duration_hours, hours)
+    } else {
+        stringResource(R.string.stats_duration_hours_minutes, hours, remainingMinutes)
+    }
+}
+
+@Composable
+private fun JournalInsulinActivityCurve(
+    points: List<JournalCurvePoint>,
+    durationMinutes: Int,
+    color: Color,
+    contentDescription: String,
+    modifier: Modifier = Modifier
+) {
+    val curvePoints = remember(points) {
+        points
+            .filter { it.minute >= 0 && it.activity.isFinite() }
+            .sortedBy { it.minute }
+    }
+    val guideColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+    val axisColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val xAxisMinutes = remember(durationMinutes) {
+        List(5) { index -> ((durationMinutes.coerceAtLeast(1) * index) / 4f).roundToInt() }
+    }
+
+    Column(
+        modifier = modifier
+            .semantics { this.contentDescription = contentDescription }
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(
+                modifier = Modifier
+                    .width(36.dp)
+                    .height(96.dp),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("100%", style = MaterialTheme.typography.labelSmall, color = axisColor)
+                Text("50%", style = MaterialTheme.typography.labelSmall, color = axisColor)
+                Text("0%", style = MaterialTheme.typography.labelSmall, color = axisColor)
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Canvas(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(96.dp)
+            ) {
+                if (curvePoints.size < 2) return@Canvas
+                val maxMinute = maxOf(durationMinutes, curvePoints.last().minute, 1).toFloat()
+                val top = 4.dp.toPx()
+                val baseline = size.height - 4.dp.toPx()
+                val curveHeight = (baseline - top).coerceAtLeast(1f)
+
+                repeat(3) { index ->
+                    val y = baseline - ((curveHeight / 2f) * index)
+                    drawLine(
+                        color = guideColor,
+                        start = androidx.compose.ui.geometry.Offset(0f, y),
+                        end = androidx.compose.ui.geometry.Offset(size.width, y),
+                        strokeWidth = 1.dp.toPx()
+                    )
+                }
+                repeat(5) { index ->
+                    val x = (size.width / 4f) * index
+                    drawLine(
+                        color = guideColor.copy(alpha = 0.6f),
+                        start = androidx.compose.ui.geometry.Offset(x, top),
+                        end = androidx.compose.ui.geometry.Offset(x, baseline),
+                        strokeWidth = 1.dp.toPx()
+                    )
+                }
+
+                val curvePath = Path()
+                val fillPath = Path()
+                curvePoints.forEachIndexed { index, point ->
+                    val x = (point.minute / maxMinute) * size.width
+                    val y = baseline - (point.activity.coerceIn(0f, 1f) * curveHeight)
+                    if (index == 0) {
+                        curvePath.moveTo(x, y)
+                        fillPath.moveTo(x, baseline)
+                        fillPath.lineTo(x, y)
+                    } else {
+                        curvePath.lineTo(x, y)
+                        fillPath.lineTo(x, y)
+                    }
+                }
+                fillPath.lineTo(size.width, baseline)
+                fillPath.close()
+
+                drawPath(path = fillPath, color = color.copy(alpha = 0.14f))
+                drawPath(path = curvePath, color = color, style = Stroke(width = 2.dp.toPx()))
+                curvePoints.maxByOrNull { it.activity }?.let { peak ->
+                    drawCircle(
+                        color = color,
+                        radius = 4.dp.toPx(),
+                        center = androidx.compose.ui.geometry.Offset(
+                            x = (peak.minute / maxMinute) * size.width,
+                            y = baseline - (peak.activity.coerceIn(0f, 1f) * curveHeight)
+                        )
+                    )
+                }
+            }
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 44.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            xAxisMinutes.forEach { minute ->
                 Text(
-                    text = value,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    text = formatJournalWindowAxisTime(minute),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = axisColor
                 )
             }
         }
@@ -2697,22 +3243,22 @@ private fun JournalStepperField(
         } else {
             MaterialTheme.colorScheme.surfaceContainerLow
         },
-        shape = RoundedCornerShape(if (prominent) 28.dp else 22.dp)
+        shape = RoundedCornerShape(if (prominent) 28.dp else 20.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(
-                    horizontal = if (prominent) 10.dp else 12.dp,
-                    vertical = if (prominent) 9.dp else 12.dp
+                    horizontal = if (prominent) 12.dp else 12.dp,
+                    vertical = if (prominent) 8.dp else 12.dp
                 ),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             FilledTonalIconButton(
                 onClick = { stepWithFeedback(-1) },
                 modifier = if (prominent) Modifier.size(56.dp) else Modifier,
-                shape = RoundedCornerShape(if (prominent) 18.dp else 14.dp)
+                shape = RoundedCornerShape(if (prominent) 16.dp else 12.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.Remove,
@@ -2742,7 +3288,7 @@ private fun JournalStepperField(
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .padding(horizontal = 6.dp),
+                                    .padding(horizontal = 8.dp),
                                 contentAlignment = Alignment.Center
                             ) {
                                 if (value.isEmpty()) {
@@ -2760,8 +3306,7 @@ private fun JournalStepperField(
                             suffix?.let {
                                 Text(
                                     text = it,
-                                    style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.titleLargeEmphasized,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
@@ -2782,9 +3327,8 @@ private fun JournalStepperField(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp, vertical = 8.dp),
-                        textStyle = MaterialTheme.typography.titleLarge.copy(
+                        textStyle = MaterialTheme.typography.titleLargeEmphasized.copy(
                             color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.SemiBold,
                             textAlign = TextAlign.Center
                         ),
                         singleLine = true,
@@ -2814,9 +3358,8 @@ private fun JournalStepperField(
                                         if (value.isBlank()) {
                                             Text(
                                                 text = "0",
-                                                style = MaterialTheme.typography.titleLarge.copy(
+                                                style = MaterialTheme.typography.titleLargeEmphasized.copy(
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.42f),
-                                                    fontWeight = FontWeight.SemiBold,
                                                     textAlign = TextAlign.Center
                                                 )
                                             )
@@ -2840,7 +3383,7 @@ private fun JournalStepperField(
             FilledTonalIconButton(
                 onClick = { stepWithFeedback(1) },
                 modifier = if (prominent) Modifier.size(56.dp) else Modifier,
-                shape = RoundedCornerShape(if (prominent) 18.dp else 14.dp)
+                shape = RoundedCornerShape(if (prominent) 16.dp else 12.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.Add,
@@ -2866,7 +3409,7 @@ private fun describeJournalEntry(
                     Applic.app.getString(R.string.minutes_short_format, it.durationMinutes)
                 )
             }
-            listOfNotNull("$amount U".takeIf { amount.isNotBlank() }, window, entry.note).joinToString(" · ")
+            listOfNotNull(Applic.app.getString(R.string.unit_insulin_value, amount).takeIf { amount.isNotBlank() }, window, entry.note).joinToString(" · ")
         }
 
         JournalEntryType.CARBS -> {
@@ -2880,7 +3423,7 @@ private fun describeJournalEntry(
             val fat = entry.fatGrams?.takeIf { it > 0f }?.let {
                 Applic.app.getString(R.string.journal_food_fat_short, formatFloatForEditor(it))
             }
-            listOfNotNull("$amount g".takeIf { amount.isNotBlank() }, protein, fat, curve, entry.note)
+            listOfNotNull(amount.takeIf { it.isNotBlank() }?.let { Applic.app.getString(R.string.unit_carbs_value, it) }, protein, fat, curve, entry.note)
                 .joinToString(" · ")
         }
 
@@ -2921,14 +3464,8 @@ private fun journalMarkerDetail(
     unit: String
 ): String {
     return when (entry.type) {
-        JournalEntryType.INSULIN -> {
-            val amount = entry.amount?.let(::formatFloatForEditor).orEmpty()
-            "$amount U".trim()
-        }
-
-        JournalEntryType.CARBS -> {
-            val amount = entry.amount?.let(::formatFloatForEditor).orEmpty()
-            "$amount g".trim()
+        JournalEntryType.INSULIN, JournalEntryType.CARBS -> {
+            entry.amount?.let { journalMarkerAmountText(entry.type, it) }.orEmpty()
         }
 
         JournalEntryType.FINGERSTICK -> {
@@ -2943,6 +3480,13 @@ private fun journalMarkerDetail(
             (entry.note ?: entry.title).take(10)
         }
     }
+}
+
+/** An insulin or carbs amount as its chart chip shows it, such as "2 U"; null for other types. */
+internal fun journalMarkerAmountText(type: JournalEntryType, amount: Float): String? = when (type) {
+    JournalEntryType.INSULIN -> Applic.app.getString(R.string.unit_insulin_value, formatFloatForEditor(amount))
+    JournalEntryType.CARBS -> Applic.app.getString(R.string.unit_carbs_value, formatFloatForEditor(amount))
+    else -> null
 }
 
 private fun formatGlucoseForEditor(glucoseMgDl: Float, unit: String): String {
@@ -2993,7 +3537,7 @@ private fun journalTypeIcon(type: JournalEntryType): ImageVector {
 private fun JournalEntryType.labelRes(): Int {
     return when (this) {
         JournalEntryType.INSULIN -> R.string.journal_type_insulin
-        JournalEntryType.CARBS -> R.string.carbo
+        JournalEntryType.CARBS -> R.string.journal_type_food
         JournalEntryType.FINGERSTICK -> R.string.journal_type_fingerstick
         JournalEntryType.ACTIVITY -> R.string.journal_type_activity
         JournalEntryType.NOTE -> R.string.journal_type_note
@@ -3029,15 +3573,6 @@ private fun suggestedCarbAmountForFraction(fraction: Float): String {
 private fun adjustIntegerDraft(value: String, delta: Int, minValue: Int = 0): String {
     val current = value.parseIntOrNull() ?: 0
     return (current + delta).coerceAtLeast(minValue).toString()
-}
-
-private fun mergeJournalDate(currentTimestamp: Long, selectedDayTimestamp: Long): Long {
-    val current = Calendar.getInstance().apply { timeInMillis = currentTimestamp }
-    val selected = Calendar.getInstance().apply { timeInMillis = selectedDayTimestamp }
-    current.set(Calendar.YEAR, selected.get(Calendar.YEAR))
-    current.set(Calendar.MONTH, selected.get(Calendar.MONTH))
-    current.set(Calendar.DAY_OF_MONTH, selected.get(Calendar.DAY_OF_MONTH))
-    return current.timeInMillis
 }
 
 private fun mergeJournalTime(currentTimestamp: Long, selectedTime: Pair<Int, Int>): Long {

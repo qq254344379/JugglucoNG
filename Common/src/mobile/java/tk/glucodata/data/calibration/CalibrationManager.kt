@@ -15,6 +15,9 @@ import tk.glucodata.Applic
 import tk.glucodata.Natives
 import tk.glucodata.SensorIdentity
 import tk.glucodata.UiRefreshBus
+import tk.glucodata.WearSync2
+import tk.glucodata.alerts.AlertRuntimeManager
+import tk.glucodata.data.HistoryDatabase
 import java.util.LinkedHashMap
 import kotlin.math.abs
 import kotlin.math.pow
@@ -24,15 +27,29 @@ object CalibrationManager {
     private const val PREFS_NAME = "calibration_prefs"
     private const val KEY_ENABLED_RAW = "calibration_enabled_raw"
     private const val KEY_ENABLED_AUTO = "calibration_enabled_auto"
+    private const val KEY_SENSOR_ENABLEMENT_MIGRATED = "calibration_sensor_enablement_migrated"
+    private const val KEY_DISABLED_RAW_SENSOR_IDS = "calibration_disabled_raw_sensor_ids"
+    private const val KEY_DISABLED_AUTO_SENSOR_IDS = "calibration_disabled_auto_sensor_ids"
+    private const val KEY_BLANK_SENSOR_IDS_MIGRATED = "calibration_blank_sensor_ids_migrated"
+    private const val KEY_HISTORY_SENSOR_REPAIR_MIGRATED = "calibration_history_sensor_repair_migrated"
     private const val KEY_ALGORITHM_RAW = "calibration_algorithm_raw"
     private const val KEY_ALGORITHM_AUTO = "calibration_algorithm_auto"
     private const val KEY_HIDE_INITIAL_WHEN_CALIBRATED = "hide_initial_when_calibrated"
     private const val KEY_APPLY_TO_PAST = "calibration_apply_to_past"
     private const val KEY_LOCK_PAST_HISTORY = "calibration_lock_past_history"
     private const val KEY_OVERWRITE_SENSOR_VALUES = "calibration_overwrite_sensor_values"
+    private const val KEY_FREEZE_DISPLAYED_VALUES = "calibration_freeze_displayed_values"
+    private const val KEY_FREEZE_MIGRATED_FROM_OVERWRITE = "calibration_freeze_migrated_from_overwrite"
     private const val KEY_VISUAL_CONTINUITY = "calibration_visual_continuity"
+    private const val KEY_CALIBRATE_FROM_JOURNAL = "calibration_from_journal_bg"
+    private const val KEY_KEEP_DISABLED_HISTORY = "calibration_keep_disabled_history"
+    private const val KEY_WEIGHT_MODE = "calibration_weight_mode"
+    private const val KEY_PROFILE_REVISION_PREFIX = "calibration_profile_revision_"
     private const val HOUR_MS = 3_600_000.0
     private const val PAST_BLEND_WINDOW_MS = 30L * 60L * 1000L
+    private const val INTEGRATED_ANCHOR_MATCH_MS = 2L * 60L * 1000L
+    private const val LEGACY_SENSOR_RESOLUTION_WINDOW_MS = 15L * 60L * 1000L
+    private const val MAX_MANAGED_CALIBRATION_ANCHORS = 12
 
     enum class CalibrationAlgorithm(
         val storageValue: String,
@@ -72,28 +89,20 @@ object CalibrationManager {
         }
     }
 
-    private data class CalPoint(
-        val x: Double,
-        val y: Double,
-        val timestamp: Long
-    )
-
-    private data class LinearModel(
-        val slope: Double,
-        val intercept: Double
+    enum class CalibrationWeightMode(
+        val storageValue: String
     ) {
-        fun predict(x: Double): Double = slope * x + intercept
+        FRESH("fresh"),
+        BALANCED("balanced"),
+        STABLE("stable");
+
+        companion object {
+            fun fromStorage(value: String?): CalibrationWeightMode {
+                return values().firstOrNull { it.storageValue == value } ?: FRESH
+            }
+        }
     }
 
-    private data class AlgorithmComputation(
-        val prediction: Double,
-        val slope: Double? = null,
-        val intercept: Double? = null,
-        val offset: Double? = null,
-        val anchorInfluence: Double? = null,
-        val confidence: Double? = null,
-        val note: String = ""
-    )
 
     data class CalibrationDiagnostics(
         val algorithm: CalibrationAlgorithm = CalibrationAlgorithm.ADAPTIVE_ENSEMBLE,
@@ -112,6 +121,12 @@ object CalibrationManager {
     data class CalibrationSample(
         val value: Float,
         val timestamp: Long
+    )
+
+    data class SensorCalibrationEnablement(
+        val sensorId: String,
+        val rawEnabled: Boolean,
+        val autoEnabled: Boolean
     )
 
     private data class CalibrationCacheKey(
@@ -135,6 +150,27 @@ object CalibrationManager {
         val allPoints: List<CalPoint>,
         val earliestPoint: CalPoint?
     )
+
+    private data class SeriesCalibratorKey(
+        val isRawMode: Boolean,
+        val sensorId: String,
+        val revision: Long,
+        val tuning: CalibrationTuning,
+        val applyToPast: Boolean,
+    )
+
+    private data class IntegratedContextCacheKey(
+        val sensorId: String,
+        val isRawMode: Boolean,
+        val revision: Long,
+        val unit: Int,
+    )
+
+    private data class IntegratedBaselineCacheKey(
+        val sensorId: String,
+        val isRawMode: Boolean,
+        val unit: Int,
+    )
     
     private lateinit var database: CalibrationDatabase
     private lateinit var dao: CalibrationDao
@@ -147,14 +183,13 @@ object CalibrationManager {
     private val _calibrations = MutableStateFlow<List<CalibrationEntity>>(emptyList())
     val calibrations: StateFlow<List<CalibrationEntity>> = _calibrations
     
-    // Per-mode enable/disable state
-    private val _isEnabledForRaw = MutableStateFlow(true)
-    val isEnabledForRaw: StateFlow<Boolean> = _isEnabledForRaw
-    
-    private val _isEnabledForAuto = MutableStateFlow(true)
-    val isEnabledForAuto: StateFlow<Boolean> = _isEnabledForAuto
+    // Calibration enablement is per sensor and mode. An absent sensor ID is enabled by
+    // default, matching the historical global default without leaking one sensor's toggle
+    // into another sensor's history.
+    private val _disabledRawSensorIds = MutableStateFlow<Set<String>>(emptySet())
+    private val _disabledAutoSensorIds = MutableStateFlow<Set<String>>(emptySet())
 
-    private val _hideInitialWhenCalibrated = MutableStateFlow(false)
+    private val _hideInitialWhenCalibrated = MutableStateFlow(true)
     val hideInitialWhenCalibrated: StateFlow<Boolean> = _hideInitialWhenCalibrated
 
     private val _applyToPast = MutableStateFlow(false)
@@ -163,11 +198,27 @@ object CalibrationManager {
     private val _lockPastHistory = MutableStateFlow(false)
     val lockPastHistory: StateFlow<Boolean> = _lockPastHistory
 
+    private val _keepDisabledHistory = MutableStateFlow(false)
+    val keepDisabledHistory: StateFlow<Boolean> = _keepDisabledHistory
+
     private val _overwriteSensorValues = MutableStateFlow(false)
     val overwriteSensorValues: StateFlow<Boolean> = _overwriteSensorValues
 
-    private val _visualContinuity = MutableStateFlow(false)
+    /**
+     * Whether a displayed glucose value stops changing once it has stood on
+     * screen — see `tk.glucodata.data.ReadingDisplay`. On by default.
+     */
+    private val _freezeDisplayedValues = MutableStateFlow(true)
+    val freezeDisplayedValues: StateFlow<Boolean> = _freezeDisplayedValues
+
+    private val _visualContinuity = MutableStateFlow(true)
     val visualContinuity: StateFlow<Boolean> = _visualContinuity
+
+    private val _calibrateFromJournal = MutableStateFlow(false)
+    val calibrateFromJournal: StateFlow<Boolean> = _calibrateFromJournal
+
+    private val _weightMode = MutableStateFlow(CalibrationWeightMode.FRESH)
+    val weightMode: StateFlow<CalibrationWeightMode> = _weightMode
 
     // Per-mode algorithm selection
     private val _algorithmForRaw = MutableStateFlow(CalibrationAlgorithm.ADAPTIVE_ENSEMBLE)
@@ -187,6 +238,8 @@ object CalibrationManager {
 
     @Volatile
     private var calibrationRevision = 0L
+    private val _revision = MutableStateFlow(0L)
+    val revision: StateFlow<Long> = _revision
     @Volatile
     private var suppressMirrorSyncCount = 0
     private val calibrationCache = object : LinkedHashMap<CalibrationCacheKey, Float>(512, 0.75f, true) {
@@ -199,6 +252,9 @@ object CalibrationManager {
             return size > 128
         }
     }
+    private val integratedContextCache = LinkedHashMap<IntegratedContextCacheKey, CalibrationContext>()
+    private val seriesCalibrators = HashMap<SeriesCalibratorKey, SeriesCalibrator>()
+    private val integratedBaselineCache = LinkedHashMap<IntegratedBaselineCacheKey, List<CalibrationSample>>()
 
     fun init(context: Context) {
         synchronized(initLock) {
@@ -210,13 +266,19 @@ object CalibrationManager {
         database = CalibrationDatabase.getInstance(context)
         dao = database.calibrationDao()
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        _isEnabledForRaw.value = prefs.getBoolean(KEY_ENABLED_RAW, true)
-        _isEnabledForAuto.value = prefs.getBoolean(KEY_ENABLED_AUTO, true)
-        _hideInitialWhenCalibrated.value = prefs.getBoolean(KEY_HIDE_INITIAL_WHEN_CALIBRATED, false)
+        _disabledRawSensorIds.value = readSensorIdSet(KEY_DISABLED_RAW_SENSOR_IDS)
+        _disabledAutoSensorIds.value = readSensorIdSet(KEY_DISABLED_AUTO_SENSOR_IDS)
+        _hideInitialWhenCalibrated.value = prefs.getBoolean(KEY_HIDE_INITIAL_WHEN_CALIBRATED, true)
         _applyToPast.value = prefs.getBoolean(KEY_APPLY_TO_PAST, false)
         _lockPastHistory.value = prefs.getBoolean(KEY_LOCK_PAST_HISTORY, false)
+        _keepDisabledHistory.value = prefs.getBoolean(KEY_KEEP_DISABLED_HISTORY, false)
         _overwriteSensorValues.value = prefs.getBoolean(KEY_OVERWRITE_SENSOR_VALUES, false)
-        _visualContinuity.value = prefs.getBoolean(KEY_VISUAL_CONTINUITY, false)
+        _freezeDisplayedValues.value = prefs.getBoolean(KEY_FREEZE_DISPLAYED_VALUES, true)
+        _visualContinuity.value = prefs.getBoolean(KEY_VISUAL_CONTINUITY, true)
+        _calibrateFromJournal.value = prefs.getBoolean(KEY_CALIBRATE_FROM_JOURNAL, false)
+        _weightMode.value = CalibrationWeightMode.fromStorage(
+            prefs.getString(KEY_WEIGHT_MODE, CalibrationWeightMode.FRESH.storageValue)
+        )
         runCatching { Natives.setCalibratePast(_applyToPast.value) }
         _algorithmForRaw.value = CalibrationAlgorithm.fromStorage(
             prefs.getString(KEY_ALGORITHM_RAW, CalibrationAlgorithm.ADAPTIVE_ENSEMBLE.storageValue)
@@ -251,7 +313,10 @@ object CalibrationManager {
                 return true
             }
             val list = runCatching {
-                runBlocking(Dispatchers.IO) { dao.getAllSync() }
+                runBlocking(Dispatchers.IO) {
+                    migrateCalibrationSensorIdsIfPossible()
+                    dao.getAllSync()
+                }
             }.onFailure {
                 Log.w(TAG, "Failed to load calibrations for background access", it)
             }.getOrNull() ?: return false
@@ -264,64 +329,339 @@ object CalibrationManager {
 
     private fun invalidateComputationCache(reason: String) {
         calibrationRevision++
+        _revision.value = calibrationRevision
         synchronized(calibrationCache) {
             calibrationCache.clear()
         }
         synchronized(validPointsCache) {
             validPointsCache.clear()
         }
+        synchronized(integratedContextCache) {
+            integratedContextCache.clear()
+        }
+        synchronized(seriesCalibrators) {
+            seriesCalibrators.clear()
+        }
         Log.d(TAG, "Calibration cache invalidated: $reason")
+        runCatching {
+            tk.glucodata.drivers.ManagedSensorRuntime.notifyUserCalibrationRevisionChanged(calibrationRevision)
+        }
     }
 
     fun getRevision(): Long = calibrationRevision
+
+    @JvmStatic
+    fun getIntegratedCalibrationFingerprint(sensorIdOverride: String?, isRawMode: Boolean): Long {
+        val sensorId = resolveSensorId(sensorIdOverride)
+        val enabled = isEnabledForMode(isRawMode, sensorId)
+        ensureCalibrationStateLoaded()
+        var hash = 1_125_899_906_842_597L
+        fun mix(value: Long) {
+            hash = hash * 31L + value
+        }
+        mix(sensorId.hashCode().toLong())
+        mix(if (isRawMode) 1L else 0L)
+        mix(if (enabled) 1L else 0L)
+        mix(Applic.unit.toLong())
+        mix(getAlgorithmForMode(isRawMode).storageValue.hashCode().toLong())
+        mix(_weightMode.value.storageValue.hashCode().toLong())
+        mix(if (_applyToPast.value) 1L else 0L)
+        mix(if (_lockPastHistory.value) 1L else 0L)
+        mix(if (_keepDisabledHistory.value) 1L else 0L)
+        _calibrations.value
+            .asSequence()
+            .filter { matchesMode(it, isRawMode) && sensorMatches(it.sensorId, sensorId) }
+            .sortedWith(compareBy<CalibrationEntity> { it.timestamp }.thenBy { it.id })
+            .forEach { point ->
+                mix(point.id.toLong())
+                mix(point.timestamp)
+                mix(java.lang.Float.floatToRawIntBits(point.sensorValue).toLong())
+                mix(java.lang.Float.floatToRawIntBits(point.sensorValueRaw).toLong())
+                mix(java.lang.Float.floatToRawIntBits(point.userValue).toLong())
+                mix(if (point.isEnabled) 1L else 0L)
+            }
+        return hash
+    }
+
+    /**
+     * Whether the stored calibrations are actually in memory.
+     *
+     * Callers that publish "there is no calibration" — the watch sync above all —
+     * must check this first: a load can fail transiently (a Room WAL recovering
+     * right after an install, say), and an empty anchor set is then a lie that
+     * makes the watch show raw readings.
+     */
+    @JvmStatic
+    fun isCalibrationStateLoaded(): Boolean = ensureCalibrationStateLoaded()
+
+    @JvmStatic
+    fun getActiveCalibrationAnchors(sensorIdOverride: String?, isRawMode: Boolean): DoubleArray {
+        val sensorId = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, sensorId)) return DoubleArray(0)
+        ensureCalibrationStateLoaded()
+        val rows = _calibrations.value
+            .asSequence()
+            .filter { row ->
+                row.isEnabled &&
+                    matchesMode(row, isRawMode) &&
+                    sensorMatches(row.sensorId, sensorId)
+            }
+            .sortedBy { it.timestamp }
+            .toList()
+            .takeLast(MAX_MANAGED_CALIBRATION_ANCHORS)
+        return DoubleArray(rows.size * 3).also { packed ->
+            rows.forEachIndexed { index, row ->
+                packed[index * 3] = (if (isRawMode) row.sensorValueRaw else row.sensorValue).toDouble()
+                packed[index * 3 + 1] = row.userValue.toDouble()
+                packed[index * 3 + 2] = row.timestamp.toDouble()
+            }
+        }
+    }
+
+    /**
+     * The anchors an integrated evaluation actually fits against, for a driver
+     * that folds calibration into the values it stores.
+     *
+     * A stored anchor's x is the value that was on screen when it was taken,
+     * which for such a driver is already corrected. Fitting against that is
+     * self-referential, so [rebaseIntegratedContext] moves each anchor onto the
+     * stock value at its timestamp before the model runs; this exposes the
+     * result so the watch can integrate with the same numbers instead of
+     * inventing its own. Falls back to the stored anchors where no stock value
+     * is known for a timestamp, exactly as the local path does.
+     */
+    @JvmStatic
+    fun getIntegratedCalibrationAnchors(sensorIdOverride: String?, isRawMode: Boolean): DoubleArray {
+        val sensorId = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, sensorId)) return DoubleArray(0)
+        ensureCalibrationStateLoaded()
+        val stored = resolveCalibrationContext(isRawMode, sensorId) ?: return DoubleArray(0)
+        val baselineKey = IntegratedBaselineCacheKey(sensorId, isRawMode, Applic.unit)
+        val baseline = synchronized(integratedBaselineCache) { integratedBaselineCache[baselineKey] }
+        val context = applyRecordedStock(
+            if (baseline.isNullOrEmpty()) stored else rebaseIntegratedContext(stored, baseline),
+            isRawMode,
+            sensorId,
+        )
+        val points = context.allPoints
+            .filter { it.isEnabled }
+            .sortedBy { it.timestamp }
+            .takeLast(MAX_MANAGED_CALIBRATION_ANCHORS)
+        return DoubleArray(points.size * 3).also { packed ->
+            points.forEachIndexed { index, point ->
+                packed[index * 3] = point.x
+                packed[index * 3 + 1] = point.y
+                packed[index * 3 + 2] = point.timestamp.toDouble()
+            }
+        }
+    }
+
+    @JvmStatic
+    fun notifyExternalCalibrationPipelineChanged() {
+        ensureInitialized()
+        invalidateComputationCache("externalCalibrationPipeline")
+        requestUiRefreshAfterCalibrationChange()
+    }
 
     private fun normalizeSensorId(sensorId: String?): String {
         val normalized = sensorId?.trim()?.takeIf { it.isNotEmpty() } ?: return ""
         return SensorIdentity.resolveAppSensorId(normalized) ?: normalized
     }
 
-    private inline fun <T> withoutMirrorSync(block: () -> T): T {
-        suppressMirrorSyncCount++
-        return try {
-            block()
-        } finally {
-            suppressMirrorSyncCount--
+    private fun resolveSensorId(sensorIdOverride: String? = null): String {
+        val requested = normalizeSensorId(sensorIdOverride)
+        if (requested.isNotBlank()) return requested
+        val main = normalizeSensorId(SensorIdentity.resolveMainSensor())
+        if (main.isNotBlank()) return main
+        return normalizeSensorId(Natives.lastsensorname())
+    }
+
+    fun getResolvedCurrentSensorId(): String = resolveSensorId()
+
+    fun getSensorEnablementSnapshot(): List<SensorCalibrationEnablement> {
+        ensureCalibrationStateLoaded()
+        val sensorIds = SensorIdentity.distinctLogicalSensorIds(
+            buildList<String?> {
+                addAll(_calibrations.value.map { it.sensorId })
+                addAll(_disabledRawSensorIds.value)
+                addAll(_disabledAutoSensorIds.value)
+                add(resolveSensorId())
+            }
+        )
+        return sensorIds.map { sensorId ->
+            SensorCalibrationEnablement(
+                sensorId = sensorId,
+                rawEnabled = isEnabledForMode(isRawMode = true, sensorIdOverride = sensorId),
+                autoEnabled = isEnabledForMode(isRawMode = false, sensorIdOverride = sensorId)
+            )
         }
     }
 
-    private fun shouldMirrorSync(): Boolean = suppressMirrorSyncCount <= 0
-
-    private fun requestMirrorCalibrationSync(sensorId: String?) {
-        if (!shouldMirrorSync()) return
-        val normalized = normalizeSensorId(sensorId)
-        if (normalized.isBlank()) return
-        runCatching { Natives.requestMirrorCalibrationSync(normalized) }
-            .onFailure { Log.w(TAG, "Failed requesting mirror calibration sync for $normalized", it) }
+    private fun readSensorIdSet(key: String): Set<String> {
+        if (!::prefs.isInitialized) return emptySet()
+        return prefs.getStringSet(key, emptySet())
+            .orEmpty()
+            .mapNotNull { normalizeSensorId(it).takeIf(String::isNotBlank) }
+            .toSet()
     }
 
-    private fun requestMirrorCalibrationSyncForSensors(sensorIds: Iterable<String?>) {
-        if (!shouldMirrorSync()) return
-        val targets = linkedSetOf<String>()
-        sensorIds.forEach { candidate ->
-            normalizeSensorId(candidate).takeIf { it.isNotBlank() }?.let(targets::add)
+    private fun updateDisabledSensorSet(
+        current: Set<String>,
+        sensorId: String,
+        disabled: Boolean
+    ): Set<String> {
+        return SensorCalibrationEnablementPolicy.update(
+            disabledSensorIds = current,
+            sensorId = sensorId,
+            disabled = disabled,
+            matches = SensorIdentity::matches
+        )
+    }
+
+    private fun persistDisabledSensorSet(isRawMode: Boolean, sensorIds: Set<String>) {
+        val key = if (isRawMode) KEY_DISABLED_RAW_SENSOR_IDS else KEY_DISABLED_AUTO_SENSOR_IDS
+        prefs.edit().putStringSet(key, sensorIds.toSet()).apply()
+    }
+
+    private fun migrateLegacyEnablementIfPossible() {
+        if (!ensureInitialized() || prefs.getBoolean(KEY_SENSOR_ENABLEMENT_MIGRATED, false)) return
+        val currentSensor = resolveSensorId()
+        if (currentSensor.isBlank()) return
+
+        val migrated = SensorCalibrationEnablementPolicy.migrateLegacyGlobalState(
+            rawEnabled = prefs.getBoolean(KEY_ENABLED_RAW, true),
+            autoEnabled = prefs.getBoolean(KEY_ENABLED_AUTO, true),
+            currentSensorId = currentSensor,
+            existing = SensorCalibrationDisabledSets(
+                raw = _disabledRawSensorIds.value,
+                auto = _disabledAutoSensorIds.value
+            ),
+            matches = SensorIdentity::matches
+        )
+        val rawDisabled = migrated.raw
+        val autoDisabled = migrated.auto
+        _disabledRawSensorIds.value = rawDisabled
+        _disabledAutoSensorIds.value = autoDisabled
+        prefs.edit()
+            .putStringSet(KEY_DISABLED_RAW_SENSOR_IDS, rawDisabled.toSet())
+            .putStringSet(KEY_DISABLED_AUTO_SENSOR_IDS, autoDisabled.toSet())
+            .putBoolean(KEY_SENSOR_ENABLEMENT_MIGRATED, true)
+            .apply()
+        Log.i(TAG, "Migrated global calibration enablement to sensor=$currentSensor")
+    }
+
+    private suspend fun migrateBlankSensorIdsIfPossible() {
+        if (!::prefs.isInitialized || prefs.getBoolean(KEY_BLANK_SENSOR_IDS_MIGRATED, false)) return
+        val blankRows = dao.getBlankSensorIdRows()
+        if (blankRows.isEmpty()) {
+            prefs.edit().putBoolean(KEY_BLANK_SENSOR_IDS_MIGRATED, true).apply()
+            return
         }
-        normalizeSensorId(Natives.lastsensorname()).takeIf { it.isNotBlank() }?.let(targets::add)
-        targets.forEach(::requestMirrorCalibrationSync)
+        var assigned = 0
+        var unresolved = 0
+        blankRows.forEach { row ->
+            val resolvedSensor = resolveLegacyCalibrationSensorFromHistory(row.timestamp)
+            if (resolvedSensor.isNullOrBlank()) {
+                unresolved++
+            } else {
+                assigned += dao.assignBlankSensorId(row.id, resolvedSensor)
+            }
+        }
+        if (unresolved == 0) {
+            prefs.edit().putBoolean(KEY_BLANK_SENSOR_IDS_MIGRATED, true).apply()
+        }
+        if (assigned > 0) {
+            Log.i(TAG, "Resolved $assigned legacy blank calibration row(s) from Room history")
+        }
+        if (unresolved > 0) {
+            Log.w(TAG, "Left $unresolved legacy blank calibration row(s) unresolved; not assigning to current sensor")
+        }
     }
 
-    private fun requestMirrorCalibrationSyncForCurrentOrKnownSensors() {
-        requestMirrorCalibrationSyncForSensors(_calibrations.value.map { it.sensorId })
+    private suspend fun repairHistoryAssignedSensorIdsIfPossible() {
+        if (!::prefs.isInitialized) return
+        if (!prefs.getBoolean(KEY_BLANK_SENSOR_IDS_MIGRATED, false)) return
+        if (prefs.getBoolean(KEY_HISTORY_SENSOR_REPAIR_MIGRATED, false)) return
+
+        val rows = dao.getAllSync().filter { it.sensorId.isNotBlank() }
+        if (rows.isEmpty()) {
+            prefs.edit().putBoolean(KEY_HISTORY_SENSOR_REPAIR_MIGRATED, true).apply()
+            return
+        }
+
+        var repaired = 0
+        var ambiguous = 0
+        rows.forEach { row ->
+            val resolvedSensor = resolveLegacyCalibrationSensorFromHistory(row.timestamp)
+            when {
+                resolvedSensor.isNullOrBlank() -> ambiguous++
+                sensorMatches(row.sensorId, resolvedSensor) -> Unit
+                else -> repaired += dao.updateSensorId(row.id, resolvedSensor)
+            }
+        }
+
+        if (ambiguous == 0) {
+            prefs.edit().putBoolean(KEY_HISTORY_SENSOR_REPAIR_MIGRATED, true).apply()
+        }
+        if (repaired > 0) {
+            Log.w(TAG, "Repaired $repaired calibration sensor ID(s) using Room history timestamps")
+        }
     }
 
-    private fun requestUiRefreshAfterCalibrationChange() {
-        UiRefreshBus.requestDataRefresh()
-        UiRefreshBus.requestStatusRefresh()
+    private suspend fun resolveLegacyCalibrationSensorFromHistory(timestamp: Long): String? {
+        val context = Applic.app ?: return null
+        if (timestamp <= 0L) return null
+        val readings = runCatching {
+            HistoryDatabase.getInstance(context)
+                .historyDao()
+                .getReadingsBetween(
+                    startTime = timestamp - LEGACY_SENSOR_RESOLUTION_WINDOW_MS,
+                    endTime = timestamp + LEGACY_SENSOR_RESOLUTION_WINDOW_MS
+                )
+        }.onFailure {
+            Log.w(TAG, "Unable to resolve legacy calibration sensor from history", it)
+        }.getOrNull().orEmpty()
+
+        val sensorIds = SensorIdentity.distinctLogicalSensorIds(
+            readings.map { reading -> reading.sensorSerial }
+        )
+        return sensorIds.singleOrNull()
+    }
+
+    fun calibrationMatchesSensor(calibrationSensorId: String?, sensorId: String?): Boolean {
+        val calibrationSensor = normalizeSensorId(calibrationSensorId)
+        val targetSensor = normalizeSensorId(sensorId)
+        if (calibrationSensor.isBlank() || targetSensor.isBlank()) return false
+        return SensorIdentity.matches(calibrationSensor, targetSensor)
+    }
+
+    fun isLegacyUnresolvedCalibration(calibration: CalibrationEntity): Boolean {
+        return calibration.sensorId.isBlank()
+    }
+
+    private suspend fun migrateCalibrationSensorIdsIfPossible() {
+        val legacyBlankMigrationAlreadyMarked = ::prefs.isInitialized &&
+            prefs.getBoolean(KEY_BLANK_SENSOR_IDS_MIGRATED, false)
+        migrateBlankSensorIdsIfPossible()
+        if (legacyBlankMigrationAlreadyMarked) {
+            repairHistoryAssignedSensorIdsIfPossible()
+        }
     }
 
     private fun sensorMatches(calibrationSensorId: String, sensorId: String): Boolean {
-        if (calibrationSensorId.isBlank()) return true
-        if (sensorId.isBlank()) return false
-        return SensorIdentity.matches(calibrationSensorId, sensorId)
+        return calibrationMatchesSensor(calibrationSensorId, sensorId)
+    }
+
+    /**
+     * Whether a stored point belongs to the lane being computed.
+     *
+     * A hand-entered calibration is made against one lane and stays there. A
+     * journal-derived one is a finger stick — a fact about the blood, not about
+     * a lane — and both lanes were captured when it was paired, so it counts in
+     * either mode.
+     */
+    fun matchesMode(calibration: CalibrationEntity, isRawMode: Boolean): Boolean {
+        return calibration.journalEntryId != null || calibration.isRawMode == isRawMode
     }
 
     private fun getValidPoints(isRawMode: Boolean, sensorId: String): List<CalPoint> {
@@ -341,14 +681,15 @@ object CalibrationManager {
             .asSequence()
             .filter {
                 it.isEnabled &&
-                    it.isRawMode == isRawMode &&
+                    matchesMode(it, isRawMode) &&
                     sensorMatches(it.sensorId, normalizedSensorId)
             }
             .map { p ->
                 CalPoint(
                     x = (if (isRawMode) p.sensorValueRaw else p.sensorValue).toDouble(),
                     y = p.userValue.toDouble(),
-                    timestamp = p.timestamp
+                    timestamp = p.timestamp,
+                    isEnabled = true
                 )
             }
             .toList()
@@ -358,34 +699,162 @@ object CalibrationManager {
         return points
     }
 
+    private inline fun <T> withoutMirrorSync(block: () -> T): T {
+        suppressMirrorSyncCount++
+        return try {
+            block()
+        } finally {
+            suppressMirrorSyncCount--
+        }
+    }
+
+    private fun shouldMirrorSync(): Boolean = suppressMirrorSyncCount <= 0
+
+    private fun profileRevisionKey(sensorId: String) = KEY_PROFILE_REVISION_PREFIX + sensorId
+
+    private fun storedProfileRevision(sensorId: String): Long {
+        if (!::prefs.isInitialized || sensorId.isBlank()) return 0L
+        return runCatching { prefs.getLong(profileRevisionKey(sensorId), 0L) }.getOrDefault(0L)
+    }
+
+    private fun setStoredProfileRevision(sensorId: String, revision: Long) {
+        if (!::prefs.isInitialized || sensorId.isBlank()) return
+        prefs.edit().putLong(profileRevisionKey(sensorId), revision).apply()
+    }
+
+    /** How recent this device's calibration profile for [sensorId] is. */
+    private fun localProfileRevision(sensorId: String): Long {
+        val newestRow = _calibrations.value
+            .asSequence()
+            .filter { sensorMatches(it.sensorId, sensorId) }
+            .maxOfOrNull { it.timestamp } ?: 0L
+        return MirrorCalibrationProfilePolicy.localRevision(
+            storedRevision = storedProfileRevision(sensorId),
+            newestCalibrationTimestamp = newestRow
+        )
+    }
+
+    /** Marks the local profile as the newest one, so peers stop overwriting it. */
+    private fun bumpProfileRevision(sensorId: String) {
+        if (!::prefs.isInitialized || sensorId.isBlank()) return
+        setStoredProfileRevision(
+            sensorId,
+            MirrorCalibrationProfilePolicy.nextRevision(
+                now = System.currentTimeMillis(),
+                localRevision = localProfileRevision(sensorId)
+            )
+        )
+    }
+
+    private fun requestMirrorCalibrationSync(sensorId: String?) {
+        if (!shouldMirrorSync()) return
+        val normalized = normalizeSensorId(sensorId)
+        if (normalized.isBlank()) return
+        bumpProfileRevision(normalized)
+        pushMirrorCalibrationProfile(normalized)
+    }
+
+    /** Re-offers the profile as it stands, without claiming a newer local edit. */
+    private fun pushMirrorCalibrationProfile(sensorId: String) {
+        if (sensorId.isBlank()) return
+        runCatching { Natives.requestMirrorCalibrationSync(sensorId) }
+            .onFailure { Log.w(TAG, "Failed requesting mirror calibration sync for $sensorId", it) }
+    }
+
+    private fun requestMirrorCalibrationSyncForSensors(sensorIds: Iterable<String?>) {
+        if (!shouldMirrorSync()) return
+        val targets = linkedSetOf<String>()
+        sensorIds.forEach { candidate ->
+            normalizeSensorId(candidate).takeIf { it.isNotBlank() }?.let(targets::add)
+        }
+        normalizeSensorId(Natives.lastsensorname()).takeIf { it.isNotBlank() }?.let(targets::add)
+        targets.forEach(::requestMirrorCalibrationSync)
+    }
+
+    private fun requestMirrorCalibrationSyncForCurrentOrKnownSensors() {
+        requestMirrorCalibrationSyncForSensors(_calibrations.value.map { it.sensorId })
+    }
+
+    private fun requestUiRefreshAfterCalibrationChange() {
+        UiRefreshBus.requestDataRefresh()
+        UiRefreshBus.requestStatusRefresh()
+        tk.glucodata.WearSync2.onCalibrationChanged()
+    }
+
+    private fun deferGlucoseAlertsUntilNextReading() {
+        AlertRuntimeManager.onDisplayCalibrationChanged()
+    }
+
     private fun getValidPointsForSensor(isRawMode: Boolean, sensorIdOverride: String?): List<CalPoint> {
         val sensorId = normalizeSensorId(sensorIdOverride ?: Natives.lastsensorname())
         return getValidPoints(isRawMode = isRawMode, sensorId = sensorId)
     }
-    
-    fun setEnabledForMode(isRawMode: Boolean, enabled: Boolean) {
-        if (isRawMode) {
-            if (_isEnabledForRaw.value == enabled) return
-            _isEnabledForRaw.value = enabled
-            if (::prefs.isInitialized) {
-                prefs.edit().putBoolean(KEY_ENABLED_RAW, enabled).apply()
-            }
-        } else {
-            if (_isEnabledForAuto.value == enabled) return
-            _isEnabledForAuto.value = enabled
-            if (::prefs.isInitialized) {
-                prefs.edit().putBoolean(KEY_ENABLED_AUTO, enabled).apply()
-            }
+
+    private fun getHistoryAwarePointsForSensor(isRawMode: Boolean, sensorId: String): List<CalPoint> {
+        if (!_lockPastHistory.value || !_keepDisabledHistory.value) {
+            return getValidPoints(isRawMode = isRawMode, sensorId = sensorId)
         }
-        invalidateComputationCache("setEnabledForMode(${if (isRawMode) "raw" else "auto"})")
-        requestUiRefreshAfterCalibrationChange()
-        requestMirrorCalibrationSyncForCurrentOrKnownSensors()
-        Log.i(TAG, "Calibration enabled for ${if (isRawMode) "Raw" else "Auto"}: $enabled")
+
+        ensureCalibrationStateLoaded()
+        val normalizedSensorId = normalizeSensorId(sensorId)
+        return _calibrations.value
+            .asSequence()
+            .filter { matchesMode(it, isRawMode) && sensorMatches(it.sensorId, normalizedSensorId) }
+            .map { p ->
+                CalPoint(
+                    x = (if (isRawMode) p.sensorValueRaw else p.sensorValue).toDouble(),
+                    y = p.userValue.toDouble(),
+                    timestamp = p.timestamp,
+                    isEnabled = p.isEnabled
+                )
+            }
+            .filter { it.x.isFinite() && it.x > 0.0 && it.y.isFinite() && it.y > 0.0 }
+            .toList()
     }
     
-    fun isEnabledForMode(isRawMode: Boolean): Boolean {
-        ensureInitialized()
-        return if (isRawMode) _isEnabledForRaw.value else _isEnabledForAuto.value
+    @JvmOverloads
+    fun setEnabledForMode(isRawMode: Boolean, enabled: Boolean, sensorIdOverride: String? = null) {
+        if (!ensureInitialized()) return
+        val sensorId = resolveSensorId(sensorIdOverride)
+        if (sensorId.isBlank()) {
+            Log.w(TAG, "Ignoring calibration enablement change without a sensor ID")
+            return
+        }
+        migrateLegacyEnablementIfPossible()
+        val current = if (isRawMode) _disabledRawSensorIds.value else _disabledAutoSensorIds.value
+        val updated = updateDisabledSensorSet(current, sensorId, disabled = !enabled)
+        if (updated == current) return
+        if (isRawMode) {
+            _disabledRawSensorIds.value = updated
+        } else {
+            _disabledAutoSensorIds.value = updated
+        }
+        persistDisabledSensorSet(isRawMode, updated)
+        invalidateComputationCache("setEnabledForMode(${if (isRawMode) "raw" else "auto"})")
+        deferGlucoseAlertsUntilNextReading()
+        requestUiRefreshAfterCalibrationChange()
+        requestMirrorCalibrationSync(sensorId)
+        Log.i(TAG, "Calibration enabled for ${if (isRawMode) "Raw" else "Auto"}: $enabled sensor=$sensorId")
+    }
+
+    @JvmOverloads
+    fun isEnabledForMode(isRawMode: Boolean, sensorIdOverride: String? = null): Boolean {
+        if (!ensureInitialized()) return true
+        val sensorId = resolveSensorId(sensorIdOverride)
+        if (sensorId.isBlank()) {
+            return if (isRawMode) {
+                prefs.getBoolean(KEY_ENABLED_RAW, true)
+            } else {
+                prefs.getBoolean(KEY_ENABLED_AUTO, true)
+            }
+        }
+        migrateLegacyEnablementIfPossible()
+        val disabled = if (isRawMode) _disabledRawSensorIds.value else _disabledAutoSensorIds.value
+        return SensorCalibrationEnablementPolicy.isEnabled(
+            disabledSensorIds = disabled,
+            sensorId = sensorId,
+            matches = SensorIdentity::matches
+        )
     }
 
     fun setHideInitialWhenCalibrated(enabled: Boolean) {
@@ -439,6 +908,23 @@ object CalibrationManager {
         return _lockPastHistory.value
     }
 
+    fun setKeepDisabledHistory(enabled: Boolean) {
+        if (_keepDisabledHistory.value == enabled) return
+        _keepDisabledHistory.value = enabled
+        if (::prefs.isInitialized) {
+            prefs.edit().putBoolean(KEY_KEEP_DISABLED_HISTORY, enabled).apply()
+        }
+        invalidateComputationCache("setKeepDisabledHistory")
+        requestUiRefreshAfterCalibrationChange()
+        requestMirrorCalibrationSyncForCurrentOrKnownSensors()
+        Log.i(TAG, "Keep disabled calibrations for locked history: $enabled")
+    }
+
+    fun shouldKeepDisabledHistory(): Boolean {
+        ensureInitialized()
+        return _keepDisabledHistory.value
+    }
+
     fun setOverwriteSensorValues(enabled: Boolean) {
         if (_overwriteSensorValues.value == enabled) return
         _overwriteSensorValues.value = enabled
@@ -453,6 +939,51 @@ object CalibrationManager {
     fun shouldOverwriteSensorValues(): Boolean {
         ensureInitialized()
         return _overwriteSensorValues.value
+    }
+
+    fun setFreezeDisplayedValues(enabled: Boolean) {
+        if (_freezeDisplayedValues.value == enabled) return
+        _freezeDisplayedValues.value = enabled
+        if (::prefs.isInitialized) {
+            prefs.edit().putBoolean(KEY_FREEZE_DISPLAYED_VALUES, enabled).apply()
+        }
+        requestUiRefreshAfterCalibrationChange()
+        Log.i(TAG, "Freeze displayed values: $enabled")
+    }
+
+    fun shouldFreezeDisplayedValues(): Boolean {
+        ensureInitialized()
+        return _freezeDisplayedValues.value
+    }
+
+    /**
+     * Retires the old "overwrite sensor values in history DB" switch.
+     *
+     * That switch is what corrupted stores: it rewrote `history_readings.value`
+     * in place from its own previous output, so calibration compounded and the
+     * sensor's own number was destroyed. Its replacement records the displayed
+     * value beside the reading instead. Anyone who had it on wanted their
+     * displayed values kept, so they get the freeze; the destructive behaviour
+     * itself is simply gone, and the old key is cleared so a downgrade cannot
+     * resurrect it.
+     *
+     * Runs once. Returns true if this call performed the migration.
+     */
+    fun migrateOverwriteSensorValuesToFreeze(): Boolean {
+        ensureInitialized()
+        if (!::prefs.isInitialized) return false
+        if (prefs.getBoolean(KEY_FREEZE_MIGRATED_FROM_OVERWRITE, false)) return false
+
+        val hadOverwrite = prefs.getBoolean(KEY_OVERWRITE_SENSOR_VALUES, false)
+        prefs.edit()
+            .putBoolean(KEY_FREEZE_MIGRATED_FROM_OVERWRITE, true)
+            .putBoolean(KEY_FREEZE_DISPLAYED_VALUES, true)
+            .remove(KEY_OVERWRITE_SENSOR_VALUES)
+            .apply()
+        _overwriteSensorValues.value = false
+        _freezeDisplayedValues.value = true
+        Log.i(TAG, "Migrated overwrite-sensor-values ($hadOverwrite) to freeze-displayed-values")
+        return hadOverwrite
     }
 
     fun setVisualContinuity(enabled: Boolean) {
@@ -471,6 +1002,47 @@ object CalibrationManager {
         return _visualContinuity.value
     }
 
+    /**
+     * Turns every blood-glucose entry in the journal — a meter reading or a
+     * finger stick typed in by hand — into a calibration point. Switching it off
+     * removes the derived points again; hand-entered calibrations are untouched
+     * either way.
+     */
+    fun setCalibrateFromJournal(enabled: Boolean) {
+        if (_calibrateFromJournal.value == enabled) return
+        _calibrateFromJournal.value = enabled
+        if (::prefs.isInitialized) {
+            prefs.edit().putBoolean(KEY_CALIBRATE_FROM_JOURNAL, enabled).apply()
+        }
+        Log.i(TAG, "Calibrate from journal BG: $enabled")
+        JournalCalibrationSync.onSettingChanged(enabled)
+    }
+
+    fun shouldCalibrateFromJournal(): Boolean {
+        ensureInitialized()
+        return _calibrateFromJournal.value
+    }
+
+    fun setWeightMode(mode: CalibrationWeightMode) {
+        if (_weightMode.value == mode) return
+        _weightMode.value = mode
+        if (::prefs.isInitialized) {
+            prefs.edit().putString(KEY_WEIGHT_MODE, mode.storageValue).apply()
+        }
+        invalidateComputationCache("setWeightMode")
+        refreshDiagnosticsPreview(isRawMode = true, force = true)
+        refreshDiagnosticsPreview(isRawMode = false, force = true)
+        deferGlucoseAlertsUntilNextReading()
+        requestUiRefreshAfterCalibrationChange()
+        requestMirrorCalibrationSyncForCurrentOrKnownSensors()
+        Log.i(TAG, "Calibration weight mode: ${mode.storageValue}")
+    }
+
+    fun getWeightMode(): CalibrationWeightMode {
+        ensureInitialized()
+        return _weightMode.value
+    }
+
     fun setAlgorithmForMode(isRawMode: Boolean, algorithm: CalibrationAlgorithm) {
         if (isRawMode) {
             if (_algorithmForRaw.value == algorithm) return
@@ -487,9 +1059,22 @@ object CalibrationManager {
         }
         invalidateComputationCache("setAlgorithmForMode(${if (isRawMode) "raw" else "auto"})")
         refreshDiagnosticsPreview(isRawMode = isRawMode, force = true)
+        deferGlucoseAlertsUntilNextReading()
         requestUiRefreshAfterCalibrationChange()
         requestMirrorCalibrationSyncForCurrentOrKnownSensors()
         Log.i(TAG, "Calibration algorithm for ${if (isRawMode) "Raw" else "Auto"}: ${algorithm.title}")
+    }
+
+    /** The settings snapshot handed to the shared computation, and to the watch. */
+    fun tuningForMode(isRawMode: Boolean): CalibrationTuning {
+        ensureInitialized()
+        return CalibrationTuning(
+            algorithm = getAlgorithmForMode(isRawMode).storageValue,
+            weightMode = _weightMode.value.storageValue,
+            applyToPast = _applyToPast.value,
+            lockPastHistory = _lockPastHistory.value,
+            keepDisabledHistory = _keepDisabledHistory.value,
+        )
     }
 
     fun getAlgorithmForMode(isRawMode: Boolean): CalibrationAlgorithm {
@@ -506,23 +1091,31 @@ object CalibrationManager {
     )
 
     fun exportProfileForSensorAsJson(sensorId: String): String? {
-        if (sensorId.isBlank()) return null
+        val normalizedSensorId = normalizeSensorId(sensorId)
+        if (normalizedSensorId.isBlank()) return null
+        ensureCalibrationStateLoaded()
 
+        // Journal-derived points are left out on purpose: the receiving device
+        // derives its own from the journal it already syncs, and a copied one
+        // would outlive the entry it came from — no entry to track it back to.
         val rows = _calibrations.value
-            .filter { sensorMatches(it.sensorId, sensorId) }
+            .filter { it.journalEntryId == null && sensorMatches(it.sensorId, normalizedSensorId) }
             .sortedByDescending { it.timestamp }
 
         val root = JSONObject()
-        root.put("version", 1)
-        root.put("sensorId", sensorId)
+        root.put("version", 2)
+        root.put("sensorId", normalizedSensorId)
         root.put("createdAt", System.currentTimeMillis())
-        root.put("rawEnabled", _isEnabledForRaw.value)
-        root.put("autoEnabled", _isEnabledForAuto.value)
+        root.put("revision", localProfileRevision(normalizedSensorId))
+        root.put("rawEnabled", isEnabledForMode(isRawMode = true, sensorIdOverride = normalizedSensorId))
+        root.put("autoEnabled", isEnabledForMode(isRawMode = false, sensorIdOverride = normalizedSensorId))
         root.put("hideInitialWhenCalibrated", _hideInitialWhenCalibrated.value)
         root.put("applyToPast", _applyToPast.value)
         root.put("lockPastHistory", _lockPastHistory.value)
+        root.put("keepDisabledHistory", _keepDisabledHistory.value)
         root.put("overwriteSensorValues", _overwriteSensorValues.value)
         root.put("visualContinuity", _visualContinuity.value)
+        root.put("weightMode", _weightMode.value.storageValue)
         root.put("rawAlgorithm", _algorithmForRaw.value.storageValue)
         root.put("autoAlgorithm", _algorithmForAuto.value.storageValue)
 
@@ -530,7 +1123,7 @@ object CalibrationManager {
         rows.forEach { row ->
             val obj = JSONObject()
             obj.put("timestamp", row.timestamp)
-            obj.put("sensorId", if (row.sensorId.isBlank()) sensorId else row.sensorId)
+            obj.put("sensorId", if (row.sensorId.isBlank()) normalizedSensorId else row.sensorId)
             obj.put("sensorValue", row.sensorValue.toDouble())
             obj.put("sensorValueRaw", row.sensorValueRaw.toDouble())
             obj.put("userValue", row.userValue.toDouble())
@@ -549,8 +1142,8 @@ object CalibrationManager {
         overrideSensorId: String? = null
     ): CalibrationProfileImportResult {
         val root = JSONObject(json)
-        val sourceSensorId = root.optString("sensorId", "").ifBlank { Natives.lastsensorname() ?: "" }
-        val targetSensorId = overrideSensorId?.ifBlank { null } ?: sourceSensorId
+        val sourceSensorId = root.optString("sensorId", "").ifBlank { resolveSensorId() }
+        val targetSensorId = normalizeSensorId(overrideSensorId?.ifBlank { null } ?: sourceSensorId)
         if (targetSensorId.isBlank()) {
             return CalibrationProfileImportResult(
                 sensorId = "",
@@ -561,19 +1154,30 @@ object CalibrationManager {
             )
         }
 
-        val rawEnabled = root.optBoolean("rawEnabled", _isEnabledForRaw.value)
-        val autoEnabled = root.optBoolean("autoEnabled", _isEnabledForAuto.value)
+        val rawEnabled = root.optBoolean(
+            "rawEnabled",
+            isEnabledForMode(isRawMode = true, sensorIdOverride = targetSensorId)
+        )
+        val autoEnabled = root.optBoolean(
+            "autoEnabled",
+            isEnabledForMode(isRawMode = false, sensorIdOverride = targetSensorId)
+        )
         val hideInitialWhenCalibrated = root.optBoolean(
             "hideInitialWhenCalibrated",
             _hideInitialWhenCalibrated.value
         )
         val applyToPast = root.optBoolean("applyToPast", _applyToPast.value)
         val lockPastHistory = root.optBoolean("lockPastHistory", _lockPastHistory.value)
+        val keepDisabledHistory = root.optBoolean(
+            "keepDisabledHistory",
+            _keepDisabledHistory.value
+        )
         val overwriteSensorValues = root.optBoolean(
             "overwriteSensorValues",
             _overwriteSensorValues.value
         )
         val visualContinuity = root.optBoolean("visualContinuity", _visualContinuity.value)
+        val weightMode = CalibrationWeightMode.fromStorage(root.optString("weightMode", ""))
         val rawAlgorithm = CalibrationAlgorithm.fromStorage(root.optString("rawAlgorithm", ""))
         val autoAlgorithm = CalibrationAlgorithm.fromStorage(root.optString("autoAlgorithm", ""))
 
@@ -629,16 +1233,19 @@ object CalibrationManager {
             dao.insertAll(deduped)
         }
 
-        setEnabledForMode(isRawMode = true, enabled = rawEnabled)
-        setEnabledForMode(isRawMode = false, enabled = autoEnabled)
+        setEnabledForMode(isRawMode = true, enabled = rawEnabled, sensorIdOverride = targetSensorId)
+        setEnabledForMode(isRawMode = false, enabled = autoEnabled, sensorIdOverride = targetSensorId)
         setHideInitialWhenCalibrated(hideInitialWhenCalibrated)
         setApplyToPast(applyToPast)
         setLockPastHistory(lockPastHistory)
+        setKeepDisabledHistory(keepDisabledHistory)
         setOverwriteSensorValues(overwriteSensorValues)
         setVisualContinuity(visualContinuity)
+        setWeightMode(weightMode)
         setAlgorithmForMode(isRawMode = true, algorithm = rawAlgorithm)
         setAlgorithmForMode(isRawMode = false, algorithm = autoAlgorithm)
 
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
 
         requestMirrorCalibrationSync(targetSensorId)
@@ -654,7 +1261,11 @@ object CalibrationManager {
     
     suspend fun loadCalibrations() {
         if (::dao.isInitialized) {
-            val list = withContext(Dispatchers.IO) { dao.getAllSync() }
+            val list = withContext(Dispatchers.IO) {
+                migrateCalibrationSensorIdsIfPossible()
+                dao.getAllSync()
+            }
+            if (calibrationStateLoaded && _calibrations.value == list) return
             _calibrations.value = list
             calibrationStateLoaded = true
             invalidateComputationCache("loadCalibrations")
@@ -662,24 +1273,71 @@ object CalibrationManager {
         }
     }
 
-    suspend fun addCalibration(timestamp: Long, sensorValue: Float, sensorValueRaw: Float, userValue: Float, sensorId: String? = null, isRawMode: Boolean = false) {
+    @JvmOverloads
+    suspend fun addCalibration(timestamp: Long, sensorValue: Float, sensorValueRaw: Float, userValue: Float, sensorId: String? = null, isRawMode: Boolean = false, sensorValueStock: Float = 0f): Boolean {
+        val resolvedSensorId = resolveSensorId(sensorId)
+        if (resolvedSensorId.isBlank()) {
+            Log.e(TAG, "Rejected calibration without a sensor ID at $timestamp")
+            return false
+        }
         val entity = CalibrationEntity(
             timestamp = timestamp,
-            sensorId = sensorId ?: Natives.lastsensorname() ?: "",
+            sensorId = resolvedSensorId,
             sensorValue = sensorValue,
             sensorValueRaw = sensorValueRaw,
             userValue = userValue,
-            isRawMode = isRawMode
+            isRawMode = isRawMode,
+            sensorValueStock = sensorValueStock.takeIf { it.isFinite() && it > 0f } ?: 0f
         )
         withContext(Dispatchers.IO) { dao.insert(entity) }
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = isRawMode, force = true)
         requestMirrorCalibrationSync(entity.sensorId)
-        Log.i(TAG, "Added calibration: auto=$sensorValue raw=$sensorValueRaw user=$userValue isRaw=$isRawMode at $timestamp")
+        Log.i(TAG, "Added calibration: sensor=$resolvedSensorId auto=$sensorValue raw=$sensorValueRaw stock=${entity.sensorValueStock} user=$userValue isRaw=$isRawMode at $timestamp")
+        return true
+    }
+
+    /**
+     * Applies one reconciliation of the journal-derived calibrations in a single
+     * pass. Journal syncs touch many rows at once — a meter handing over its
+     * stored history writes dozens — and running the per-point path for each
+     * would reload the table and re-push the mirror profile every time.
+     */
+    suspend fun applyJournalCalibrationPlan(plan: JournalCalibrationPolicy.Plan, reason: String) {
+        if (plan.isEmpty) return
+        if (!ensureInitialized()) return
+        withContext(Dispatchers.IO) {
+            if (plan.deleteIds.isNotEmpty()) dao.deleteByIds(plan.deleteIds)
+            if (plan.inserts.isNotEmpty()) dao.insertAll(plan.inserts)
+            plan.updates.forEach { dao.update(it) }
+        }
+        deferGlucoseAlertsUntilNextReading()
+        loadCalibrations()
+        refreshDiagnosticsPreview(isRawMode = false, force = true)
+        refreshDiagnosticsPreview(isRawMode = true, force = true)
+        Log.i(
+            TAG,
+            "Journal calibrations synced ($reason): +${plan.inserts.size} " +
+                "~${plan.updates.size} -${plan.deleteIds.size}"
+        )
+    }
+
+    /** Drops every calibration derived from a journal entry, keeping manual ones. */
+    suspend fun purgeJournalCalibrations() {
+        if (!ensureInitialized()) return
+        val removed = withContext(Dispatchers.IO) { dao.deleteJournalDerived() }
+        if (removed <= 0) return
+        deferGlucoseAlertsUntilNextReading()
+        loadCalibrations()
+        refreshDiagnosticsPreview(isRawMode = false, force = true)
+        refreshDiagnosticsPreview(isRawMode = true, force = true)
+        Log.i(TAG, "Removed $removed journal-derived calibration(s)")
     }
 
     suspend fun restoreCalibration(entity: CalibrationEntity) {
         withContext(Dispatchers.IO) { dao.insert(entity) }
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = entity.isRawMode, force = true)
         requestMirrorCalibrationSync(entity.sensorId)
@@ -688,6 +1346,7 @@ object CalibrationManager {
 
     suspend fun deleteCalibration(entity: CalibrationEntity) {
         withContext(Dispatchers.IO) { dao.delete(entity) }
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = entity.isRawMode, force = true)
         requestMirrorCalibrationSync(entity.sensorId)
@@ -696,14 +1355,132 @@ object CalibrationManager {
     
     suspend fun updateCalibration(entity: CalibrationEntity) {
         withContext(Dispatchers.IO) { dao.update(entity) }
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = entity.isRawMode, force = true)
         requestMirrorCalibrationSync(entity.sensorId)
     }
     
+    /**
+     * Records a fingerstick calibration entered on the watch. The watch cannot
+     * see the sensor's current lanes, so the values are taken here — the same
+     * ones the phone's own calibration sheet would use.
+     */
+    @JvmOverloads
+    fun addCalibrationFromWearBlocking(
+        userValueMgdl: Float,
+        sensorStockMgdl: Float = Float.NaN,
+    ): Boolean = kotlinx.coroutines.runBlocking {
+        val snapshot = tk.glucodata.CurrentDisplaySource.resolveCurrentForExchange()
+            ?: return@runBlocking false
+        val autoValue = snapshot.autoValue.takeIf { it.isFinite() && it > 0f }
+            ?: snapshot.primaryValue.takeIf { it.isFinite() && it > 0f }
+            ?: return@runBlocking false
+        val rawValue = snapshot.rawValue.takeIf { it.isFinite() && it > 0f } ?: autoValue
+        val now = System.currentTimeMillis()
+        addCalibration(
+            timestamp = now,
+            sensorValue = autoValue,
+            sensorValueRaw = rawValue,
+            userValue = storedValueFromMgdl(userValueMgdl),
+            sensorId = snapshot.sensorId,
+            sensorValueStock = storedStockValue(sensorStockMgdl, now, snapshot.sensorId),
+        )
+    }
+
+    /**
+     * The stock value to record on an anchor, in the display unit.
+     *
+     * Prefers what the watch sent — only the device that computed the reading
+     * knows it — and otherwise asks this device, which knows it when the phone
+     * is the one holding the sensor. 0 where neither does, which leaves the fit
+     * to recover it from the source history exactly as before.
+     */
+    private fun storedStockValue(sensorStockMgdl: Float, timestamp: Long, sensorId: String?): Float {
+        if (sensorStockMgdl.isFinite() && sensorStockMgdl > 0f) return storedValueFromMgdl(sensorStockMgdl)
+        val local = runCatching {
+            tk.glucodata.IntegratedStockBaseline.stockAt(sensorId, timestamp)
+        }.getOrDefault(Float.NaN)
+        return local.takeIf { it.isFinite() && it > 0f } ?: 0f
+    }
+
+    /**
+     * Records a watch calibration against a chosen reading rather than the
+     * current one, the way the phone's sheet uses the row you tapped: the lanes
+     * come from the history point nearest that time.
+     */
+    fun addCalibrationFromWearAtBlocking(
+        timestampMs: Long,
+        userValueMgdl: Float,
+        sensorStockMgdl: Float,
+    ): Boolean =
+        kotlinx.coroutines.runBlocking {
+            if (timestampMs <= 0L) {
+                return@runBlocking addCalibrationFromWearBlocking(userValueMgdl, sensorStockMgdl)
+            }
+            val sensorId = tk.glucodata.SensorIdentity.resolveMainSensor() ?: return@runBlocking false
+            val isMmol = tk.glucodata.Applic.unit == 1
+            val window = 15L * 60L * 1000L
+            val nearest = runCatching {
+                tk.glucodata.NotificationHistorySource.getDisplayHistory(
+                    timestampMs - window,
+                    isMmol,
+                    sensorId,
+                )
+            }.getOrDefault(emptyList())
+                .filter { kotlin.math.abs(it.timestamp - timestampMs) <= window }
+                .minByOrNull { kotlin.math.abs(it.timestamp - timestampMs) }
+                ?: return@runBlocking false
+            val autoValue = nearest.value.takeIf { it.isFinite() && it > 0f } ?: return@runBlocking false
+            val rawValue = nearest.rawValue.takeIf { it.isFinite() && it > 0f } ?: autoValue
+            addCalibration(
+                timestamp = nearest.timestamp,
+                sensorValue = autoValue,
+                sensorValueRaw = rawValue,
+                userValue = storedValueFromMgdl(userValueMgdl),
+                sensorId = sensorId,
+                sensorValueStock = storedStockValue(sensorStockMgdl, nearest.timestamp, sensorId),
+            )
+        }
+
+    /**
+     * The watch sends canonical mg/dL — it must not depend on the phone's unit
+     * setting — but calibrations are stored in the display unit, the way the
+     * phone's own sheet writes them. Storing mg/dL directly is what turned a
+     * 5.8 mmol calibration into "104,0" in the list.
+     */
+    private fun storedValueFromMgdl(mgdl: Float): Float =
+        if (tk.glucodata.Applic.unit == 1) mgdl / tk.glucodata.ui.util.GlucoseFormatter.MGDL_PER_MMOL else mgdl
+
+    /**
+     * Blocking per-entry operations for the shared Wear bridge. The watch knows
+     * a calibration by its timestamp — it never sees the Room id — so entries
+     * are looked up that way.
+     */
+    fun deleteCalibrationAtBlocking(timestamp: Long): Boolean = kotlinx.coroutines.runBlocking {
+        val entity = _calibrations.value.firstOrNull { it.timestamp == timestamp }
+            ?: return@runBlocking false
+        deleteCalibration(entity)
+        true
+    }
+
+    fun updateCalibrationUserValueBlocking(timestamp: Long, userValueMgdl: Float): Boolean =
+        kotlinx.coroutines.runBlocking {
+            val entity = _calibrations.value.firstOrNull { it.timestamp == timestamp }
+                ?: return@runBlocking false
+            updateCalibration(entity.copy(userValue = storedValueFromMgdl(userValueMgdl)))
+            true
+        }
+
+    /** Blocking entry point for the shared Wear bridge (see WearCalibrationCommand). */
+    fun clearAllBlocking() {
+        kotlinx.coroutines.runBlocking { clearAll() }
+    }
+
     suspend fun clearAll() {
         val affectedSensors = _calibrations.value.map { it.sensorId }
         withContext(Dispatchers.IO) { dao.deleteAll() }
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = true, force = true)
         refreshDiagnosticsPreview(isRawMode = false, force = true)
@@ -713,6 +1490,7 @@ object CalibrationManager {
 
     suspend fun restoreAll(calibrations: List<CalibrationEntity>) {
         withContext(Dispatchers.IO) { dao.insertAll(calibrations) }
+        deferGlucoseAlertsUntilNextReading()
         loadCalibrations()
         refreshDiagnosticsPreview(isRawMode = true, force = true)
         refreshDiagnosticsPreview(isRawMode = false, force = true)
@@ -728,13 +1506,69 @@ object CalibrationManager {
         importProfileFromJson(json, replaceExisting, overrideSensorId)
     }
 
+    /**
+     * A mirror import replaces the target sensor's calibration set wholesale, so it may
+     * only ever be applied when the peer's profile is genuinely newer than ours. Without
+     * that check a master with no calibrations of its own wipes the follower's every time
+     * it pushes readings, which is exactly what the follower's own calibration is for.
+     * See [MirrorCalibrationProfilePolicy].
+     */
     fun importMirrorProfileFromJsonBlocking(
         json: String,
         overrideSensorId: String? = null
-    ): CalibrationProfileImportResult = withoutMirrorSync {
-        runBlocking {
-            importProfileFromJson(json, replaceExisting = true, overrideSensorId = overrideSensorId)
+    ): CalibrationProfileImportResult {
+        ensureCalibrationStateLoaded()
+        val root = runCatching { JSONObject(json) }.getOrNull()
+            ?: return CalibrationProfileImportResult(
+                sensorId = normalizeSensorId(overrideSensorId),
+                imported = 0,
+                skipped = 0,
+                replaced = 0,
+                message = "Unreadable mirror calibration profile"
+            )
+        val sourceSensorId = root.optString("sensorId", "").ifBlank { resolveSensorId() }
+        val targetSensorId = normalizeSensorId(overrideSensorId?.ifBlank { null } ?: sourceSensorId)
+        if (targetSensorId.isBlank()) {
+            return CalibrationProfileImportResult(
+                sensorId = "",
+                imported = 0,
+                skipped = 0,
+                replaced = 0,
+                message = "No target sensor found in mirror profile"
+            )
         }
+
+        val incomingRevision = MirrorCalibrationProfilePolicy.incomingRevision(root)
+        val localRevision = localProfileRevision(targetSensorId)
+        if (!MirrorCalibrationProfilePolicy.shouldApply(incomingRevision, localRevision)) {
+            Log.i(
+                TAG,
+                "Kept local calibration profile for $targetSensorId: mirror revision $incomingRevision <= local $localRevision"
+            )
+            if (MirrorCalibrationProfilePolicy.shouldOfferLocalBack(incomingRevision, localRevision)) {
+                // Ours is the newer profile — offer it back so the peer converges on it.
+                pushMirrorCalibrationProfile(targetSensorId)
+            }
+            return CalibrationProfileImportResult(
+                sensorId = targetSensorId,
+                imported = 0,
+                skipped = 0,
+                replaced = 0,
+                message = "Kept newer local calibration profile for $targetSensorId"
+            )
+        }
+
+        val result = withoutMirrorSync {
+            runBlocking {
+                importProfileFromJson(
+                    json,
+                    replaceExisting = true,
+                    overrideSensorId = targetSensorId
+                )
+            }
+        }
+        setStoredProfileRevision(targetSensorId, incomingRevision)
+        return result
     }
 
     /**
@@ -750,7 +1584,8 @@ object CalibrationManager {
         emitDiagnostics: Boolean = false,
         sensorIdOverride: String? = null
     ): Float {
-        if (!isEnabledForMode(isRawMode)) {
+        val currentSensor = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, currentSensor)) {
             return value
         }
         // Missing/invalid inputs must stay missing. Calibrating 0/NaN can produce
@@ -758,8 +1593,10 @@ object CalibrationManager {
         if (!value.isFinite() || value <= 0f) {
             return value
         }
+        if (tk.glucodata.drivers.ManagedSensorRuntime.integratesUserCalibration(currentSensor, isRawMode)) {
+            return value
+        }
 
-        val currentSensor = normalizeSensorId(sensorIdOverride ?: Natives.lastsensorname())
         val algorithm = getAlgorithmForMode(isRawMode)
         val cacheKey = CalibrationCacheKey(
             isRawMode = isRawMode,
@@ -785,10 +1622,11 @@ object CalibrationManager {
         }
 
         val context = resolveCalibrationContext(isRawMode, currentSensor) ?: return value
-        val points = resolvePointsForTimestamp(
+        val points = CalibrationMath.resolvePointsForTimestamp(
             allPoints = context.allPoints,
             targetTimestamp = timestamp,
-            earliestPoint = context.earliestPoint
+            earliestPoint = context.earliestPoint,
+            tuning = tuningForMode(isRawMode)
         )
         if (points.isEmpty()) return value
 
@@ -806,6 +1644,51 @@ object CalibrationManager {
         return finalValue
     }
 
+    /**
+     * The calibration a whole series is drawn through, resolved once.
+     *
+     * Same answer as [getCalibratedValue] for every point, and the same three
+     * reasons to leave a value alone — mode disabled for the sensor, a driver
+     * that already folds the correction into what it stores, no usable points —
+     * are the three ways this returns null. The chart used to ask per point and
+     * paid the full resolution for each one past the value cache's capacity;
+     * see [SeriesCalibrator] for what that cost as the store grew.
+     *
+     * The instance is reused across rebuilds until a calibration or setting
+     * changes, so a rebuild that adds one reading calibrates one reading.
+     */
+    internal fun seriesCalibrator(isRawMode: Boolean, sensorIdOverride: String?): SeriesCalibrator? {
+        val currentSensor = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, currentSensor)) return null
+        if (tk.glucodata.drivers.ManagedSensorRuntime.integratesUserCalibration(currentSensor, isRawMode)) {
+            return null
+        }
+        val tuning = tuningForMode(isRawMode)
+        val key = SeriesCalibratorKey(
+            isRawMode = isRawMode,
+            sensorId = currentSensor,
+            revision = calibrationRevision,
+            tuning = tuning,
+            applyToPast = _applyToPast.value,
+        )
+        synchronized(seriesCalibrators) { seriesCalibrators[key] }?.let { return it }
+        val context = resolveCalibrationContext(isRawMode, currentSensor) ?: return null
+        val calibrator = SeriesCalibrator(
+            allPoints = context.allPoints,
+            earliestPoint = context.earliestPoint,
+            algorithm = context.algorithm.storageValue,
+            tuning = tuning,
+            applyToPast = key.applyToPast,
+        )
+        synchronized(seriesCalibrators) {
+            // Anything from an older revision is stale by definition; a handful
+            // of (mode, sensor) instances is all that ever belongs here.
+            seriesCalibrators.keys.retainAll { it.revision == calibrationRevision }
+            seriesCalibrators[key] = calibrator
+        }
+        return calibrator
+    }
+
     @JvmOverloads
     fun getCalibratedSeries(
         samples: List<CalibrationSample>,
@@ -813,18 +1696,128 @@ object CalibrationManager {
         emitDiagnostics: Boolean = false,
         sensorIdOverride: String? = null
     ): FloatArray {
-        if (samples.isEmpty()) return FloatArray(0)
+        return getCalibratedSeriesInternal(
+            samples = samples,
+            isRawMode = isRawMode,
+            emitDiagnostics = emitDiagnostics,
+            sensorIdOverride = sensorIdOverride,
+            respectManagedOwnership = true,
+        )
+    }
 
-        val context = resolveCalibrationContext(isRawMode, sensorIdOverride)
-        if (context == null) {
+    /**
+     * Evaluates the selected Juggluco calibration model for a managed driver.
+     * Values are in the user's current display unit, exactly like stored
+     * calibration points. This deliberately bypasses the managed-driver
+     * ownership guard; callers must store the returned values themselves.
+     */
+    @JvmStatic
+    fun getIntegratedCalibratedSeries(
+        values: FloatArray,
+        timestamps: LongArray,
+        isRawMode: Boolean,
+        sensorIdOverride: String?,
+    ): FloatArray {
+        if (values.size != timestamps.size) return values.copyOf()
+        val samples = List(values.size) { index ->
+            CalibrationSample(value = values[index], timestamp = timestamps[index])
+        }
+        if (samples.isEmpty()) return FloatArray(0)
+        val resolvedSensor = resolveSensorId(sensorIdOverride)
+        val cacheKey = IntegratedContextCacheKey(resolvedSensor, isRawMode, calibrationRevision, Applic.unit)
+        val baselineKey = IntegratedBaselineCacheKey(resolvedSensor, isRawMode, Applic.unit)
+        val storedContext = resolveCalibrationContext(isRawMode, resolvedSensor)
+            ?: return values.copyOf()
+        val context = if (samples.size > 1) {
+            val baseline = integratedBaselineSamples(storedContext, samples)
+            if (baseline.isNotEmpty()) synchronized(integratedBaselineCache) {
+                integratedBaselineCache[baselineKey] = baseline
+            }
+            applyRecordedStock(rebaseIntegratedContext(storedContext, samples), isRawMode, resolvedSensor).also { rebased ->
+                synchronized(integratedContextCache) {
+                    integratedContextCache[cacheKey] = rebased
+                }
+            }
+        } else {
+            synchronized(integratedContextCache) { integratedContextCache[cacheKey] }
+                ?: synchronized(integratedBaselineCache) { integratedBaselineCache[baselineKey] }
+                    ?.let { baseline ->
+                        applyRecordedStock(
+                            rebaseIntegratedContext(storedContext, baseline),
+                            isRawMode,
+                            resolvedSensor,
+                        )
+                    }
+                ?: applyRecordedStock(storedContext, isRawMode, resolvedSensor)
+        }
+        return evaluateCalibratedSeries(samples, isRawMode, emitDiagnostics = false, context = context)
+    }
+
+    /** Restores stock-model values at calibration timestamps for a managed driver. */
+    @JvmStatic
+    fun seedIntegratedCalibrationBaseline(
+        values: FloatArray,
+        timestamps: LongArray,
+        isRawMode: Boolean,
+        sensorIdOverride: String?,
+    ) {
+        if (values.size != timestamps.size || values.isEmpty()) return
+        val resolvedSensor = resolveSensorId(sensorIdOverride)
+        if (resolvedSensor.isBlank()) return
+        val samples = values.indices.mapNotNull { index ->
+            val value = values[index]
+            val timestamp = timestamps[index]
+            if (value.isFinite() && value > 0f && timestamp > 0L) {
+                CalibrationSample(value, timestamp)
+            } else {
+                null
+            }
+        }
+        if (samples.isEmpty()) return
+        val baselineKey = IntegratedBaselineCacheKey(resolvedSensor, isRawMode, Applic.unit)
+        synchronized(integratedBaselineCache) {
+            integratedBaselineCache[baselineKey] = samples
+        }
+        synchronized(integratedContextCache) {
+            integratedContextCache.keys.removeAll { key ->
+                key.sensorId == resolvedSensor && key.isRawMode == isRawMode && key.unit == Applic.unit
+            }
+        }
+    }
+
+    private fun getCalibratedSeriesInternal(
+        samples: List<CalibrationSample>,
+        isRawMode: Boolean,
+        emitDiagnostics: Boolean,
+        sensorIdOverride: String?,
+        respectManagedOwnership: Boolean,
+    ): FloatArray {
+        if (samples.isEmpty()) return FloatArray(0)
+        val resolvedSensor = resolveSensorId(sensorIdOverride)
+        if (respectManagedOwnership &&
+            tk.glucodata.drivers.ManagedSensorRuntime.integratesUserCalibration(resolvedSensor, isRawMode)
+        ) {
             return FloatArray(samples.size) { index -> samples[index].value }
         }
 
+        val context = resolveCalibrationContext(isRawMode, resolvedSensor)
+        if (context == null) {
+            return FloatArray(samples.size) { index -> samples[index].value }
+        }
+        return evaluateCalibratedSeries(samples, isRawMode, emitDiagnostics, context)
+    }
+
+    private fun evaluateCalibratedSeries(
+        samples: List<CalibrationSample>,
+        isRawMode: Boolean,
+        emitDiagnostics: Boolean,
+        context: CalibrationContext,
+    ): FloatArray {
         val results = FloatArray(samples.size)
         if (!_lockPastHistory.value) {
-            val points = context.allPoints
+            val points = context.allPoints.filter { it.isEnabled }
             samples.forEachIndexed { index, sample ->
-                results[index] = if (points.isEmpty()) {
+                val modelValue = if (points.isEmpty()) {
                     sample.value
                 } else {
                     computeCalibratedValue(
@@ -836,25 +1829,22 @@ object CalibrationManager {
                         emitDiagnostics = emitDiagnostics && index == samples.lastIndex
                     )
                 }
+                results[index] = modelValue
             }
             return results
         }
 
-        val sortedPoints = context.allPoints.sortedBy { it.timestamp }
         val indexedSamples = samples.withIndex().sortedBy { it.value.timestamp }
-        var pointCount = 0
 
         indexedSamples.forEachIndexed { sortedIndex, indexedSample ->
             val sample = indexedSample.value
-            while (pointCount < sortedPoints.size && sortedPoints[pointCount].timestamp <= sample.timestamp) {
-                pointCount++
-            }
-            val points = when {
-                pointCount > 0 -> sortedPoints.subList(0, pointCount)
-                _applyToPast.value && context.earliestPoint != null -> listOf(context.earliestPoint)
-                else -> emptyList()
-            }
-            results[indexedSample.index] = if (points.isEmpty()) {
+            val points = CalibrationMath.resolvePointsForTimestamp(
+                allPoints = context.allPoints,
+                targetTimestamp = sample.timestamp,
+                earliestPoint = context.earliestPoint,
+                tuning = tuningForMode(isRawMode)
+            )
+            val modelValue = if (points.isEmpty()) {
                 sample.value
             } else {
                 computeCalibratedValue(
@@ -866,49 +1856,108 @@ object CalibrationManager {
                     emitDiagnostics = emitDiagnostics && sortedIndex == indexedSamples.lastIndex
                 )
             }
+            results[indexedSample.index] = modelValue
         }
 
         return results
+    }
+
+    /**
+     * Overrides an anchor's x with the stock value recorded when it was taken.
+     *
+     * This wins over [rebaseIntegratedContext]'s history match, which can only
+     * find a stock value on the device that produced the reading — a calibration
+     * taken while the watch held the sensor has no match on the phone, and one
+     * taken on the phone loses its match once the source history has rolled past
+     * it. A recorded value is the same number the match would have found, and it
+     * does not expire.
+     */
+    private fun applyRecordedStock(
+        context: CalibrationContext,
+        isRawMode: Boolean,
+        sensorId: String,
+    ): CalibrationContext {
+        val normalizedSensorId = normalizeSensorId(sensorId)
+        val recorded = _calibrations.value
+            .asSequence()
+            .filter { matchesMode(it, isRawMode) && sensorMatches(it.sensorId, normalizedSensorId) }
+            .filter { it.sensorValueStock.isFinite() && it.sensorValueStock > 0f }
+            .associate { it.timestamp to it.sensorValueStock.toDouble() }
+        if (recorded.isEmpty()) return context
+        val points = context.allPoints.map { point ->
+            recorded[point.timestamp]?.let { point.copy(x = it) } ?: point
+        }
+        return context.copy(
+            allPoints = points,
+            earliestPoint = points.filter { it.isEnabled }.minByOrNull { it.timestamp },
+        )
+    }
+
+    private fun rebaseIntegratedContext(
+        context: CalibrationContext,
+        stockSamples: List<CalibrationSample>,
+    ): CalibrationContext {
+        if (stockSamples.isEmpty()) return context
+        val ordered = stockSamples
+            .asSequence()
+            .filter { it.timestamp > 0L && it.value.isFinite() && it.value > 0f }
+            .sortedBy { it.timestamp }
+            .toList()
+        if (ordered.isEmpty()) return context
+
+        val rebasedPoints = context.allPoints.map { point ->
+            val nearest = ordered.minByOrNull { sample -> kotlin.math.abs(sample.timestamp - point.timestamp) }
+            if (nearest != null && kotlin.math.abs(nearest.timestamp - point.timestamp) <= INTEGRATED_ANCHOR_MATCH_MS) {
+                point.copy(x = nearest.value.toDouble())
+            } else {
+                point
+            }
+        }
+        return context.copy(
+            allPoints = rebasedPoints,
+            earliestPoint = rebasedPoints.filter { it.isEnabled }.minByOrNull { it.timestamp },
+        )
+    }
+
+    private fun integratedBaselineSamples(
+        context: CalibrationContext,
+        stockSamples: List<CalibrationSample>,
+    ): List<CalibrationSample> {
+        val ordered = stockSamples
+            .asSequence()
+            .filter { it.timestamp > 0L && it.value.isFinite() && it.value > 0f }
+            .sortedBy { it.timestamp }
+            .toList()
+        if (ordered.isEmpty()) return emptyList()
+        return context.allPoints
+            .mapNotNull { point ->
+                ordered.minByOrNull { sample -> kotlin.math.abs(sample.timestamp - point.timestamp) }
+                    ?.takeIf { nearest ->
+                        kotlin.math.abs(nearest.timestamp - point.timestamp) <= INTEGRATED_ANCHOR_MATCH_MS
+                    }
+            }
+            .distinctBy { it.timestamp }
     }
 
     private fun resolveCalibrationContext(
         isRawMode: Boolean,
         sensorIdOverride: String?
     ): CalibrationContext? {
-        if (!isEnabledForMode(isRawMode)) {
-            return null
-        }
-        val currentSensor = normalizeSensorId(sensorIdOverride ?: Natives.lastsensorname())
-        val allPoints = getValidPointsForSensor(isRawMode = isRawMode, sensorIdOverride = currentSensor)
-        if (allPoints.isEmpty()) {
+        val currentSensor = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, currentSensor)) return null
+        val allPoints = getHistoryAwarePointsForSensor(isRawMode = isRawMode, sensorId = currentSensor)
+        val activePoints = allPoints.filter { it.isEnabled }
+        if (activePoints.isEmpty()) {
             return null
         }
         return CalibrationContext(
             sensorId = currentSensor,
             algorithm = getAlgorithmForMode(isRawMode),
             allPoints = allPoints,
-            earliestPoint = allPoints.minByOrNull { it.timestamp }
+            earliestPoint = activePoints.minByOrNull { it.timestamp }
         )
     }
 
-    private fun resolvePointsForTimestamp(
-        allPoints: List<CalPoint>,
-        targetTimestamp: Long,
-        earliestPoint: CalPoint?
-    ): List<CalPoint> {
-        if (!_lockPastHistory.value) {
-            return allPoints
-        }
-        return allPoints
-            .filter { it.timestamp <= targetTimestamp }
-            .ifEmpty {
-                if (_applyToPast.value && earliestPoint != null) {
-                    listOf(earliestPoint)
-                } else {
-                    emptyList()
-                }
-            }
-    }
 
     private fun computeCalibratedValue(
         originalValue: Float,
@@ -925,11 +1974,12 @@ object CalibrationManager {
             return originalValue
         }
 
-        val computation = computeAlgorithm(
-            algorithm = algorithm,
+        val computation = CalibrationMath.computeAlgorithm(
+            algorithm = algorithm.storageValue,
             targetValue = originalValue.toDouble(),
             targetTimestamp = targetTimestamp,
-            points = points
+            points = points,
+            tuning = tuningForMode(isRawMode)
         )
 
         if (emitDiagnostics) {
@@ -946,69 +1996,16 @@ object CalibrationManager {
             )
         }
 
-        val calibrated = sanitizeCalibratedValue(computation.prediction, originalValue)
+        val calibrated = CalibrationMath.sanitizeCalibratedValue(computation.prediction, originalValue)
         return if (_applyToPast.value) {
             calibrated
         } else {
-            applyPastPolicy(
+            CalibrationMath.applyPastPolicy(
                 originalValue = originalValue,
                 calibratedValue = calibrated,
                 targetTimestamp = targetTimestamp,
                 points = points
             )
-        }
-    }
-
-    private fun applyPastPolicy(
-        originalValue: Float,
-        calibratedValue: Float,
-        targetTimestamp: Long,
-        points: List<CalPoint>
-    ): Float {
-        val firstCalibrationTs = points.minOfOrNull { it.timestamp } ?: return calibratedValue
-        if (targetTimestamp >= firstCalibrationTs) return calibratedValue
-
-        val blendStartTs = firstCalibrationTs - PAST_BLEND_WINDOW_MS
-        if (targetTimestamp <= blendStartTs) return originalValue
-
-        val blend = ((targetTimestamp - blendStartTs).toDouble() / PAST_BLEND_WINDOW_MS.toDouble())
-            .coerceIn(0.0, 1.0)
-            .toFloat()
-        return originalValue + (calibratedValue - originalValue) * blend
-    }
-
-    private fun computeAlgorithm(
-        algorithm: CalibrationAlgorithm,
-        targetValue: Double,
-        targetTimestamp: Long,
-        points: List<CalPoint>
-    ): AlgorithmComputation {
-        if (points.size == 1) {
-            val offset = points.first().y - points.first().x
-            return AlgorithmComputation(
-                prediction = targetValue + offset,
-                offset = offset,
-                anchorInfluence = 1.0,
-                confidence = 1.0,
-                note = "Single-point offset calibration"
-            )
-        }
-
-        return when (algorithm) {
-            CalibrationAlgorithm.SANE_WEIGHTED_OLS ->
-                saneWeightedOls(targetValue, targetTimestamp, points)
-
-            CalibrationAlgorithm.XDRIP_MEDIAN_SLOPE ->
-                xdripMedianSlope(targetValue, targetTimestamp, points)
-
-            CalibrationAlgorithm.TIME_WEIGHTED_ROBUST_REGRESSION ->
-                timeWeightedRobustRegression(targetValue, targetTimestamp, points)
-
-            CalibrationAlgorithm.ELASTIC_TIME_WEIGHTED_INTERPOLATION ->
-                elasticTimeWeightedInterpolation(targetValue, targetTimestamp, points)
-
-            CalibrationAlgorithm.ADAPTIVE_ENSEMBLE ->
-                adaptiveEnsemble(targetValue, targetTimestamp, points)
         }
     }
 
@@ -1039,11 +2036,11 @@ object CalibrationManager {
         targetTimestamp: Long? = null,
         force: Boolean = true
     ) {
-        val sensorId = Natives.lastsensorname() ?: ""
+        val sensorId = resolveSensorId()
         val points = getValidPoints(isRawMode = isRawMode, sensorId = sensorId)
         val algorithm = getAlgorithmForMode(isRawMode)
 
-        if (!isEnabledForMode(isRawMode)) {
+        if (!isEnabledForMode(isRawMode, sensorId)) {
             emitDiagnostics(
                 isRawMode = isRawMode,
                 diagnostics = CalibrationDiagnostics(
@@ -1072,11 +2069,12 @@ object CalibrationManager {
         val latestPoint = points.maxByOrNull { it.timestamp } ?: points.last()
         val targetTs = targetTimestamp ?: latestPoint.timestamp
         val targetVal = targetValue?.toDouble() ?: latestPoint.x
-        val computation = computeAlgorithm(
-            algorithm = algorithm,
+        val computation = CalibrationMath.computeAlgorithm(
+            algorithm = algorithm.storageValue,
             targetValue = targetVal,
             targetTimestamp = targetTs,
-            points = points
+            points = points,
+            tuning = tuningForMode(isRawMode)
         )
 
         emitDiagnostics(
@@ -1092,11 +2090,6 @@ object CalibrationManager {
         )
     }
 
-    private fun sanitizeCalibratedValue(calibrated: Double, fallback: Float): Float {
-        if (!calibrated.isFinite()) return fallback
-        return calibrated.coerceIn(0.0, 1000.0).toFloat()
-    }
-
     private fun emitDiagnostics(isRawMode: Boolean, diagnostics: CalibrationDiagnostics, force: Boolean = false) {
         val now = System.currentTimeMillis()
         if (isRawMode) {
@@ -1110,368 +2103,6 @@ object CalibrationManager {
         }
     }
 
-    private fun median(values: List<Double>): Double {
-        if (values.isEmpty()) return 0.0
-        val sorted = values.sorted()
-        val mid = sorted.size / 2
-        return if (sorted.size % 2 == 0) {
-            (sorted[mid - 1] + sorted[mid]) / 2.0
-        } else {
-            sorted[mid]
-        }
-    }
-
-    private fun temporalWeight(
-        pointTimestamp: Long,
-        targetTimestamp: Long,
-        pastHalfLifeHours: Double,
-        futureHalfLifeHours: Double
-    ): Double {
-        val deltaHours = (targetTimestamp - pointTimestamp) / HOUR_MS
-        val ageHours = abs(deltaHours)
-        val halfLife = if (deltaHours >= 0.0) pastHalfLifeHours else futureHalfLifeHours
-        return 0.5.pow(ageHours / halfLife.coerceAtLeast(0.1))
-    }
-
-    private fun weightedOffset(points: List<CalPoint>, weights: List<Double>): Double {
-        var sumW = 0.0
-        var sumOffset = 0.0
-        points.indices.forEach { idx ->
-            val w = weights[idx].coerceAtLeast(0.0)
-            sumW += w
-            sumOffset += (points[idx].y - points[idx].x) * w
-        }
-        return if (sumW > 1e-9) sumOffset / sumW else points.map { it.y - it.x }.average()
-    }
-
-    private fun weightedLinearModel(
-        points: List<CalPoint>,
-        weights: List<Double>,
-        slopeMin: Double,
-        slopeMax: Double
-    ): LinearModel? {
-        if (points.size != weights.size || points.isEmpty()) return null
-
-        var sumW = 0.0
-        var sumWX = 0.0
-        var sumWY = 0.0
-        var sumWXY = 0.0
-        var sumWX2 = 0.0
-
-        points.indices.forEach { idx ->
-            val w = weights[idx].coerceAtLeast(0.0)
-            val x = points[idx].x
-            val y = points[idx].y
-            sumW += w
-            sumWX += w * x
-            sumWY += w * y
-            sumWXY += w * x * y
-            sumWX2 += w * x * x
-        }
-
-        if (sumW <= 1e-9) return null
-        val denominator = sumW * sumWX2 - sumWX * sumWX
-        if (abs(denominator) <= 1e-9) return null
-
-        var slope = (sumW * sumWXY - sumWX * sumWY) / denominator
-        slope = slope.coerceIn(slopeMin, slopeMax)
-        val intercept = (sumWY - slope * sumWX) / sumW
-
-        if (!slope.isFinite() || !intercept.isFinite()) return null
-        return LinearModel(slope = slope, intercept = intercept)
-    }
-
-    private fun saneWeightedOls(targetValue: Double, targetTimestamp: Long, points: List<CalPoint>): AlgorithmComputation {
-        val newestTimestamp = points.maxOfOrNull { it.timestamp } ?: targetTimestamp
-        val weights = points.map { p ->
-            var w = temporalWeight(
-                pointTimestamp = p.timestamp,
-                targetTimestamp = targetTimestamp,
-                pastHalfLifeHours = 18.0,
-                futureHalfLifeHours = 6.0
-            )
-            if (p.timestamp == newestTimestamp) w *= 1.25
-            w
-        }
-
-        val model = weightedLinearModel(points, weights, slopeMin = 0.65, slopeMax = 1.35)
-        val fallback = targetValue + weightedOffset(points, weights)
-        val regression = model?.predict(targetValue) ?: fallback
-
-        val nearest = points.minByOrNull {
-            abs(it.x - targetValue) + abs(it.timestamp - targetTimestamp) / HOUR_MS
-        }
-
-        if (nearest != null) {
-            val dx = abs(nearest.x - targetValue)
-            val dtHours = abs(nearest.timestamp - targetTimestamp) / HOUR_MS
-            val snap = (1.0 / (1.0 + dx * 2.5)) * (1.0 / (1.0 + dtHours / 8.0)) * 0.25
-            val anchor = targetValue + (nearest.y - nearest.x)
-            val blended = regression * (1.0 - snap) + anchor * snap
-            val confidence = ((weights.maxOrNull() ?: 0.0) / weights.sum().coerceAtLeast(1e-6)).coerceIn(0.15, 1.0)
-            return AlgorithmComputation(
-                prediction = blended,
-                slope = model?.slope,
-                intercept = model?.intercept,
-                offset = blended - targetValue,
-                anchorInfluence = snap,
-                confidence = confidence,
-                note = "Recency-weighted OLS with local anchor snap"
-            )
-        }
-
-        val confidence = ((weights.maxOrNull() ?: 0.0) / weights.sum().coerceAtLeast(1e-6)).coerceIn(0.15, 1.0)
-        return AlgorithmComputation(
-            prediction = regression,
-            slope = model?.slope,
-            intercept = model?.intercept,
-            offset = regression - targetValue,
-            anchorInfluence = 0.0,
-            confidence = confidence,
-            note = "Recency-weighted OLS"
-        )
-    }
-
-    private fun xdripMedianSlope(targetValue: Double, targetTimestamp: Long, points: List<CalPoint>): AlgorithmComputation {
-        val workingSet = points
-            .sortedBy { abs(it.timestamp - targetTimestamp) }
-            .take(12)
-            .ifEmpty { points }
-
-        val slopes = mutableListOf<Double>()
-        for (i in 0 until workingSet.size) {
-            for (j in i + 1 until workingSet.size) {
-                val dx = workingSet[j].x - workingSet[i].x
-                if (abs(dx) <= 1e-9) continue
-                slopes.add((workingSet[j].y - workingSet[i].y) / dx)
-            }
-        }
-
-        if (slopes.isEmpty()) {
-            val weights = workingSet.map {
-                temporalWeight(it.timestamp, targetTimestamp, pastHalfLifeHours = 18.0, futureHalfLifeHours = 6.0)
-            }
-            val prediction = targetValue + weightedOffset(workingSet, weights)
-            return AlgorithmComputation(
-                prediction = prediction,
-                offset = prediction - targetValue,
-                anchorInfluence = 0.0,
-                confidence = 0.35,
-                note = "Median slope fallback to weighted offset"
-            )
-        }
-
-        val slope = median(slopes).coerceIn(0.60, 1.40)
-        val intercept = median(workingSet.map { it.y - slope * it.x })
-        val prediction = slope * targetValue + intercept
-
-        return if (prediction.isFinite()) {
-            AlgorithmComputation(
-                prediction = prediction,
-                slope = slope,
-                intercept = intercept,
-                offset = prediction - targetValue,
-                anchorInfluence = 0.0,
-                confidence = 0.70,
-                note = "Theil-Sen style median slope"
-            )
-        } else {
-            val weights = workingSet.map {
-                temporalWeight(it.timestamp, targetTimestamp, pastHalfLifeHours = 18.0, futureHalfLifeHours = 6.0)
-            }
-            val fallback = targetValue + weightedOffset(workingSet, weights)
-            AlgorithmComputation(
-                prediction = fallback,
-                offset = fallback - targetValue,
-                anchorInfluence = 0.0,
-                confidence = 0.40,
-                note = "Median slope invalid, using weighted offset"
-            )
-        }
-    }
-
-    private fun timeWeightedRobustRegression(targetValue: Double, targetTimestamp: Long, points: List<CalPoint>): AlgorithmComputation {
-        val baseWeights = points.map {
-            temporalWeight(
-                pointTimestamp = it.timestamp,
-                targetTimestamp = targetTimestamp,
-                pastHalfLifeHours = 24.0,
-                futureHalfLifeHours = 8.0
-            )
-        }
-
-        var weights = baseWeights.toMutableList()
-        var model = weightedLinearModel(points, weights, slopeMin = 0.60, slopeMax = 1.40)
-            ?: run {
-                val fallback = targetValue + weightedOffset(points, baseWeights)
-                return AlgorithmComputation(
-                    prediction = fallback,
-                    offset = fallback - targetValue,
-                    anchorInfluence = 0.0,
-                    confidence = 0.35,
-                    note = "Robust model unavailable, using weighted offset"
-                )
-            }
-
-        var finalMad = 0.05
-
-        repeat(4) {
-            val residuals = points.map { p -> p.y - model.predict(p.x) }
-            val mad = median(residuals.map { abs(it) }).coerceAtLeast(0.05)
-            finalMad = mad
-            val scale = (mad * 1.4826).coerceAtLeast(0.05)
-
-            weights = baseWeights.indices.map { idx ->
-                val u = residuals[idx] / (1.5 * scale)
-                val robustWeight = if (abs(u) <= 1.0) 1.0 else 1.0 / abs(u)
-                (baseWeights[idx] * robustWeight).coerceAtLeast(1e-4)
-            }.toMutableList()
-
-            model = weightedLinearModel(points, weights, slopeMin = 0.60, slopeMax = 1.40) ?: model
-        }
-
-        val regression = model.predict(targetValue)
-        val offsetFallback = targetValue + weightedOffset(points, weights)
-        return if (regression.isFinite()) {
-            val prediction = regression * 0.85 + offsetFallback * 0.15
-            val confidence = (1.0 / (1.0 + finalMad)).coerceIn(0.20, 1.0)
-            AlgorithmComputation(
-                prediction = prediction,
-                slope = model.slope,
-                intercept = model.intercept,
-                offset = prediction - targetValue,
-                anchorInfluence = 0.0,
-                confidence = confidence,
-                note = "Huber-style robust regression"
-            )
-        } else {
-            AlgorithmComputation(
-                prediction = offsetFallback,
-                offset = offsetFallback - targetValue,
-                anchorInfluence = 0.0,
-                confidence = 0.35,
-                note = "Robust regression fallback to weighted offset"
-            )
-        }
-    }
-
-    private fun elasticTimeWeightedInterpolation(targetValue: Double, targetTimestamp: Long, points: List<CalPoint>): AlgorithmComputation {
-        val scale = median(points.map { abs(it.x - targetValue) }).coerceAtLeast(0.5)
-
-        val localWeights = points.map { p ->
-            val timeWeight = temporalWeight(
-                pointTimestamp = p.timestamp,
-                targetTimestamp = targetTimestamp,
-                pastHalfLifeHours = 14.0,
-                futureHalfLifeHours = 5.0
-            )
-            val proximity = 1.0 / (1.0 + ((abs(p.x - targetValue) / scale).pow(2.0)))
-            (timeWeight * proximity).coerceAtLeast(1e-4)
-        }
-
-        val localModel = weightedLinearModel(points, localWeights, slopeMin = 0.55, slopeMax = 1.45)
-        val localPrediction = localModel?.predict(targetValue)
-            ?: (targetValue + weightedOffset(points, localWeights))
-
-        val globalPrediction = timeWeightedRobustRegression(targetValue, targetTimestamp, points).prediction
-        val dominance = (localWeights.maxOrNull() ?: 0.0) / localWeights.sum().coerceAtLeast(1e-6)
-        val alpha = (0.35 + 0.55 * dominance).coerceIn(0.35, 0.90)
-
-        var blended = localPrediction * alpha + globalPrediction * (1.0 - alpha)
-        var snapApplied = 0.0
-
-        val nearestByValue = points.minByOrNull { abs(it.x - targetValue) }
-        if (nearestByValue != null) {
-            val dx = abs(nearestByValue.x - targetValue)
-            val snap = (1.0 / (1.0 + dx * 3.0)) * 0.20
-            snapApplied = snap
-            val anchor = targetValue + (nearestByValue.y - nearestByValue.x)
-            blended = blended * (1.0 - snap) + anchor * snap
-        }
-
-        return AlgorithmComputation(
-            prediction = blended,
-            slope = localModel?.slope,
-            intercept = localModel?.intercept,
-            offset = blended - targetValue,
-            anchorInfluence = snapApplied,
-            confidence = alpha,
-            note = "Elastic local interpolation blended with robust global trend"
-        )
-    }
-
-    private fun adaptiveEnsemble(targetValue: Double, targetTimestamp: Long, points: List<CalPoint>): AlgorithmComputation {
-        val sane = saneWeightedOls(targetValue, targetTimestamp, points)
-        val xdrip = xdripMedianSlope(targetValue, targetTimestamp, points)
-        val robust = timeWeightedRobustRegression(targetValue, targetTimestamp, points)
-        val elastic = elasticTimeWeightedInterpolation(targetValue, targetTimestamp, points)
-
-        val pSane = sane.prediction
-        val pXdrip = xdrip.prediction
-        val pRobust = robust.prediction
-        val pElastic = elastic.prediction
-
-        val predictions = listOf(pSane, pXdrip, pRobust, pElastic)
-        val center = median(predictions)
-        val dispersion = predictions.map { abs(it - center) }.average().coerceAtLeast(0.01)
-        val harmony = (1.0 / (1.0 + dispersion)).coerceIn(0.20, 1.00)
-
-        val scale = median(points.map { abs(it.x - targetValue) }).coerceAtLeast(0.5)
-        val localWeights = points.map { p ->
-            val timeWeight = temporalWeight(
-                pointTimestamp = p.timestamp,
-                targetTimestamp = targetTimestamp,
-                pastHalfLifeHours = 12.0,
-                futureHalfLifeHours = 4.0
-            )
-            val proximity = 1.0 / (1.0 + ((abs(p.x - targetValue) / scale).pow(2.0)))
-            (timeWeight * proximity).coerceAtLeast(1e-4)
-        }
-        val localDominance = (localWeights.maxOrNull() ?: 0.0) / localWeights.sum().coerceAtLeast(1e-6)
-
-        var wSane = 0.20
-        var wXdrip = 0.15
-        var wRobust = 0.30
-        var wElastic = 0.35 + (0.20 * localDominance)
-
-        if (harmony < 0.50) {
-            wSane *= 0.85
-            wXdrip *= 0.70
-            wRobust *= 1.10
-            wElastic *= 1.10
-        }
-
-        val sumW = wSane + wXdrip + wRobust + wElastic
-        var blended = (
-            pSane * wSane +
-                pXdrip * wXdrip +
-                pRobust * wRobust +
-                pElastic * wElastic
-            ) / sumW
-        var snapApplied = 0.0
-
-        val nearest = points.minByOrNull {
-            abs(it.x - targetValue) + abs(it.timestamp - targetTimestamp) / HOUR_MS
-        }
-        if (nearest != null) {
-            val dx = abs(nearest.x - targetValue)
-            val dtHours = abs(nearest.timestamp - targetTimestamp) / HOUR_MS
-            val snap = (1.0 / (1.0 + dx * 2.0)) * (1.0 / (1.0 + dtHours / 6.0)) * 0.35
-            snapApplied = snap
-            val anchor = targetValue + (nearest.y - nearest.x)
-            blended = blended * (1.0 - snap) + anchor * snap
-        }
-
-        return AlgorithmComputation(
-            prediction = blended,
-            slope = robust.slope ?: elastic.slope,
-            intercept = robust.intercept ?: elastic.intercept,
-            offset = blended - targetValue,
-            anchorInfluence = snapApplied,
-            confidence = harmony,
-            note = "Adaptive ensemble blend of sane/xDrip/robust/elastic"
-        )
-    }
     
     /**
      * Check if there's active calibration for the given mode.
@@ -1481,43 +2112,52 @@ object CalibrationManager {
     }
 
     fun hasActiveCalibration(isRawMode: Boolean, sensorIdOverride: String? = null): Boolean {
-        if (!isEnabledForMode(isRawMode)) return false
+        val sensorId = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, sensorId)) return false
+        if (tk.glucodata.drivers.ManagedSensorRuntime.integratesUserCalibration(sensorId, isRawMode)) return false
 
-        return getValidPointsForSensor(isRawMode, sensorIdOverride).isNotEmpty()
+        return getValidPointsForSensor(isRawMode, sensorId).isNotEmpty()
+    }
+
+    fun hasCalibrationPointsForMode(isRawMode: Boolean, sensorIdOverride: String? = null): Boolean {
+        return getValidPointsForSensor(isRawMode, resolveSensorId(sensorIdOverride)).isNotEmpty()
     }
 
     /** Check if an enabled calibration was added at this timestamp (±30s tolerance) for given mode */
-    fun hasCalibrationAt(timestamp: Long, isRawMode: Boolean): Boolean {
-        if (!isEnabledForMode(isRawMode)) return false
+    @JvmOverloads
+    fun hasCalibrationAt(timestamp: Long, isRawMode: Boolean, sensorIdOverride: String? = null): Boolean {
+        val currentSensor = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, currentSensor)) return false
         ensureCalibrationStateLoaded()
-        val currentSensor = Natives.lastsensorname() ?: ""
         return _calibrations.value.any { cal ->
             cal.isEnabled &&
-            cal.isRawMode == isRawMode &&
+            matchesMode(cal, isRawMode) &&
             sensorMatches(cal.sensorId, currentSensor) &&
             kotlin.math.abs(cal.timestamp - timestamp) <= 30_000L
         }
     }
     
     /** Get calibration at timestamp for editing (±30s tolerance) */
-    fun getCalibrationAt(timestamp: Long, isRawMode: Boolean): CalibrationEntity? {
+    @JvmOverloads
+    fun getCalibrationAt(timestamp: Long, isRawMode: Boolean, sensorIdOverride: String? = null): CalibrationEntity? {
         ensureCalibrationStateLoaded()
-        val currentSensor = Natives.lastsensorname() ?: ""
+        val currentSensor = resolveSensorId(sensorIdOverride)
         return _calibrations.value.find { cal ->
-            cal.isRawMode == isRawMode &&
+            matchesMode(cal, isRawMode) &&
             sensorMatches(cal.sensorId, currentSensor) &&
             kotlin.math.abs(cal.timestamp - timestamp) <= 30_000L
         }
     }
     
     /** Get visible calibrations for chart display (only enabled, matching mode and sensor) */
-    fun getVisibleCalibrations(isRawMode: Boolean): List<CalibrationEntity> {
-        if (!isEnabledForMode(isRawMode)) return emptyList()
+    @JvmOverloads
+    fun getVisibleCalibrations(isRawMode: Boolean, sensorIdOverride: String? = null): List<CalibrationEntity> {
+        val currentSensor = resolveSensorId(sensorIdOverride)
+        if (!isEnabledForMode(isRawMode, currentSensor)) return emptyList()
         ensureCalibrationStateLoaded()
-        val currentSensor = Natives.lastsensorname() ?: ""
         return _calibrations.value.filter { cal ->
             cal.isEnabled &&
-            cal.isRawMode == isRawMode &&
+            matchesMode(cal, isRawMode) &&
             sensorMatches(cal.sensorId, currentSensor)
         }
     }

@@ -10,6 +10,7 @@ import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import tk.glucodata.Applic
+import tk.glucodata.GlucoseReadingSource
 import tk.glucodata.Log
 import tk.glucodata.R
 import tk.glucodata.SensorIdentity
@@ -40,6 +41,8 @@ class ApiGlucoseSourceManager(
         private const val SENSOR_GEN = 0
         private const val RETRY_INTERVAL_MS = 30_000L
         private const val MGDL_PER_MMOLL = 18.0182f
+        private const val MIN_REASONABLE_TIMESTAMP_MS = 946_684_800_000L
+        private const val MAX_FUTURE_TIMESTAMP_DRIFT_MS = 10L * 60L * 1000L
     }
 
     private enum class Phase {
@@ -56,6 +59,10 @@ class ApiGlucoseSourceManager(
     @Volatile private var phase: Phase = Phase.IDLE
     @Volatile private var status: String = localizedString(R.string.api_source_status_idle, "API source idle")
     @Volatile private var lastImportedHistoryTailMs: Long = 0L
+    // Snapshot parsed from the current poll, committed only once the refresh is
+    // known to still be active (see refresh()): parsing must not mutate the
+    // shared ApiIobSnapshot while a disable/terminate may be racing it.
+    @Volatile private var pendingIobSnapshot: ApiIobSnapshot.RemoteIob? = null
     @Volatile private var latestReadingTimeMs: Long = 0L
     @Volatile private var latestReadingMgdl: Float = Float.NaN
     @Volatile private var latestAutoMgdl: Float = Float.NaN
@@ -169,17 +176,20 @@ class ApiGlucoseSourceManager(
     override fun softDisconnect() {
         stop = true
         handler.removeCallbacksAndMessages(null)
+        dropApiIobSnapshot()
         setStatus(Phase.IDLE, localizedString(R.string.api_source_status_paused, "API source paused"))
     }
 
     override fun softReconnect() {
         stop = false
+        lastImportedHistoryTailMs = 0L
         scheduleRefresh(0L)
     }
 
     override fun terminateManagedSensor(wipeData: Boolean) {
         stop = true
         handler.removeCallbacksAndMessages(null)
+        dropApiIobSnapshot()
         if (wipeData) {
             Applic.app?.let { ApiGlucoseSourceRegistry.disableSourceSensor(it) }
         }
@@ -213,7 +223,16 @@ class ApiGlucoseSourceManager(
         }
         setStatus(Phase.SYNCING, localizedString(R.string.api_source_status_syncing, "Refreshing API source"))
         try {
+            VirtualGlucoseSensorBridge.pruneFutureHistory(SerialNumber, "API source")
+            pendingIobSnapshot = null
             val readings = fetchReadings()
+            if (stop) {
+                // Disabled or terminated while the network request was in flight:
+                // drop what it brought back instead of resurrecting cleared state.
+                dropApiIobSnapshot()
+                return
+            }
+            commitPendingIobSnapshot()
             if (readings.isEmpty()) {
                 setStatus(Phase.IDLE, localizedString(R.string.api_source_status_no_readings, "No API readings yet"))
                 scheduleRefresh(pollIntervalMs)
@@ -248,6 +267,8 @@ class ApiGlucoseSourceManager(
             sensorSerial = SerialNumber,
             readings = readings,
             logLabel = "API source",
+            mirrorToNative = true,
+            source = GlucoseReadingSource.API,
         )
         if (tailMs > 0L) {
             lastImportedHistoryTailMs = tailMs
@@ -276,6 +297,8 @@ class ApiGlucoseSourceManager(
             reading = latest.copy(rate = rate),
             sensorGen = SENSOR_GEN,
             logLabel = "API source",
+            mirrorToNative = true,
+            source = GlucoseReadingSource.API,
         )
     }
 
@@ -460,6 +483,8 @@ class ApiGlucoseSourceManager(
     private fun parseOutboundJson(body: String): List<VirtualGlucoseSensorBridge.Reading> {
         val trimmed = body.trim()
         if (trimmed.isEmpty()) return emptyList()
+        importJournalPayload(trimmed)
+        noteIobSnapshot(ApiIobSnapshot.parse(trimmed))
         val objects = when {
             trimmed.startsWith("[") -> jsonArrayObjects(JSONArray(trimmed))
             else -> {
@@ -494,7 +519,6 @@ class ApiGlucoseSourceManager(
     }
 
     private fun parseJsonReading(entry: JSONObject): VirtualGlucoseSensorBridge.Reading? {
-        importJournal(entry)
         val primaryMgdl = firstFiniteField(
             entry,
             "glucose_mgdl",
@@ -547,7 +571,8 @@ class ApiGlucoseSourceManager(
                 entry.optLong("date", 0L),
                 entry.optLong("mills", 0L),
                 entry.optLong("datetime", 0L),
-            )
+            ),
+            entry.toString()
         ) ?: return null
 
         val rate = firstFiniteAny(entry.optDouble("rate_mgdl_per_min", Double.NaN))?.toFloat()
@@ -627,11 +652,10 @@ class ApiGlucoseSourceManager(
             }
             .toMap()
 
-        val timestamp = normalizeTimestamp(
-            fields["TS"]?.toLongOrNull()
-                ?: fields["TIMESTAMP"]?.toLongOrNull()
-                ?: 0L
-        ) ?: return null
+        val timestampRaw = fields["TS"]?.toLongOrNull()
+            ?: fields["TIMESTAMP"]?.toLongOrNull()
+            ?: 0L
+        val timestamp = normalizeTimestamp(timestampRaw, message) ?: return null
         val glucoseMgdl = fields["MGDL"]?.toDoubleOrNull()
             ?: fields["GLUCOSE_MGDL"]?.toDoubleOrNull()
             ?: fields["GV"]?.toDoubleOrNull()?.let { it * MGDL_PER_MMOLL }
@@ -660,6 +684,9 @@ class ApiGlucoseSourceManager(
             ?: fields["RAW_MMOL"]?.toDoubleOrNull()?.let { it * MGDL_PER_MMOLL }
             ?: fields["RAW"]?.toDoubleOrNull()?.let(::inferCompactGlucoseMgdl)
             ?: Double.NaN
+        // GlucoWatch text carries the sender's IOB/COB alongside glucose; keep
+        // the snapshot so the follower shows the sender's numbers (see parseOutboundJson).
+        noteIobSnapshot(ApiIobSnapshot.fromTextFields(fields))
         return VirtualGlucoseSensorBridge.Reading(
             timestampMs = timestamp,
             glucoseMgdl = glucoseMgdl.toFloat(),
@@ -737,19 +764,43 @@ class ApiGlucoseSourceManager(
     private fun inferCompactGlucoseMgdl(value: Double): Double =
         if (value in 1.0..40.0) value * MGDL_PER_MMOLL else value
 
-    private fun importJournal(entry: JSONObject) {
-        val journal = when {
-            entry.has("journal") -> entry.opt("journal")
-            entry.has("events") -> JSONObject().put("events", entry.optJSONArray("events"))
-            else -> null
-        } ?: return
-        runCatching {
-            val type = Class.forName("tk.glucodata.OutboundApiJournalSnapshot")
-            val method = type.getMethod("importFromJson", String::class.java)
-            method.invoke(null, journal.toString())
+    private fun importJournalPayload(raw: String): Int {
+        if (raw.isBlank()) return 0
+        return runCatching {
+            tk.glucodata.JournalSnapshotAccess.importFromJsonForSource(raw, "api:$SerialNumber")
+        }.onSuccess { imported ->
+            if (imported > 0) {
+                Log.i(TAG, "Imported $imported API journal entries")
+                UiRefreshBus.requestDataRefresh()
+            }
         }.onFailure {
             Log.w(TAG, "journal import ignored: ${it.message}")
+        }.getOrDefault(0)
+    }
+
+    /** Stage a snapshot parsed mid-poll; the newest timestamp wins across messages. */
+    private fun noteIobSnapshot(remote: ApiIobSnapshot.RemoteIob?) {
+        if (remote == null) return
+        val current = pendingIobSnapshot
+        if (current == null || remote.timestampMillis > current.timestampMillis) {
+            pendingIobSnapshot = remote
         }
+    }
+
+    /** Publish the staged snapshot now that the refresh is known to still be active. */
+    private fun commitPendingIobSnapshot() {
+        val pending = pendingIobSnapshot
+        pendingIobSnapshot = null
+        if (pending != null && ApiIobSnapshot.update(pending)) {
+            tk.glucodata.JournalSnapshotAccess.invalidateBroadcastIobCache()
+        }
+    }
+
+    /** Forget local and remote API IOB state: the source is gone, nothing may linger. */
+    private fun dropApiIobSnapshot() {
+        pendingIobSnapshot = null
+        ApiIobSnapshot.clear()
+        tk.glucodata.JournalSnapshotAccess.invalidateBroadcastIobCache()
     }
 
     private fun firstFinite(vararg values: Double): Double? =
@@ -766,10 +817,46 @@ class ApiGlucoseSourceManager(
     private fun firstLong(vararg values: Long): Long =
         values.firstOrNull { it > 0L } ?: 0L
 
-    private fun normalizeTimestamp(raw: Long): Long? {
+    private fun normalizeTimestamp(raw: Long, sourcePreview: String = ""): Long? {
         if (raw <= 0L) return null
-        val millis = if (raw < 10_000_000_000L) raw * 1000L else raw
-        return millis.takeIf { it > 0L }
+        val millis = when (raw) {
+            in 1_000_000_000L..9_999_999_999L -> raw * 1_000L
+            in 1_000_000_000_000L..9_999_999_999_999L -> raw
+            in 10_000_000_000_000L..99_999_999_999_999L -> {
+                val repaired = raw / 10L
+                if (raw % 10L == 0L && isPlausibleTimestamp(repaired)) {
+                    Log.w(TAG, "Repaired API source timestamp $raw -> $repaired")
+                    repaired
+                } else {
+                    logRejectedTimestamp(raw, "unsupported precision", sourcePreview)
+                    return null
+                }
+            }
+            in 1_000_000_000_000_000L..9_999_999_999_999_999L -> raw / 1_000L
+            in 1_000_000_000_000_000_000L..Long.MAX_VALUE -> raw / 1_000_000L
+            else -> {
+                logRejectedTimestamp(raw, "unsupported precision", sourcePreview)
+                return null
+            }
+        }
+        if (!isPlausibleTimestamp(millis)) {
+            logRejectedTimestamp(raw, "out-of-range timestamp", sourcePreview)
+            return null
+        }
+        return millis
+    }
+
+    private fun isPlausibleTimestamp(timestampMs: Long): Boolean {
+        val maxAccepted = System.currentTimeMillis() + MAX_FUTURE_TIMESTAMP_DRIFT_MS
+        return timestampMs in MIN_REASONABLE_TIMESTAMP_MS..maxAccepted
+    }
+
+    private fun logRejectedTimestamp(raw: Long, reason: String, sourcePreview: String) {
+        val preview = sourcePreview
+            .replace('\n', ' ')
+            .replace('\r', ' ')
+            .take(160)
+        Log.w(TAG, "Ignored API source reading with $reason: ts=$raw preview=$preview")
     }
 
     private fun formEncode(fields: Map<String, String>): String =

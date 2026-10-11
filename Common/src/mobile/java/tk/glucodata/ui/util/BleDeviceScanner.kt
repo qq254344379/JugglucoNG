@@ -52,6 +52,7 @@ class BleDeviceScanner(context: Context) {
 
     @SuppressLint("MissingPermission")
     fun startScan(
+        serviceUuids: List<UUID> = emptyList(),
         onResult: (ScanResult) -> Unit,
         onError: (ScanStartError) -> Unit = {}
     ) {
@@ -87,7 +88,20 @@ class BleDeviceScanner(context: Context) {
 
         scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult?) {
-                result?.let { onResult(it) }
+                result?.let {
+                    // Debug builds only: every setup wizard scans through here, and
+                    // Log.i also feeds the trace ring users attach to reports, which
+                    // would otherwise fill with the names and addresses of every
+                    // device nearby.
+                    if (Log.doLog) {
+                        val uuids = it.scanRecord?.serviceUuids?.map { s -> s.uuid.toString() }
+                        Log.i(LOG_ID, "scan result name=${runCatching { it.device.name }.getOrNull()}" +
+                            " recordName=${it.scanRecord?.deviceName}" +
+                            " addr=${runCatching { it.device.address }.getOrNull()}" +
+                            " rssi=${it.rssi} services=$uuids")
+                    }
+                    onResult(it)
+                }
             }
 
             override fun onScanFailed(errorCode: Int) {
@@ -99,9 +113,14 @@ class BleDeviceScanner(context: Context) {
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
+        val filters = serviceUuids.map { uuid ->
+            ScanFilter.Builder()
+                .setServiceUuid(ParcelUuid(uuid))
+                .build()
+        }
 
         try {
-            scanner.startScan(null, settings, scanCallback)
+            scanner.startScan(filters.ifEmpty { null }, settings, scanCallback)
         } catch (e: SecurityException) {
             Log.e(LOG_ID, "SecurityException during startScan: " + e.message)
             scanCallback = null

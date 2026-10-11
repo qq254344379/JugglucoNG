@@ -78,16 +78,20 @@ import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Locale;
 import java.util.Set;
 
 public class Talker {
 static public final String LOG_ID="Talker";
     private TextToSpeech engine;
+    volatile boolean engineReady = false;
 
 static    private float curpitch=1.0f;
 static  private float curspeed=1.0f;
-static private    long   cursep=50*1000L;
+// volatile: written on the UI thread by the settings dialog, read on the BLE callback thread
+// by selspeak(). A non-volatile long has neither atomicity (JLS 17.7) nor visibility.
+static private volatile long cursep=50*1000L;
 static private int voicepos=-1;
 static private String playstring=null;
 static private Spinner spinner=null;
@@ -146,11 +150,76 @@ public static void removeVoiceOptionsListener(Runnable listener) {
         }
     }
 
+static String getFriendlyVoiceName(Voice voice) {
+    String systemName = voice.getName();
+    if (systemName.contains("-x-")) {
+        String id = systemName.split("-x-")[1].split("-")[0];
+        if (id.startsWith("msm")) return "Device Voice";
+        switch (id) {
+            case "iob": return "Voice A";
+            case "iog": return "Voice B";
+            case "iol": return "Voice C";
+            case "iom": return "Voice D";
+            case "sfg": return "Voice E";
+            case "tpc": return "Voice F";
+            case "tpd": return "Voice G";
+            case "tpf": return "Voice H";
+            default:    return "Voice (" + id.toUpperCase() + ")";
+        }
+    }
+    return systemName;
+}
+
+private static volatile Runnable previewDoneCallback;
+
+public static void setPreviewDoneListener(Runnable r) {
+    previewDoneCallback = r;
+}
+
+public static void previewVoice(int index) {
+    if (DontTalk) return;
+    var talk = SuperGattCallback.talker;
+    if (talk == null || !talk.engineReady) return;
+    Voice voice;
+    synchronized (voiceChoice) {
+        if (index < 0 || index >= voiceChoice.size()) return;
+        voice = voiceChoice.get(index);
+    }
+    talk.setvalues();
+    talk.engine.setVoice(voice);
+    talk.speakPreview();
+}
+
+private void speakPreview() {
+    if (DontTalk) return;
+    try {
+        if (android.os.Build.VERSION.SDK_INT >= minandroid) {
+            engine.setAudioAttributes(mediaAudio);
+            engine.speak("This is a voice preview.", TextToSpeech.QUEUE_FLUSH, null, "voice_preview");
+            engine.setAudioAttributes(notification_audio);
+        } else {
+            engine.speak("This is a voice preview.", TextToSpeech.QUEUE_FLUSH, null);
+        }
+    } catch (Throwable th) {
+        Log.stack(LOG_ID, "speakPreview failed", th);
+    }
+}
+
+public static void stopPreview() {
+    var talk = SuperGattCallback.talker;
+    if (talk != null && talk.engine != null) {
+        talk.engine.stop();
+        talk.setvoice();
+    }
+    var cb = previewDoneCallback;
+    if (cb != null) Applic.RunOnUiThread(cb);
+}
+
 public static ArrayList<String> getVoiceNames() {
     ArrayList<String> names=new ArrayList<>();
     synchronized(voiceChoice) {
         for(var voice:voiceChoice) {
-            names.add(voice.getName());
+            names.add(getFriendlyVoiceName(voice));
             }
         }
     return names;
@@ -181,7 +250,7 @@ public static void ensureComposeTalker(Context context) {
         SuperGattCallback.newtalker(context);
     }
 
-public static void applyComposeSettings(Context context, boolean speakGlucose, boolean touchTalk, boolean speakMessages, boolean speakAlarms, boolean mediaSound, float speed, float pitch, int separationSeconds, int selectedVoice) {
+public static void applyComposeSettings(Context context, boolean speakGlucose, boolean touchTalk, boolean speakMessages, boolean speakAlarms, boolean mediaSound, boolean overrideSilent, float speed, float pitch, int separationSeconds, int selectedVoice) {
     if(DontTalk)
         return;
     curspeed=speed;
@@ -191,7 +260,10 @@ public static void applyComposeSettings(Context context, boolean speakGlucose, b
     if(selectedVoice>=0)
         voicepos=selectedVoice;
 
-    if(mediaSound) {
+    if(overrideSilent) {
+        Natives.setSoundType(AudioAttributes.USAGE_ALARM);
+        }
+    else if(mediaSound) {
         Natives.setSoundType(AudioAttributes.USAGE_MEDIA);
         }
     else {
@@ -231,22 +303,31 @@ public static void selectProfile(Context context,int profile) {
     notifyVoiceListeners();
     }
 
+static final AudioAttributes mediaAudio = new AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build();
+
 public static void testCurrentValue(Context context) {
     if(DontTalk)
         return;
     var current = CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout);
-    var say=(current!=null&&current.getPrimaryStr()!=null)?current.getPrimaryStr():"8.7";
-    if(istalking()) {
-        var talk=SuperGattCallback.talker;
-        if(talk!=null) {
-            talk.setvalues();
-            talk.setvoice();
+    var say=current!=null?current.getSpeechPrimaryStr():context.getString(R.string.tts_missed_readings);
+    var talk=SuperGattCallback.talker;
+    if(talk!=null && talk.engineReady) {
+        talk.setvalues();
+        talk.setvoice();
+        // Use media stream so test is audible regardless of notification mute
+        if(android.os.Build.VERSION.SDK_INT >= minandroid)
+            talk.speak(say, mediaAudio);
+        else
             talk.speak(say);
-            return;
-            }
+        return;
         }
+    // Engine not ready yet — queue for after init
     playstring=say;
-    SuperGattCallback.newtalker(context);
+    if(talk==null)
+        SuperGattCallback.newtalker(context);
     }
 
 void setvalues() {
@@ -277,6 +358,7 @@ if(!DontTalk) {
     }
 void destruct() {
 if(!DontTalk) {
+    engineReady = false;
     if(engine!=null) {
         engine.shutdown();
         engine=null;
@@ -303,6 +385,7 @@ if(!DontTalk) {
             return;
             }
          if(status ==TextToSpeech.SUCCESS) {
+            engineReady = true;
             setvalues();
             if (android.os.Build.VERSION.SDK_INT >= minandroid) {
                 Set<Voice> voices=gine.getVoices();
@@ -311,25 +394,32 @@ if(!DontTalk) {
                     }
                 else {
                     var loc=getlocale();
-   //                    var lang=(context!=null)?context.getString(R.string.language):loc.getLanguage();
                     var lang=loc.getLanguage();
                     {if(doLog) {Log.i(LOG_ID,"lang="+lang);};};
 
+                    var filtered=new ArrayList<Voice>();
+                    for(var voice:voices) {
+                        if(!lang.equals(voice.getLocale().getLanguage())) continue;
+                        // Skip network-only voices — not reliably available offline
+                        if(voice.isNetworkConnectionRequired()) continue;
+                        // Skip voices that are listed but not actually installed
+                        if(voice.getFeatures().contains(android.speech.tts.TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)) continue;
+                        // Skip base locale placeholder — not a selectable voice
+                        if(voice.getName().endsWith("-language")) continue;
+                        filtered.add(voice);
+                        }
+                    filtered.sort(Comparator.comparing(Voice::getName));
                     synchronized(voiceChoice) {
                         voiceChoice.clear();
-                        for(var voice:voices) {
-                            if(lang.equals(voice.getLocale().getLanguage())) {
-                                voiceChoice.add(voice);
-                                }
-                            }
+                        voiceChoice.addAll(filtered);
                         }
                     var spin=spinner;
                     if(spin!=null) {
                         {if(doLog) {Log.i(LOG_ID,"Talker spinner!=null");};};
                           Applic.RunOnUiThread(() -> {
                             spin.setAdapter(new RangeAdapter<Voice>(voiceChoice, Applic.app, voice -> {
-                                    return voice.getName();
-                                    })); 
+                                    return getFriendlyVoiceName(voice);
+                                    }));
                             if(voicepos>=0&&voicepos<voiceChoice.size())
                                 spin.setSelection(voicepos);
                             });
@@ -361,6 +451,10 @@ if(!DontTalk) {
             if(doLog) {Log.i(LOG_ID,"onDone "+utteranceId);};
             if(!notifyfocus)
                 doTurnFocusoff();
+            if ("voice_preview".equals(utteranceId)) {
+                var cb = previewDoneCallback;
+                if (cb != null) Applic.RunOnUiThread(cb);
+            }
         }
 
         @Override
@@ -368,7 +462,10 @@ if(!DontTalk) {
             if(doLog) {Log.i(LOG_ID,"onError "+utteranceId);};
             if(!notifyfocus)
                 doTurnFocusoff();
-
+            if ("voice_preview".equals(utteranceId)) {
+                var cb = previewDoneCallback;
+                if (cb != null) Applic.RunOnUiThread(cb);
+            }
             }
         @Override
         public void onStart(String utteranceId) {
@@ -384,54 +481,156 @@ if(!DontTalk) {
         }
    }
 
-public void speak(String message) {
+// Fraction of the stream's max volume that is the minimum allowed for TTS output.
+// Prevents silence when the user (or system) drives the stream to zero.
+private static final float MIN_TTS_VOLUME_FRACTION = 0.25f;
+
+private static int usageToStreamType(int usage) {
+    switch (usage) {
+        case AudioAttributes.USAGE_ALARM:  return AudioManager.STREAM_ALARM;
+        case AudioAttributes.USAGE_MEDIA:  return AudioManager.STREAM_MUSIC;
+        default:                           return AudioManager.STREAM_NOTIFICATION;
+    }
+}
+
+private static void ensureMinStreamVolume() {
+    try {
+        AudioManager am = (AudioManager) Applic.app.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        final int stream = usageToStreamType(Natives.getSoundType());
+        final int maxVol = am.getStreamMaxVolume(stream);
+        final int minVol = Math.max(1, Math.round(maxVol * MIN_TTS_VOLUME_FRACTION));
+        if (am.getStreamVolume(stream) < minVol) {
+            am.setStreamVolume(stream, minVol, 0);
+        }
+    } catch (Throwable th) {
+        Log.stack(LOG_ID, "ensureMinStreamVolume", th);
+    }
+}
+
+/**
+ * Hand an utterance to the engine.
+ *
+ * @return true only when the engine accepted it, i.e. when an
+ *         {@link UtteranceProgressListener} callback is guaranteed to follow. Callers that
+ *         ration announcements must not charge the separation interval for an utterance that
+ *         never reached the engine (see {@link #selspeak}), and callers holding transient audio
+ *         focus must release it themselves on false.
+ */
+public boolean speak(String message) {
     if(!DontTalk) {
         try {
-            if(
-                    ((android.os.Build.VERSION.SDK_INT >= 21)?
-                    engine.speak(message, TextToSpeech.QUEUE_FLUSH, null,message):
-                            engine.speak(message, TextToSpeech.QUEUE_FLUSH, null)) ==TextToSpeech.SUCCESS)
-
-
-            {
+            ensureMinStreamVolume();
+            int speakResult=(android.os.Build.VERSION.SDK_INT >= 21)
+                    ? engine.speak(message, TextToSpeech.QUEUE_FLUSH, null,message)
+                    : engine.speak(message, TextToSpeech.QUEUE_FLUSH, null);
+            if(speakResult==TextToSpeech.SUCCESS) {
+                health.record(true,engineReady);
                 if(doLog) {Log.i(LOG_ID,"success speak "+message);}
+                return true;
                 }
              else {
-                Log.e(LOG_ID,"failed speak "+message);
+                health.record(false,engineReady);
+                Log.e(LOG_ID,"failed speak "+message+" consecutiveFailures="+health.consecutiveFailures());
                 }
             }
         catch(Throwable th) {
+            // A dead/unbound TTS engine can fail by throwing (e.g. a dead Binder) rather than
+            // returning a non-SUCCESS result - count it the same way, or needsReinit() never
+            // trips for that failure mode.
+            health.record(false,engineReady);
             Log.stack(LOG_ID,"speak failed",th);
             }
         }
+    return false;
+    }
+
+// Tracks real engine health, as opposed to istalking() which only checks that
+// SuperGattCallback.talker is non-null. A talker object surviving a TTS-service disconnect
+// (e.g. com.google.android.tts auto-updating overnight, which unbinds the TextToSpeech
+// connection permanently until reconstructed) still passes istalking(), so nothing ever healed
+// it. Observed in the field: "TextToSpeech: Disconnected from TTS engine" once after a
+// com.google.android.tts package REPLACE, then 172 consecutive "failed speak"/"not bound to TTS
+// engine" results with zero recovery over 4+ days. Refusals before onInit are not counted -
+// see SpeakHealth.record().
+private final SpeakHealth health=new SpeakHealth();
+/** How long selspeak() defers after an utterance the engine would not take. Short enough that
+ *  the next reading retries, so a failed attempt costs one reading rather than one whole
+ *  user-configured separation interval. */
+private static final long FAILED_SPEAK_RETRY_MS=30_000L;
+
+/** True once repeated real speak failures show the engine is dead and must be reconstructed. */
+public boolean needsReinit() {
+    return health.needsReinit();
     }
 static boolean notifyfocus=false;
 //private static final AudioAttributes notification_audio = (new AudioAttributes.Builder()) .setLegacyStreamType(TextToSpeech.Engine.DEFAULT_STREAM) .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH) .build(); 
 //private static final AudioAttributes notification_audio =(android.os.Build.VERSION.SDK_INT >= 21)?new AudioAttributes.Builder().setUsage(isWearable? USAGE_ASSISTANCE_SONIFICATION:USAGE_NOTIFICATION ) .build():null;
 //private static final AudioAttributes notification_audio = notification_audio;
-public void speak(String message, AudioAttributes attr) {
-if(!DontTalk) {
-    if(android.os.Build.VERSION.SDK_INT >= minandroid) {
-        if(attr!=notification_audio) {
-            engine.setAudioAttributes(attr);
-           }
-           }
-    
-//    engine.speak(message, TextToSpeech.QUEUE_FLUSH, null);
-    speak(message);
-    if(android.os.Build.VERSION.SDK_INT >= minandroid) {
-        if(attr!=notification_audio)
-            engine.setAudioAttributes(notification_audio);
+/**
+ * Speak with a one-shot audio-attribute override, restoring {@link Notify#notification_audio}
+ * afterwards. This is the overload the alarm path uses.
+ *
+ * <p>Reads {@code engine} into a local: {@link #destruct} nulls it from another thread, so the
+ * two setAudioAttributes() calls bracketing the utterance could each dereference null while an
+ * alarm was being announced. The single-argument {@link #speak(String)} swallows that in its own
+ * try/catch; this overload did not, so the throw escaped onto the caller's thread - for
+ * {@link Notify} that is a scheduler thread mid-alarm.
+ *
+ * @return true only when the engine accepted the utterance. See {@link #speak(String)}.
+ */
+public boolean speak(String message, AudioAttributes attr) {
+    if(DontTalk)
+        return false;
+    final TextToSpeech gine=engine;
+    if(gine==null) {
+        Log.e(LOG_ID,"speak(message,attr): engine already shut down, dropping \""+message+"\"");
+        return false;
+        }
+    final boolean override=android.os.Build.VERSION.SDK_INT >= minandroid && attr!=notification_audio;
+    boolean spoken=false;
+    try {
+        if(override) {
+            gine.setAudioAttributes(attr);
+            }
+        spoken=speak(message);
+        }
+    catch(Throwable th) {
+        Log.stack(LOG_ID,"speak(message,attr)",th);
+        }
+    finally {
+        // Restore in a finally: leaving the override in place would apply the alarm's
+        // attributes to every subsequent routine announcement.
+        if(override) {
+            try {
+                gine.setAudioAttributes(notification_audio);
+                }
+            catch(Throwable th) {
+                Log.stack(LOG_ID,"speak(message,attr) restore",th);
+                }
+            }
          }
-         }
+    return spoken;
     }
-static long nexttime=0L;
+// volatile: written and read from the announce path and the settings/UI thread alike.
+volatile static long nexttime=0L;
 void selspeak(String message) {
     if(!DontTalk) {
-        var now=System.currentTimeMillis();    
-        if(now>nexttime) {
+        var now=System.currentTimeMillis();
+        if(now>nexttime && SpeakSchedule.INSTANCE.isWithinSchedule(Applic.app)) {
+            // Claim the slot before speaking, so two readings arriving back to back cannot both
+            // announce - then hand nearly all of it back if the engine refused the utterance.
+            // Charging a failed attempt the full separation interval made the engine-health
+            // check's detection latency scale with a user setting, which is backwards:
+            // SpeakHealth counts announcement *attempts*, and attempts only happen
+            // once per cursep, so a threshold of 2 meant a dead engine went unnoticed
+            // for 2 x cursep - 10 minutes at a 300s separation, 33 minutes at 999s, with every
+            // further failure costing another interval of silence. Retrying on the next reading
+            // instead makes detection ~2 minutes regardless of how the user set the interval.
             nexttime=now+cursep;
-            speak(message);
+            if(!speak(message)) {
+                nexttime=now+Math.min(cursep,FAILED_SPEAK_RETRY_MS);
+                }
             }
           }
     }
@@ -540,8 +739,8 @@ private static void cleanupConfigOverlay(MainActivity context, View layout) {
     tk.glucodata.help.hidekeyboard(context);
     removeContentView(layout);
     spinner=null;
-    if(Menus.on)
-        Menus.show(context);
+    if(LegacyScreensAccess.getMenusOn())
+        LegacyScreensAccess.get().openMenus(context);
     context.lightBars(!getInvertColors( ));
     }
 
@@ -655,7 +854,7 @@ private static View makeConfigView(MainActivity context, boolean overlayMode, Ru
 
             } });
         spin.setAdapter(new RangeAdapter<Voice>(voiceChoice, context, voice -> {
-                return voice.getName();
+                return getFriendlyVoiceName(voice);
                 }));
         {if(doLog) {Log.i(LOG_ID,"voicepos="+voicepos);};};
         if(voicepos>=0&&voicepos<voiceChoice.size())
@@ -765,7 +964,7 @@ private static View makeConfigView(MainActivity context, boolean overlayMode, Ru
         });
     test.setOnClickListener(v->  {
         var current = CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout);
-        var say=(current!=null&&current.getPrimaryStr()!=null)?current.getPrimaryStr():"8.7";
+        var say=current!=null?current.getSpeechPrimaryStr():context.getString(R.string.tts_missed_readings);
         getvalues.run();
         if(istalking()) {
             var talk=SuperGattCallback.talker;

@@ -35,7 +35,8 @@ data class MQBgRecord(
     val marker: Int,
     val packetIndex: Int,
     val sampleCurrent: Int,
-    val batteryPercent: Int,
+    /** Raw vendor battery field; not a percentage. */
+    val batteryRaw: Int,
     /** 6 bytes of the raw record for durable storage / replay. */
     val recordBytes: ByteArray,
 )
@@ -114,7 +115,7 @@ object MQParser {
                     marker = marker,
                     packetIndex = (packetHi shl 8) or packetLo,
                     sampleCurrent = (currentHi shl 8) or currentLo,
-                    batteryPercent = battery,
+                    batteryRaw = battery,
                     recordBytes = rec,
                 )
             )

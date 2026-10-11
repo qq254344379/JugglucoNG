@@ -9,7 +9,9 @@ import android.os.IBinder
 import android.view.Gravity
 import android.view.Surface
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
+import android.widget.FrameLayout
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -29,6 +31,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import tk.glucodata.ui.optOutOfForceDark
 import tk.glucodata.UiRefreshBus
 import tk.glucodata.data.GlucoseRepository
 import tk.glucodata.data.settings.FloatingSettingsRepository
@@ -58,6 +61,8 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
 
     private var windowManager: WindowManager? = null
     private var composeView: ComposeView? = null
+    // The view actually attached to the WindowManager; see CutoutAwareContainer.
+    private var overlayRoot: View? = null
     private lateinit var layoutParams: WindowManager.LayoutParams
     
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -138,22 +143,24 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
     private fun setupOverlay() {
         if (composeView != null) return
 
-        composeView = ComposeView(this).apply {
+        val root = CutoutAwareContainer(this) { v, insets ->
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                cutoutData.value = resolveCutoutData(v, insets.displayCutout)
+                if (dynamicIslandEnabled) {
+                    applyOverlayPlacement()
+                }
+            }
+        }.apply {
+            // Compose resolves the window recomposer's lifecycle from the window's
+            // rootView, which is this container now — the owners have to live here.
             setViewTreeLifecycleOwner(this@FloatingGlucoseService)
             setViewTreeViewModelStoreOwner(this@FloatingGlucoseService)
             setViewTreeSavedStateRegistryOwner(this@FloatingGlucoseService)
-            
-            // Listen for Insets to detect Cutout reliably
-            setOnApplyWindowInsetsListener { v, insets ->
-                if (android.os.Build.VERSION.SDK_INT >= 28) {
-                    cutoutData.value = resolveCutoutData(v, insets.displayCutout)
-                    if (dynamicIslandEnabled) {
-                        applyOverlayPlacement()
-                    }
-                }
-                insets
-            }
-            
+        }
+        overlayRoot = root
+        root.optOutOfForceDark()
+
+        composeView = ComposeView(this).apply {
             setContent {
                 FloatingGlucoseOverlay(
                     repository = settingsRepository,
@@ -192,16 +199,24 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
         layoutParams.x = startX
         layoutParams.y = startY
 
+        root.addView(
+            composeView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+
         try {
-            windowManager?.addView(composeView, layoutParams)
-            composeView?.requestApplyInsets()
+            windowManager?.addView(root, layoutParams)
+            root.requestApplyInsets()
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
     
     private fun updateViewPosition(xDelta: Int, yDelta: Int) {
-        if (composeView == null || windowManager == null) return
+        if (overlayRoot == null || windowManager == null) return
         
         layoutParams.x += xDelta
         layoutParams.y += yDelta
@@ -209,7 +224,7 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
         freeformY = layoutParams.y
         
         try {
-            windowManager?.updateViewLayout(composeView, layoutParams)
+            windowManager?.updateViewLayout(overlayRoot, layoutParams)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -283,7 +298,7 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
     }
 
     private fun applyOverlayPlacement() {
-        if (composeView == null || windowManager == null) return
+        if (overlayRoot == null || windowManager == null) return
 
         if (dynamicIslandEnabled) {
             val islandEdge = cutoutData.value.edge.takeIf { it != CutoutEdge.NONE }
@@ -317,7 +332,7 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
         }
 
         try {
-            windowManager?.updateViewLayout(composeView, layoutParams)
+            windowManager?.updateViewLayout(overlayRoot, layoutParams)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -325,11 +340,31 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        composeView?.post {
-            composeView?.requestApplyInsets()
+        overlayRoot?.post {
+            overlayRoot?.requestApplyInsets()
             if (dynamicIslandEnabled) {
                 applyOverlayPlacement()
             }
+        }
+    }
+
+    /**
+     * Cutout detection used to hang on setOnApplyWindowInsetsListener of the
+     * ComposeView itself. Since Compose 1.10 the AndroidComposeView child installs
+     * its own OnApplyWindowInsetsListener on its *parent* when it attaches (see
+     * InsetsListener.onViewAttachedToWindow), silently replacing ours: cutoutData
+     * stayed NONE, so the island still docked to the correct edge via the rotation
+     * fallback but rendered as the horizontal pill with the default gap in
+     * landscape. This container is the window root; Compose never touches it,
+     * and dispatchApplyWindowInsets runs before any listener anyway.
+     */
+    private class CutoutAwareContainer(
+        context: Context,
+        private val onInsets: (View, WindowInsets) -> Unit
+    ) : FrameLayout(context) {
+        override fun dispatchApplyWindowInsets(insets: WindowInsets): WindowInsets {
+            onInsets(this, insets)
+            return super.dispatchApplyWindowInsets(insets)
         }
     }
 
@@ -337,12 +372,13 @@ class FloatingGlucoseService : Service(), LifecycleOwner, ViewModelStoreOwner, S
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         store.clear()
         serviceScope.cancel()
-        if (composeView != null) {
+        if (overlayRoot != null) {
             try {
-                windowManager?.removeView(composeView)
+                windowManager?.removeView(overlayRoot)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
+            overlayRoot = null
             composeView = null
         }
         super.onDestroy()

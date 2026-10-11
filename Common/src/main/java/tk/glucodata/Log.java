@@ -37,7 +37,46 @@ import dalvik.system.BaseDexClassLoader;
 
 
 public class Log {
-public static final boolean doLog=BuildConfig.doLog==1;
+/**
+ * Compile-time ceiling. Builds that set {@code doLog=0} strip logging entirely and can never
+ * turn it back on at runtime.
+ */
+private static final boolean buildAllowsLog=BuildConfig.doLog==1;
+
+/**
+ * Whether log calls should do any work at all.
+ *
+ * <p>Not a constant: the native side keeps the real switch ({@code Natives.islogging()}, backed
+ * by the {@code nolog} setting and the Debug Settings toggle) and drops everything when it is
+ * off. Mirroring it here lets the {@code if(doLog)} guards short-circuit <em>before</em> the
+ * message string is concatenated and pushed across JNI, which is pure waste on the BLE paths.
+ *
+ * <p>Seeded optimistically so logging works during startup, before natives are loaded; refreshed
+ * by {@link #refreshDoLog()} once they are, and again whenever the user flips the toggle.
+ */
+public static volatile boolean doLog=buildAllowsLog;
+
+/**
+ * Re-read the native logging switch. Call after natives load and after any
+ * {@code Natives.dolog(...)} change.
+ */
+public static void refreshDoLog() {
+	if(!buildAllowsLog) {
+		doLog=false;
+		return;
+		}
+	if(!Applic.Nativesloaded) {
+		doLog=true;
+		return;
+		}
+	try {
+		doLog=Natives.islogging();
+		}
+	catch(Throwable e) {
+		android.util.Log.e(LOG_ID,"islogging() unavailable, keeping logging on");
+		doLog=true;
+		}
+	}
 static final private String LOG_ID="Log";
 private static void log(String type,String one,String two) {
    	if(!Applic.Nativesloaded)  {
@@ -64,6 +103,7 @@ private static void log(String type,String one,String two) {
 		}
 	  }
 public static void info(String str) {
+	SensorTraceRing.add(' ',null,str);
 	if(doLog) {
 		if(Applic.Nativesloaded)  {
 			Natives.log(str+'\n');
@@ -102,11 +142,18 @@ public static String stackstring(String mess,Throwable e) {
 
    	}
 public static void e(String one,String two) {
+	SensorTraceRing.add('E',one,two);
 	if(!doLog||!Applic.Nativesloaded)
 		android.util.Log.e(one,two);
 	else
 		log("E",one,two);
 		};
+/**
+ * Not captured into {@link SensorTraceRing}: unlike the tagged calls, this one is the reason
+ * its own message does not exist yet, and capturing would mean running String.format on every
+ * call with logging off. No driver uses it -- they format at the call site and pass the result
+ * to {@link #i} -- so there is nothing here worth that.
+ */
 public static void format(String format, Object... args) {
 	if(doLog) {
 		String form=String.format(usedlocale,format,args);
@@ -130,10 +177,10 @@ public static void annolog(String mess) {
    }
 //s/public static void \([a-z]\).*\(log.*\);/public static void \1(String one,String two) 	{ if(Applic.Nativesloaded) {\2 else android.util.Log.\1(one,two);};/g
 
-public static void d(String one,String two) 	{ if(doLog) {if(Applic.Nativesloaded) {log("D",one,two);} else android.util.Log.d(one,two);}};
-public static void w(String one,String two) 	{ if(doLog) {if(Applic.Nativesloaded) {log("W",one,two);} else android.util.Log.w(one,two);}};
-public static void v(String one,String two) 	{ if(doLog) {if(Applic.Nativesloaded) {log("V",one,two);} else android.util.Log.v(one,two);}};
-public static void i(String one,String two) 	{ if(doLog) {if(Applic.Nativesloaded) {log("I",one,two);} else android.util.Log.i(one,two);}};
+public static void d(String one,String two) 	{ SensorTraceRing.add('D',one,two); if(doLog) {if(Applic.Nativesloaded) {log("D",one,two);} else android.util.Log.d(one,two);}};
+public static void w(String one,String two) 	{ SensorTraceRing.add('W',one,two); if(doLog) {if(Applic.Nativesloaded) {log("W",one,two);} else android.util.Log.w(one,two);}};
+public static void v(String one,String two) 	{ SensorTraceRing.add('V',one,two); if(doLog) {if(Applic.Nativesloaded) {log("V",one,two);} else android.util.Log.v(one,two);}};
+public static void i(String one,String two) 	{ SensorTraceRing.add('I',one,two); if(doLog) {if(Applic.Nativesloaded) {log("I",one,two);} else android.util.Log.i(one,two);}};
 public static void  showbytes(String mess,byte[] ar) {
 	if(doLog)
 		{if(doLog){Natives.showbytes(mess,ar);};}

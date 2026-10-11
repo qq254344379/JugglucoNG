@@ -30,6 +30,9 @@ import kotlin.math.roundToInt
 
 object MQAlgorithm {
 
+    /** Preferences store floats; recover their decimal value before vendor decimal truncation. */
+    internal fun decimalParameter(value: Float): Double = value.toString().toDouble()
+
     private fun roundDown2(value: Double): Double =
         BigDecimal(value.toString()).setScale(2, RoundingMode.DOWN).toDouble()
 

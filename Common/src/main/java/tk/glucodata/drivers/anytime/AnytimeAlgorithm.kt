@@ -1,55 +1,158 @@
-// AnytimeAlgorithm.kt — Glucose computation: vendor JNI + linear fallback.
+// AnytimeAlgorithm.kt — Glucose computation, pure Kotlin. No vendor `.so` for readings.
 //
-// Two paths:
+// Paths:
 //
-//  1. NATIVE: Loads `libalgorithm-jni.so` if it has been dropped into
-//     src/main/jniLibs/{abi}. Current official CT4/Yuwell builds export
-//     `algorithmLatestGlucose(LatestData)` / `algorithmGlucose(HistoryData)`.
-//     Older packaged builds export `algorithm(DataInput)`, so compute() tries
-//     the official path first and falls back when that symbol is unavailable.
+//  1. NATIVE_PORT: `AnytimeNativeAlgorithm`, the pure-Kotlin port of the SHIPPED
+//     vendor `.so` CT3 kernel (`yqidui_PX3`). Used for the CT3 families.
+//     Validated against a Unicorn oracle (AnytimeNativeCt3Tests); stateful and
+//     per-sensor, state persisted via AnytimeRegistry.
 //
-//  2. LINEAR: Pure-Kotlin raw display lane. It is not a replacement for the
-//     vendor algorithm and stays separate from native output; Auto+Raw modes
-//     must never copy the auto value into the raw lane.
+//  2. MODEL: `AnytimeCalibrator`, the pure-Kotlin port of the Reference App's MK4
+//     chain (see docs/MK4_FINAL_SUMMARY.md), used for CT4. Empirical CT-14 model
+//     for CT2. Stateful and per-sensor: see `calibratorFor`/`restoreCalibratorState`.
+//     Only advanced from the live path (`advanceModelFallback = true`);
+//     history/backfill records are not guaranteed ascending (recent-tail-first
+//     backfill can revisit older ids after newer ones), so backfill uses LINEAR.
 //
-// This module hides the choice from callers — `compute()` always returns a
-// `Result`. We expose `isNativeAvailable` so UI can show "vendor algorithm" vs
-// "linear fallback" badges.
+//  3. LINEAR: Pure-Kotlin raw display lane. It is not a replacement for the
+//     algorithm and stays separate from the Auto lane; Auto+Raw modes must never
+//     copy the auto value into the raw lane.
+//
+// CT5 is transmitter-computed (`fromComputedRecord`) with a learned Iw→mg/dL scale
+// (`AnytimeCt5RawScale`), and never calls `compute()`.
+//
+// No JNI: the vendor `libalgorithm-jni.so` is not packaged and is not consulted for
+// readings or QR decoding (`AnytimeQr` is the pure-Kotlin parser).
+//
+// This module hides the choice from callers — `compute()` always returns a `Result`.
 
 package tk.glucodata.drivers.anytime
 
-import ist.com.sdk.AlgorithmTools
-import ist.com.sdk.CurrentGlucose
-import ist.com.sdk.DataInput
-import ist.com.sdk.DataOutput
-import ist.com.sdk.HistoryData
-import ist.com.sdk.KRDecodeData
-import ist.com.sdk.LatestData
 import tk.glucodata.Log
 
 object AnytimeAlgorithm {
 
     private const val TAG = AnytimeConstants.TAG
-    private const val LEGACY_WARMUP_RECORDS = 20
-    @Volatile private var officialLatestMissing: Boolean = false
-    @Volatile private var officialHistoryMissing: Boolean = false
-    @Volatile private var legacyAlgorithmMissing: Boolean = false
-    @Volatile private var nativeSkippedNoFactoryLogged: Boolean = false
 
-    /** The .so loads lazily on first JNI call (or first `getInstance()`). */
-    val isNativeAvailable: Boolean by lazy {
-        runCatching {
-            val tools = AlgorithmTools.getInstance()
-            // Make a no-op call to force the load; getVersion() returns SDKVersion.
-            tools.getVersion()
-            true
-        }.getOrElse { t ->
-            Log.w(TAG, "libalgorithm-jni.so not loadable: ${t.message}")
-            false
-        }
+    enum class Source { NATIVE, NATIVE_PORT, MODEL, LINEAR }
+
+    /** One [AnytimeCalibrator] per sensor session, keyed by the persistent sensor id (SerialNumber). */
+    private val calibrators = java.util.concurrent.ConcurrentHashMap<String, AnytimeCalibrator>()
+
+    private fun calibratorFor(persistentSensorId: String, k0: Float): AnytimeCalibrator {
+        val existing = calibrators[persistentSensorId]
+        if (existing != null && existing.k0 == k0) return existing
+        val created = AnytimeCalibrator(k0)
+        calibrators[persistentSensorId] = created
+        return created
     }
 
-    enum class Source { NATIVE, LINEAR }
+    /** Seed the pool from persisted state, e.g. in `restoreFromPersistence`, before any live call. */
+    @JvmStatic
+    fun restoreCalibratorState(persistentSensorId: String, k0: Float, state: AnytimeCalibrator.State) {
+        if (persistentSensorId.isBlank() || k0 <= 0f) return
+        val calibrator = AnytimeCalibrator(k0)
+        calibrator.restoreState(state)
+        calibrators[persistentSensorId] = calibrator
+    }
+
+    /** Read current continuity state for persistence, e.g. in `persistAlgorithmState`. */
+    @JvmStatic
+    fun snapshotCalibratorState(persistentSensorId: String): AnytimeCalibrator.State? =
+        calibrators[persistentSensorId]?.snapshot()
+
+    /** Drop pooled state for a sensor being removed/replaced. */
+    @JvmStatic
+    fun clearCalibratorState(persistentSensorId: String) {
+        calibrators.remove(persistentSensorId)
+    }
+
+    // ---- CT3 native-port state (the vendored CT3 chain, pure Kotlin) ----
+
+    private class NativePort(var state: AnytimeNativeState = AnytimeNativeState()) {
+        /** The vendor `dynamic[0]`: the previous sample's glucose id. */
+        var previousGlucoseId: Int = -1
+    }
+
+    private val nativePorts = java.util.concurrent.ConcurrentHashMap<String, NativePort>()
+
+    private fun nativePortFor(persistentSensorId: String): NativePort =
+        nativePorts.getOrPut(persistentSensorId) { NativePort() }
+
+    /** Seed the pool from persisted state before the first live call. */
+    @JvmStatic
+    fun restoreNativePortState(persistentSensorId: String, encoded: String) {
+        if (persistentSensorId.isBlank()) return
+        AnytimeNativeState.decode(encoded)?.let { nativePorts[persistentSensorId] = NativePort(it) }
+    }
+
+    /** Read current continuity state for persistence; null when there is none. */
+    @JvmStatic
+    fun snapshotNativePortState(persistentSensorId: String): String? =
+        nativePorts[persistentSensorId]?.state?.encode()
+
+    @JvmStatic
+    fun clearNativePortState(persistentSensorId: String) {
+        nativePorts.remove(persistentSensorId)
+    }
+
+    /** CT3 families: the vendor kernel is the only source we port ourselves. */
+    private fun isCt3Family(family: AnytimeConstants.FamilyEntry): Boolean =
+        when (family.family) {
+            AnytimeConstants.Family.CT3,
+            AnytimeConstants.Family.CT3_PLUS,
+            AnytimeConstants.Family.CT3_YUWELL,
+            AnytimeConstants.Family.CT3_ULTRASONIC,
+            -> true
+            else -> false
+        }
+
+    /**
+     * Pure-Kotlin CT3 chain (`AnytimeNativeAlgorithm`), used when the vendor `.so`
+     * is absent. Stateful and per sensor; only advance from the live path.
+     */
+    private fun computeCt3NativePort(
+        record: AnytimeRawRecord,
+        calibration: AnytimeQrCalibration,
+        persistentSensorId: String,
+        lastReferenceBgMgdlTimes10: Int,
+        lastReferenceBgGlucoseId: Int,
+        rawMgdl: Float,
+    ): Result {
+        val port = nativePortFor(persistentSensorId)
+        val attachReference =
+            shouldAttachReferenceBg(record.glucoseId, lastReferenceBgGlucoseId, lastReferenceBgMgdlTimes10)
+        val input = AnytimeNativeInput().apply {
+            glucoseId = record.glucoseId
+            iw = record.iwNa
+            ib = record.ibNa
+            temperatureC = record.temperatureC
+            k0 = calibration.k
+            r = calibration.r
+            // Matches the JNI path: only the fingerstick fields are attached.
+            flags = if (attachReference) 0x80 else 0
+            newBgValue = if (attachReference) lastReferenceBgMgdlTimes10 / 10f else 0f
+        }
+        val out = AnytimeNativeAlgorithm.process(input, port.state, port.previousGlucoseId)
+        port.previousGlucoseId = record.glucoseId
+
+        val mmol = out.glucose.coerceAtLeast(AnytimeConstants.ALGO_MMOL_FLOOR.toFloat())
+        val mgdlTimes10 = (out.mgdl * 10)
+            .coerceIn(AnytimeConstants.ALGO_MGDL_MIN_TIMES10, AnytimeConstants.ALGO_MGDL_MAX_TIMES10)
+        return Result(
+            glucoseId = record.glucoseId,
+            mmol = mmol,
+            mgdlTimes10 = mgdlTimes10,
+            ibNa = record.ibNa,
+            iwNa = record.iwNa,
+            temperatureC = record.temperatureC,
+            trend = out.trend,
+            errorCode = out.errorCode,
+            warnCode = out.warn,
+            source = Source.NATIVE_PORT,
+            rawMgdl = rawMgdl,
+        )
+    }
 
     /** Algorithm output. Mirrors the native `DataOutput` where the bundled JNI provides it. */
     data class Result(
@@ -113,249 +216,92 @@ object AnytimeAlgorithm {
         lastReferenceBgGlucoseId: Int = 0,
         sessionPacketsSinceInit: Int = 0,
         recentRecords: List<AnytimeRawRecord> = listOf(record),
+        recentRecordsProvider: (() -> List<AnytimeRawRecord>)? = null,
         sensorStartTimeMs: Long = 0L,
+        logNativeFallbackWarnings: Boolean = true,
+        /** Stable per-sensor key for the MODEL calibrator pool; see `calibratorFor`. */
+        persistentSensorId: String = sensorIdName,
+        /**
+         * Advance the stateful MODEL fallback for this call. Only the live push
+         * path may set this true — backfill ids are not guaranteed ascending
+         * (recent-tail-first), which would corrupt the calibrator's continuity.
+         */
+        advanceModelFallback: Boolean = false,
     ): Result {
         val k = qr?.k ?: 0f
         val r = qr?.r ?: 0f
         val voltageFlag = qr?.voltageFlag ?: 0
         val linear = computeLinear(record, k, r, family, voltageFlag)
         val calibration = qr?.takeIf { it.isFactoryCalibration }
-        if (isNativeAvailable && calibration != null) {
-            val window = recentRecords
-                .filter { it.glucoseId <= record.glucoseId }
-                .distinctBy { it.glucoseId }
-                .sortedBy { it.glucoseId }
-                .ifEmpty { listOf(record) }
-            val contiguousHistory = contiguousHistoryThrough(record, window)
-            tryOfficialLatest(
-                record = record,
-                calibration = calibration,
-                family = family,
-                sensorIdName = sensorIdName,
-                sampleTimeMs = sampleTimeMs,
-                lastReferenceBgMgdlTimes10 = lastReferenceBgMgdlTimes10,
-                lastReferenceBgGlucoseId = lastReferenceBgGlucoseId,
-                rawMgdl = linear.rawMgdl,
-            )?.let { mapped ->
-                if (isNativeResultUsable(mapped)) return mapped
-                Log.w(
-                    TAG,
-                    "official latest algorithm returned invalid result: id=${mapped.glucoseId} " +
-                            "mmol=${mapped.mmol} mgdl=${mapped.mgdl} trend=${mapped.trend} " +
-                            "err=${mapped.errorCode}; trying history/fallback"
-                )
-            }
-            tryOfficialHistory(
-                record = record,
-                calibration = calibration,
-                family = family,
-                sensorIdName = sensorIdName,
-                sampleTimeMs = sampleTimeMs,
-                lastReferenceBgMgdlTimes10 = lastReferenceBgMgdlTimes10,
-                lastReferenceBgGlucoseId = lastReferenceBgGlucoseId,
-                window = contiguousHistory,
-                sensorStartTimeMs = sensorStartTimeMs,
-                rawMgdl = linear.rawMgdl,
-            )?.let { mapped ->
-                if (isNativeResultUsable(mapped)) return mapped
-                Log.w(
-                    TAG,
-                    "official history algorithm returned invalid result: id=${mapped.glucoseId} " +
-                            "mmol=${mapped.mmol} mgdl=${mapped.mgdl} trend=${mapped.trend} " +
-                            "err=${mapped.errorCode}; using fallback"
-                )
-            }
-            tryLegacyNative(
-                record = record,
-                calibration = calibration,
-                family = family,
-                sensorIdName = sensorIdName,
-                sampleTimeMs = sampleTimeMs,
-                lastReferenceBgMgdlTimes10 = lastReferenceBgMgdlTimes10,
-                lastReferenceBgGlucoseId = lastReferenceBgGlucoseId,
-                window = contiguousHistory,
-                sensorStartTimeMs = sensorStartTimeMs,
-                rawMgdl = linear.rawMgdl,
-            )?.let { mapped ->
-                if (isNativeResultUsable(mapped)) return mapped
-                val msg = "legacy native algorithm returned invalid result: id=${mapped.glucoseId} " +
-                        "mmol=${mapped.mmol} mgdl=${mapped.mgdl} trend=${mapped.trend} " +
-                        "err=${mapped.errorCode}; using linear fallback"
-                if (mapped.glucoseId >= LEGACY_WARMUP_RECORDS) {
-                    Log.w(TAG, msg)
+        if (family.family == AnytimeConstants.Family.CT2) {
+            return computeCt14(record, sampleTimeMs, sensorStartTimeMs)
+        }
+        if (family.family == AnytimeConstants.Family.CT4) {
+            return computeModel(record, k, persistentSensorId, linear.rawMgdl)
+        }
+        // No vendor `libalgorithm-jni.so` path: CT2 (empirical), CT4 (MK4) and CT5
+        // (transmitter-computed + learned scale) are pure Kotlin, and CT3 runs the
+        // pure-Kotlin port below. The vendor blob is never consulted for glucose.
+        // CT3 has no reference model of its own: the pure-Kotlin native port is the
+        // only calibrated path, and LINEAR the last resort. MODEL (MK4) is CT4-only,
+        // so it is never used for CT3.
+        if (isCt3Family(family)) {
+            if (calibration != null && advanceModelFallback) {
+                runCatching {
+                    return computeCt3NativePort(
+                        record = record,
+                        calibration = calibration,
+                        persistentSensorId = persistentSensorId,
+                        lastReferenceBgMgdlTimes10 = lastReferenceBgMgdlTimes10,
+                        lastReferenceBgGlucoseId = lastReferenceBgGlucoseId,
+                        rawMgdl = linear.rawMgdl,
+                    )
+                }.onFailure { t ->
+                    if (logNativeFallbackWarnings) {
+                        Log.w(TAG, "CT3 native port failed: ${t.message}; using linear fallback")
+                    }
                 }
             }
-
-        } else if (isNativeAvailable && qr != null && !nativeSkippedNoFactoryLogged) {
-            nativeSkippedNoFactoryLogged = true
-            Log.w(
-                TAG,
-                "native algorithm skipped: no factory/manual calibration " +
-                        "(format=${qr.format} K=$k R=$r); using linear fallback"
-            )
+            return linear
+        }
+        if (advanceModelFallback && k > 0f) {
+            return computeModel(record, k, persistentSensorId, linear.rawMgdl)
         }
         return linear
     }
 
-    private fun tryOfficialLatest(
+    /**
+     * Reference App MK4 chain (see docs/MK4_FINAL_SUMMARY.md), stateful per
+     * [persistentSensorId]. Only call with ascending [AnytimeRawRecord.glucoseId]
+     * per sensor — see `advanceModelFallback` on [compute].
+     */
+    private fun computeModel(
         record: AnytimeRawRecord,
-        calibration: AnytimeQrCalibration,
-        family: AnytimeConstants.FamilyEntry,
-        sensorIdName: String,
-        sampleTimeMs: Long,
-        lastReferenceBgMgdlTimes10: Int,
-        lastReferenceBgGlucoseId: Int,
+        k0: Float,
+        persistentSensorId: String,
         rawMgdl: Float,
-    ): Result? {
-        if (officialLatestMissing) return null
-        return runCatching {
-            val latest = LatestData().apply {
-                setGlucoseId(record.glucoseId)
-                setIw(record.iwNa)
-                setIb(record.ibNa)
-                setT(record.temperatureC)
-                setK0(calibration.k)
-                setR(calibration.r)
-                setTimeMillis(sampleTimeMs)
-                setSensorInfo(calibration.rawQr)
-                setTransmitterName(sensorIdName, calibration.voltageFlag)
-                setAlgorithm(nativeAlgorithm(family, calibration.voltageFlag))
-                if (shouldAttachReferenceBg(record.glucoseId, lastReferenceBgGlucoseId, lastReferenceBgMgdlTimes10)) {
-                    setNewBgToGlucoseId(lastReferenceBgGlucoseId)
-                    setNewBgValue(lastReferenceBgMgdlTimes10 / 10)
-                }
-            }
-            val out: CurrentGlucose? = AlgorithmTools.getInstance().algorithmLatestGlucose(latest)
-            out?.let { mapCurrentNative(record, it, rawMgdl) }
-        }.getOrElse { t ->
-            if (t is UnsatisfiedLinkError) {
-                officialLatestMissing = true
-                Log.d(TAG, "official latest algorithm unavailable: ${t.message}")
-            } else {
-                Log.w(TAG, "official latest algorithm failed: ${t.message}")
-            }
-            null
-        }
-    }
-
-    private fun tryOfficialHistory(
-        record: AnytimeRawRecord,
-        calibration: AnytimeQrCalibration,
-        family: AnytimeConstants.FamilyEntry,
-        sensorIdName: String,
-        sampleTimeMs: Long,
-        lastReferenceBgMgdlTimes10: Int,
-        lastReferenceBgGlucoseId: Int,
-        window: List<AnytimeRawRecord>,
-        sensorStartTimeMs: Long,
-        rawMgdl: Float,
-        algorithmGlucoseId: Int = record.glucoseId,
-    ): Result? {
-        if (officialHistoryMissing) return null
-        if (window.size < 2) return null
-        return runCatching {
-            val eventIds: IntArray
-            val bgValues: IntArray
-            if (shouldAttachReferenceBg(record.glucoseId, lastReferenceBgGlucoseId, lastReferenceBgMgdlTimes10)) {
-                eventIds = intArrayOf(lastReferenceBgGlucoseId)
-                bgValues = intArrayOf(lastReferenceBgMgdlTimes10 / 10)
-            } else {
-                eventIds = IntArray(0)
-                bgValues = IntArray(0)
-            }
-            val history = HistoryData().apply {
-                setGlucoseId(algorithmGlucoseId)
-                setIws(window.map { it.iwNa }.toFloatArray())
-                setIbs(window.map { it.ibNa }.toFloatArray())
-                setTs(window.map { it.temperatureC }.toFloatArray())
-                setNewBgToGlucoseIds(eventIds)
-                setNewBgValues(bgValues)
-                setStartTimeMillis(sensorStartTimeMs.takeIf { it > 0L } ?: sampleTimeMs)
-                setK0(calibration.k)
-                setR(calibration.r)
-                setSensorInfo(calibration.rawQr)
-                setTransmitterName(sensorIdName, calibration.voltageFlag)
-                setAlgorithm(nativeAlgorithm(family, calibration.voltageFlag))
-            }
-            val out: CurrentGlucose? = AlgorithmTools.getInstance().algorithmGlucose(history)
-            out?.let { mapCurrentNative(record, it, rawMgdl) }
-        }.getOrElse { t ->
-            if (t is UnsatisfiedLinkError) {
-                officialHistoryMissing = true
-                Log.d(TAG, "official history algorithm unavailable: ${t.message}")
-            } else {
-                Log.w(TAG, "official history algorithm failed: ${t.message}")
-            }
-            null
-        }
-    }
-
-    private fun tryLegacyNative(
-        record: AnytimeRawRecord,
-        calibration: AnytimeQrCalibration,
-        family: AnytimeConstants.FamilyEntry,
-        sensorIdName: String,
-        sampleTimeMs: Long,
-        lastReferenceBgMgdlTimes10: Int,
-        lastReferenceBgGlucoseId: Int,
-        window: List<AnytimeRawRecord>,
-        sensorStartTimeMs: Long,
-        rawMgdl: Float,
-        algorithmGlucoseId: Int = record.glucoseId,
-    ): Result? {
-        if (legacyAlgorithmMissing) return null
-        if (window.isEmpty()) return null
-        return runCatching {
-            val eventIds: IntArray?
-            val bgValues: IntArray?
-            if (shouldAttachReferenceBg(record.glucoseId, lastReferenceBgGlucoseId, lastReferenceBgMgdlTimes10)) {
-                eventIds = intArrayOf(lastReferenceBgGlucoseId)
-                bgValues = intArrayOf(lastReferenceBgMgdlTimes10 / 10)
-            } else {
-                eventIds = null
-                bgValues = null
-            }
-            val input = DataInput(
-                glucoseId = algorithmGlucoseId,
-                Iws = window.map { it.iwNa }.toFloatArray(),
-                Ibs = window.map { it.ibNa }.toFloatArray(),
-                Ts = window.map { it.temperatureC }.toFloatArray(),
-                eventIds = eventIds,
-                BGMGs = bgValues,
-                K0 = calibration.k,
-                R = calibration.r,
-                startTimeMillis = sensorStartTimeMs.takeIf { it > 0L } ?: sampleTimeMs,
-                transmitterName = sensorIdName,
-            ).apply {
-                setAlgorithm(nativeAlgorithm(family, calibration.voltageFlag))
-                setWarmup_time(20)
-                setLife_time(family.endNumber)
-            }
-            val out: DataOutput? = AlgorithmTools.getInstance().algorithm(input)
-            out?.let { mapLegacyNative(record, it, rawMgdl) }
-        }.getOrElse { t ->
-            if (t is UnsatisfiedLinkError) {
-                legacyAlgorithmMissing = true
-                Log.d(TAG, "legacy native algorithm unavailable: ${t.message}")
-            } else {
-                Log.w(TAG, "legacy native algorithm failed: ${t.message}")
-            }
-            null
-        }
-    }
-
-    private fun contiguousHistoryThrough(
-        record: AnytimeRawRecord,
-        sortedRecords: List<AnytimeRawRecord>,
-    ): List<AnytimeRawRecord> {
-        if (record.glucoseId < 0) return emptyList()
-        val byId = sortedRecords.associateBy { it.glucoseId }
-        val out = ArrayList<AnytimeRawRecord>(record.glucoseId + 1)
-        for (id in 0..record.glucoseId) {
-            val rec = byId[id] ?: return emptyList()
-            out.add(rec)
-        }
-        return out
+    ): Result {
+        // CT4 has no factory QR, so k0 is usually 0. Fall back to the MK4
+        // reference K0 (1.13); 0 would divide by zero in AnytimeCalibrator.
+        val effectiveK0 = if (k0 > 0f) k0 else AnytimeConstants.CT4_DEFAULT_K0
+        val calibrator = calibratorFor(persistentSensorId, effectiveK0)
+        val filteredMmol = calibrator.computeNext(record)
+        val mmol = filteredMmol.coerceAtLeast(AnytimeConstants.ALGO_MMOL_FLOOR.toFloat())
+        val mgdlTimes10 = (mmol * 18.0f * 10f + 0.5f).toInt()
+            .coerceIn(AnytimeConstants.ALGO_MGDL_MIN_TIMES10, AnytimeConstants.ALGO_MGDL_MAX_TIMES10)
+        return Result(
+            glucoseId = record.glucoseId,
+            mmol = mmol,
+            mgdlTimes10 = mgdlTimes10,
+            ibNa = record.ibNa,
+            iwNa = record.iwNa,
+            temperatureC = record.temperatureC,
+            trend = 6, // TREND_NONE — model path doesn't compute trend, same as linear
+            errorCode = 0,
+            warnCode = 0,
+            source = Source.MODEL,
+            rawMgdl = rawMgdl,
+        )
     }
 
     /** Linear K/R fallback. */
@@ -387,6 +333,52 @@ object AnytimeAlgorithm {
             warnCode = 0,
             source = Source.LINEAR,
             rawMgdl = rawMmol * 18.0f,
+        )
+    }
+
+    /** CT2 aging-compensated raw current, nA. Split out so the term is unit-testable. */
+    @JvmStatic
+    fun ct14RawNa(iwNa: Float, sampleTimeMs: Long, sensorStartTimeMs: Long): Float {
+        val elapsedDays = if (sensorStartTimeMs > 0L && sampleTimeMs > sensorStartTimeMs) {
+            (sampleTimeMs - sensorStartTimeMs).toFloat() / 86_400_000f
+        } else {
+            0f
+        }
+        return iwNa + AnytimeConstants.CT14_AGING_NA_PER_DAY * elapsedDays
+    }
+
+    /**
+     * CT2/CT-14 empirical model (see [AnytimeConstants.CT14_AGING_NA_PER_DAY]):
+     *
+     *   raw        = Iw + 0.4 · elapsedDays      (aging drift of the sensor)
+     *   stock_mmol = (raw − intercept) / slope   (default CT2 calibration)
+     *
+     * The user's fingerstick calibration is applied later by the caller
+     * (`AnytimeBleManager.applyUserCalibration`), on top of this stock value.
+     */
+    @JvmStatic
+    fun computeCt14(
+        record: AnytimeRawRecord,
+        sampleTimeMs: Long,
+        sensorStartTimeMs: Long,
+    ): Result {
+        val rawNa = ct14RawNa(record.iwNa, sampleTimeMs, sensorStartTimeMs)
+        val stockMmol = (rawNa - AnytimeConstants.CT14_DEFAULT_INTERCEPT) / AnytimeConstants.CT14_DEFAULT_SLOPE
+        val mmol = stockMmol.coerceAtLeast(AnytimeConstants.ALGO_MMOL_FLOOR.toFloat())
+        val mgdlTimes10 = (mmol * 18.0f * 10f + 0.5f).toInt()
+            .coerceIn(AnytimeConstants.ALGO_MGDL_MIN_TIMES10, AnytimeConstants.ALGO_MGDL_MAX_TIMES10)
+        return Result(
+            glucoseId = record.glucoseId,
+            mmol = mmol,
+            mgdlTimes10 = mgdlTimes10,
+            ibNa = record.ibNa,
+            iwNa = record.iwNa,
+            temperatureC = record.temperatureC,
+            trend = 6, // TREND_NONE — this path does not compute a trend
+            errorCode = 0,
+            warnCode = 0,
+            source = Source.LINEAR,
+            rawMgdl = stockMmol * 18.0f,
         )
     }
 
@@ -427,102 +419,22 @@ object AnytimeAlgorithm {
             warnCode = rec.warnCode,
             source = Source.NATIVE, // it's transmitter-native, even more authoritative
             rawMgdl = rawLinear.rawMgdl,
+            beVoltageMv = rec.beVoltageMv,
+            weVoltageMv = rec.weVoltageMv,
+            reVoltageMv = rec.reVoltageMv,
+            ceVoltageMv = rec.ceVoltageMv,
+            bVoltageMv = rec.batteryRaw,
         )
     }
 
-    /** Decode the QR string via the JNI when available; pure-Kotlin otherwise. */
+    /**
+     * Decode the QR string with the pure-Kotlin parser (see [AnytimeQr], which ports
+     * the vendor's own regex shapes). No JNI fallback: the vendor `decodeCT` is not
+     * packaged and, on real labels, mis-reads some codes (a 15-day CT4 sticker comes
+     * back with `lifeTime = 6`).
+     */
     @JvmStatic
-    fun decodeQr(qr: String): AnytimeQrCalibration? {
-        if (isNativeAvailable) {
-            runCatching {
-                val data: KRDecodeData? = AlgorithmTools.getInstance().decodeCT(qr.toCharArray())
-                if (data != null && data.k > 0f && data.r > 0f) {
-                    return AnytimeQrCalibration(
-                        rawQr = qr,
-                        format = AnytimeQrCalibration.Format.B,
-                        k = data.k,
-                        r = data.r,
-                        lifeTime = data.lifeTime.takeIf { it > 0 } ?: AnytimeConstants.DEFAULT_RATED_LIFETIME_DAYS,
-                        productMonth = data.productMonth,
-                        productYear = 2000 + data.year,
-                        electrodeType = data.electrodeType.orEmpty(),
-                        electrodeTecNo = data.electrodeTecNo.orEmpty(),
-                        enzymeTecNo = data.enzymeTecNo.orEmpty(),
-                        membraneTecNo = data.membraneTecNo.orEmpty(),
-                        marketNo = data.marketNo.orEmpty(),
-                        serialNo = data.serialNo.orEmpty(),
-                        sensorNo = data.sensorNo.orEmpty(),
-                        unitOrder = data.unitOrder,
-                        voltageFlag = AnytimeQr.inferVoltageFlag(qr),
-                        calibrationCount = data.calibration,
-                    )
-                } else if (data != null) {
-                    Log.w(TAG, "native decodeCT returned invalid K/R: K=${data.k} R=${data.r}")
-                }
-            }.onFailure { t ->
-                Log.w(TAG, "native decodeCT failed: ${t.message}")
-            }
-        }
-        return AnytimeQr.parse(qr)
-    }
-
-    private fun mapCurrentNative(record: AnytimeRawRecord, native: CurrentGlucose, rawMgdl: Float): Result {
-        val preferredMgdl = when {
-            native.gluMG_AI > 0 -> native.gluMG_AI
-            native.gluMG > 0 -> native.gluMG
-            native.glu_AI > 0f -> (native.glu_AI * 18f + 0.5f).toInt()
-            native.glu > 0f -> (native.glu * 18f + 0.5f).toInt()
-            else -> 0
-        }
-        val preferredMmol = when {
-            native.glu_AI > 0f -> native.glu_AI
-            native.glu > 0f -> native.glu
-            preferredMgdl > 0 -> preferredMgdl / 18f
-            else -> 0f
-        }
-        return Result(
-            glucoseId = record.glucoseId,
-            mmol = preferredMmol,
-            mgdlTimes10 = preferredMgdl * 10,
-            ibNa = record.ibNa,
-            iwNa = record.iwNa,
-            temperatureC = record.temperatureC,
-            trend = native.trend,
-            errorCode = native.errorCode,
-            warnCode = native.warnCode,
-            source = Source.NATIVE,
-            rawMgdl = rawMgdl,
-            sensitivityCoefficient = native.sensitivityCoefficient,
-            kBase = native.k_BASE,
-            kAuto = native.k_AUTO,
-            iw30Iir = native.iw30IIR,
-            iw48Iir = native.iw48IIR,
-            beVoltageMv = native.beVoltage,
-            weVoltageMv = native.weVoltage,
-            reVoltageMv = native.reVoltage,
-            ceVoltageMv = native.ceVoltage,
-            bVoltageMv = native.bVoltage,
-            calibrationStatus = native.calibrationStatus,
-        )
-    }
-
-    private fun mapLegacyNative(record: AnytimeRawRecord, native: DataOutput, rawMgdl: Float): Result {
-        val mgdl = native.GLU_MG
-        return Result(
-            glucoseId = record.glucoseId,
-            mmol = mgdl / 18f,
-            mgdlTimes10 = mgdl * 10,
-            ibNa = record.ibNa,
-            iwNa = record.iwNa,
-            temperatureC = record.temperatureC,
-            trend = native.trend,
-            errorCode = native.errorCode,
-            warnCode = native.warnCode,
-            source = Source.NATIVE,
-            rawMgdl = rawMgdl,
-            calibrationStatus = native.calibrationStatus,
-        )
-    }
+    fun decodeQr(qr: String): AnytimeQrCalibration? = AnytimeQr.parse(qr)
 
     private fun normalizedRawIw(
         iwNa: Float,
@@ -537,32 +449,4 @@ object AnytimeAlgorithm {
         }
     }
 
-    private fun nativeAlgorithm(family: AnytimeConstants.FamilyEntry, voltageFlag: Int): Int {
-        return when (family.family) {
-            AnytimeConstants.Family.CT3,
-            AnytimeConstants.Family.CT3_PLUS,
-            AnytimeConstants.Family.CT3_YUWELL,
-            AnytimeConstants.Family.CT3_ULTRASONIC -> when {
-                (family.algorithm == 12 || family.algorithm == 9) && voltageFlag == 0 -> 3
-                family.algorithm == 3 && voltageFlag == 1 -> 9
-                else -> family.algorithm
-            }
-            AnytimeConstants.Family.CT4 -> when {
-                family.algorithm == 10 && voltageFlag == 0 -> 3
-                family.algorithm == 3 && voltageFlag == 1 -> 10
-                else -> family.algorithm
-            }
-            else -> family.algorithm
-        }
-    }
-
-    private fun isNativeResultUsable(result: Result): Boolean {
-        if (result.errorCode != 0) return false
-        if (result.mgdlTimes10 !in AnytimeConstants.ALGO_MGDL_MIN_TIMES10..AnytimeConstants.ALGO_MGDL_MAX_TIMES10) return false
-        if (result.mmol <= 0f || result.mmol.isNaN()) return false
-        val mgdl = result.mgdl
-        val fromMmol = result.mmol * 18f
-        val tolerance = maxOf(20f, mgdl * 0.35f)
-        return kotlin.math.abs(fromMmol - mgdl) <= tolerance
-    }
 }

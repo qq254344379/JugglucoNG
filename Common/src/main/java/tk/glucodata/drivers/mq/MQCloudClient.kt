@@ -26,6 +26,7 @@ data class MQCloudActionResult(
     val success: Boolean = false,
     val failure: MQBootstrapFailure = MQBootstrapFailure.NONE,
     val message: String? = null,
+    val alreadyMonitoring: Boolean = false,
 )
 
 data class MQCloudAuthResult(
@@ -486,18 +487,7 @@ object MQCloudClient {
             },
             authToken = authToken,
         )
-        val array = root.root?.optJSONArray("result")
-            ?: return MQCloudHistoryResult(failure = root.failure, message = root.message)
-        val history = ArrayList<MQBootstrapHistoryPoint>(array.length())
-        for (index in 0 until array.length()) {
-            val item = array.optJSONObject(index) ?: continue
-            parseSnapshotHistoryPoint(item)?.let(history::add)
-        }
-        return MQCloudHistoryResult(
-            history = history.sortedWith(compareBy<MQBootstrapHistoryPoint> { it.timestampMs }.thenBy { it.packetIndex }),
-            failure = if (history.isNotEmpty()) MQBootstrapFailure.NONE else root.failure,
-            message = root.message,
-        )
+        return decodeHistory(root, "snapshot detail", alignToLocalClock = false)
     }
 
     fun fetchSnapshotTimeBucketHistory(
@@ -571,8 +561,21 @@ object MQCloudClient {
             },
             authToken = authToken,
         )
-        val array = root.root?.optJSONArray("result")
-            ?: return MQCloudHistoryResult(failure = root.failure, message = root.message)
+        return decodeHistory(root, "timeBucket", alignToLocalClock = true)
+    }
+
+    internal fun decodeHistory(
+        root: MQCloudPostResult,
+        source: String,
+        alignToLocalClock: Boolean = false,
+    ): MQCloudHistoryResult {
+        if (root.failure == MQBootstrapFailure.AUTH_EXPIRED) {
+            return MQCloudHistoryResult(failure = root.failure, message = root.message)
+        }
+        val array = root.root?.optJSONArray("result") ?: return MQCloudHistoryResult(
+            failure = root.failure.takeUnless { it == MQBootstrapFailure.NONE } ?: MQBootstrapFailure.SERVER,
+            message = root.message ?: "MQ $source response has no history array",
+        )
         val responseServerTimeMs = parseServerTimeMs(root.root.opt("timestamp"))
         val history = ArrayList<MQBootstrapHistoryPoint>(array.length())
         for (index in 0 until array.length()) {
@@ -580,17 +583,19 @@ object MQCloudClient {
             parseSnapshotHistoryPoint(
                 item = item,
                 responseServerTimeMs = responseServerTimeMs,
-                alignToLocalClock = true,
+                alignToLocalClock = alignToLocalClock,
             )?.let(history::add)
         }
+        val rejected = array.length() - history.size
+        Log.i(TAG, "MQ $source history response: records=${array.length()} parsed=${history.size} rejected=$rejected firstMs=${history.minOfOrNull { it.timestampMs }} lastMs=${history.maxOfOrNull { it.timestampMs }}")
         return MQCloudHistoryResult(
             history = history.sortedWith(compareBy<MQBootstrapHistoryPoint> { it.timestampMs }.thenBy { it.packetIndex }),
-            failure = if (history.isNotEmpty() || root.failure == MQBootstrapFailure.NONE) {
-                MQBootstrapFailure.NONE
-            } else {
-                root.failure
+            failure = when {
+                history.isNotEmpty() -> MQBootstrapFailure.NONE
+                rejected > 0 -> MQBootstrapFailure.SERVER
+                else -> root.failure
             },
-            message = root.message,
+            message = if (rejected > 0 && history.isEmpty()) "MQ $source rejected all $rejected history records" else root.message,
         )
     }
 
@@ -605,12 +610,7 @@ object MQCloudClient {
     ): MQCloudSessionResult {
         val root = postForm(
             url = endpoints.dataRecordStartUrl,
-            form = buildString {
-                append("bleId=").append(bleId.urlEncode())
-                append("&mac=").append(mac.urlEncode())
-                append("&account=").append(account.urlEncode())
-                append("&qrCode=").append(qrCode.urlEncode())
-            },
+            form = MQVendorIdentity.startForm(bleId, mac, account, qrCode),
             authToken = authToken,
         )
         val snapshotId = root.root?.optJSONObject("result")?.optStringOrNull("snapshotId")
@@ -629,8 +629,8 @@ object MQCloudClient {
         bleId: String,
         qrCode: String,
         endpoints: MQVendorEndpoints = MQConstants.vendorEndpoints(MQRegistry.loadApiBaseUrl(context)),
-    ): MQCloudActionResult =
-        postAction(
+    ): MQCloudActionResult {
+        val root = postForm(
             url = endpoints.dataRecordGoOnUrl,
             form = buildString {
                 append("snapshotId=").append(snapshotId.urlEncode())
@@ -638,8 +638,16 @@ object MQCloudClient {
                 append("&qrCode=").append(qrCode.urlEncode())
             },
             authToken = authToken,
-            successMessage = "MQ continue-wear session submitted",
         )
+        return MQCloudActionResult(
+            success = root.failure == MQBootstrapFailure.NONE,
+            failure = root.failure,
+            message = root.message,
+            alreadyMonitoring = MQCloudRecovery.isAlreadyMonitoring(
+                root.root?.optInt("code"), root.root?.optBoolean("success") == true, root.message,
+            ),
+        )
+    }
 
     fun endWearSession(
         context: Context,
@@ -904,9 +912,9 @@ object MQCloudClient {
     ): MQBootstrapHistoryPoint? {
         val hex = item.optStringOrNull("cd")
             ?.uppercase(Locale.US)
-            ?.filter { it in '0'..'9' || it in 'A'..'F' }
+            ?.takeIf { value -> value.all { it in '0'..'9' || it in 'A'..'F' } }
             ?: return null
-        if (hex.length < 20) return null
+        if (hex.length < 20 || !hex.startsWith("40")) return null
         val packetIndex = parseLeU16(hex, 1)
         val glucoseTimes10Mmol = parseLeU16(hex, 8)
         val rawTimestampMs = parseServerTimeMs(item.opt("rd")) ?: return null

@@ -3,14 +3,18 @@ package tk.glucodata.ui.overlay
 import android.view.MotionEvent
 import android.content.Intent
 import android.graphics.Typeface // Added for Google Sans
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ripple
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -36,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import tk.glucodata.data.settings.FloatingSettingsRepository
 import tk.glucodata.ui.theme.MainFontFile
@@ -45,6 +50,7 @@ import tk.glucodata.logic.TrendEngine
 import tk.glucodata.data.calibration.CalibrationManager
 import tk.glucodata.ui.getDisplayValues
 import tk.glucodata.CurrentDisplaySource
+import tk.glucodata.DisplayDataState
 import tk.glucodata.Natives
 import tk.glucodata.Notify
 import tk.glucodata.SensorIdentity
@@ -90,6 +96,20 @@ fun FloatingGlucoseOverlay(
     val currentSnapshot = remember(refreshRevision, currentSensorId, glucosePoint?.timestamp, history.size) {
         CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout, currentSensorId)
     }
+
+    // The overlay only recomposes on new data, so once readings stop nothing would
+    // ever notice the last one aging out. Re-read the clock until it crosses the
+    // same timeout the widget and dashboard use, then show the no-data state.
+    val latestReadingMillis = maxOf(currentSnapshot?.timeMillis ?: 0L, glucosePoint?.timestamp ?: 0L)
+    val freshnessNow by produceState(System.currentTimeMillis(), latestReadingMillis) {
+        while (true) {
+            value = System.currentTimeMillis()
+            val wait = nextOverlayFreshnessCheckDelay(latestReadingMillis, value) ?: break
+            delay(wait)
+        }
+    }
+    // Every layout (pill, side and top island) reads value and arrow from this.
+    val displayPoint = overlayDisplayPoint(glucosePoint, currentSnapshot?.timeMillis ?: 0L, freshnessNow)
     
     // View Mode & Calibration
     val viewData = remember(currentSnapshot, glucosePoint, currentSensorId) {
@@ -107,9 +127,16 @@ fun FloatingGlucoseOverlay(
     val viewMode = viewData.first
     val unitInt = viewData.second
     
-    val trendResult = remember(history) {
+    // Same estimator, window and raw/smoothed choice as every other arrow; the
+    // overlay used to omit useRaw, so in raw view modes it regressed over the
+    // smoothed series and tilted differently from the hero it floats next to.
+    val trendResult = remember(history, viewMode, unitInt) {
         if (history.isNotEmpty()) {
-            TrendEngine.calculateTrend(history, isMmol = (unitInt == 1))
+            TrendEngine.calculateTrend(
+                history,
+                useRaw = (viewMode == 1 || viewMode == 3),
+                isMmol = (unitInt == 1)
+            )
         } else {
             TrendEngine.TrendResult(TrendEngine.TrendState.Unknown, 0f, 0f, 0f, 0f)
         }
@@ -126,14 +153,39 @@ fun FloatingGlucoseOverlay(
         70.dp
     }
     // Styles
+    val isDarkTheme = isSystemInDarkTheme()
     val finalBgColor = if (isTransparent) Color.Transparent else Color.Black.copy(alpha = opacity)
     val finalShape = RoundedCornerShape(cornerRadius.dp)
-    val finalTextColor = Color.White
-    val textOutlineColor = Color.Black.copy(alpha = if (isTransparent) 0.34f else 0.28f)
+    val finalTextColor = if (isTransparent && !isDarkTheme) {
+        // ui-guardrails: allow hex_color - drawn straight onto other apps, outside the app theme
+        Color(0xFF27231F)
+    } else {
+        Color.White
+    }
+    val textOutlineColor = when {
+        isTransparent && !isDarkTheme -> Color.White.copy(alpha = 0.88f)
+        isTransparent -> Color.Black.copy(alpha = 0.58f)
+        else -> Color.Black.copy(alpha = 0.28f)
+    }
     val textShadow = Shadow(
-        color = Color.Black.copy(alpha = if (isTransparent) 0.52f else 0.42f),
-        offset = Offset(0f, 1.5f),
-        blurRadius = 5f
+        color = when {
+            isTransparent && !isDarkTheme -> Color.White.copy(alpha = 1.0f)
+            isTransparent -> Color.Black.copy(alpha = 0.62f)
+            else -> Color.Black.copy(alpha = 0.42f)
+        },
+        offset = Offset(0f, if (isTransparent && !isDarkTheme) 0f else if (isTransparent) 1.2f else 1.5f),
+        blurRadius = if (isTransparent && !isDarkTheme) 7f else if (isTransparent) 4.5f else 5f
+    )
+    val arrowOutlineColor = if (isTransparent && useSubtleOutline) textOutlineColor else null
+    val arrowShadowColor = if (isTransparent && !useSubtleOutline) textShadow.color else null
+    val overlayInteractionSource = remember { MutableInteractionSource() }
+    val overlayIndication = ripple(
+        bounded = true,
+        color = if (isTransparent) {
+            Color.White.copy(alpha = 0.24f)
+        } else {
+            Color.White.copy(alpha = 0.16f)
+        }
     )
     var pendingDragX by remember { mutableFloatStateOf(0f) }
     var pendingDragY by remember { mutableFloatStateOf(0f) }
@@ -210,8 +262,8 @@ fun FloatingGlucoseOverlay(
     }
 
     val valueContent: @Composable () -> Unit = {
-        if (glucosePoint != null) {
-            val point = glucosePoint!!
+        if (displayPoint != null) {
+            val point = displayPoint
             val unit = if (unitInt == 1) "mmol/L" else "mg/dL"
             val dvs = currentSnapshot?.displayValues ?: run {
                 val isRawModeForCal = viewMode == 1 || viewMode == 3
@@ -299,11 +351,13 @@ fun FloatingGlucoseOverlay(
     }
 
     val arrowContent: @Composable () -> Unit = {
-        if (showArrow && glucosePoint != null) {
+        if (showArrow && displayPoint != null) {
             TrendIndicator(
                 trendResult = trendResult,
                 modifier = Modifier.size(if (isDynamicIsland && isVerticalIsland) sideIslandArrowSize else arrowSize),
-                color = finalTextColor
+                color = finalTextColor,
+                outlineColor = arrowOutlineColor,
+                shadowColor = arrowShadowColor
             )
         } else {
             Spacer(Modifier.size(1.dp))
@@ -315,16 +369,25 @@ fun FloatingGlucoseOverlay(
     
     // ROOT LAYOUT: Column for vertical offset spacer
     if (isDynamicIsland) {
+        // Clip and click the pill itself, not the offset wrapper: the wrapper is
+        // taller by the offset spacer, so its corner radius clamps differently
+        // from the pill's own Surface and its arc cut into the bottom corners.
+        val pillModifier = Modifier
+            .clip(finalShape)
+            .clickable(
+                interactionSource = overlayInteractionSource,
+                indication = overlayIndication
+            ) { launchIntent?.let { context.startActivity(it) } }
         CutoutOffsetLayout(
             edge = cutoutEdge,
             offset = verticalOffset.dp,
             modifier = Modifier
                 .wrapContentSize()
                 .then(dragModifier)
-                .clickable { launchIntent?.let { context.startActivity(it) } }
         ) {
             if (isVerticalIsland) {
                 AsymmetricCenteringColumn(
+                    modifier = pillModifier,
                     gap = finalGap,
                     horizontalAlignment = Alignment.CenterHorizontally,
                     backgroundContent = {
@@ -358,6 +421,7 @@ fun FloatingGlucoseOverlay(
                 }
             } else {
                 AsymmetricCenteringRow(
+                    modifier = pillModifier,
                     gap = finalGap,
                     verticalAlignment = Alignment.CenterVertically,
                     backgroundContent = {
@@ -397,7 +461,11 @@ fun FloatingGlucoseOverlay(
             modifier = Modifier
                 .wrapContentSize()
                 .then(dragModifier)
-                .clickable { launchIntent?.let { context.startActivity(it) } }
+                .clip(finalShape)
+                .clickable(
+                    interactionSource = overlayInteractionSource,
+                    indication = overlayIndication
+                ) { launchIntent?.let { context.startActivity(it) } }
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = pillHorizontalPadding, vertical = pillVerticalPadding),
@@ -405,8 +473,14 @@ fun FloatingGlucoseOverlay(
                 horizontalArrangement = Arrangement.spacedBy(inlineSpacing)
             ) {
                 valueContent()
-                if (showArrow && glucosePoint != null) {
-                    TrendIndicator(trendResult, Modifier.size(arrowSize), finalTextColor)
+                if (showArrow && displayPoint != null) {
+                    TrendIndicator(
+                        trendResult,
+                        Modifier.size(arrowSize),
+                        finalTextColor,
+                        outlineColor = arrowOutlineColor,
+                        shadowColor = arrowShadowColor
+                    )
                 }
             }
         }
@@ -625,4 +699,43 @@ private fun AsymmetricCenteringColumn(
             bottom?.place(x = getX(bottomW), y = maxSideHeight + gapPx)
         }
     }
+}
+
+private const val OVERLAY_FRESHNESS_POLL_MS = 15_000L
+
+/**
+ * How long to wait before re-checking whether the reading at [latestReadingMillis]
+ * has gone stale, or null once it has (or there is none) and nothing is left to
+ * watch. Capped at [OVERLAY_FRESHNESS_POLL_MS] because coroutine delays run on
+ * uptime, which stops during deep sleep: one long wait would wake far too late.
+ */
+internal fun nextOverlayFreshnessCheckDelay(
+    latestReadingMillis: Long,
+    nowMillis: Long,
+    freshnessWindowMillis: Long = Notify.glucosetimeout
+): Long? {
+    if (latestReadingMillis <= 0L) return null
+    val untilStale = latestReadingMillis + freshnessWindowMillis - nowMillis
+    if (untilStale < 0L) return null
+    return (untilStale + 1L).coerceAtMost(OVERLAY_FRESHNESS_POLL_MS)
+}
+
+/**
+ * The point the overlay may show at [nowMillis]: the latest one while it is within
+ * the widget/dashboard freshness window, null (the no-data state) once it is not.
+ */
+internal fun overlayDisplayPoint(
+    latestPoint: GlucosePoint?,
+    snapshotMillis: Long,
+    nowMillis: Long,
+    freshnessWindowMillis: Long = Notify.glucosetimeout
+): GlucosePoint? {
+    val isFresh = DisplayDataState.resolve(
+        sensorPresent = true,
+        currentTimestampMillis = snapshotMillis,
+        latestHistoryTimestampMillis = latestPoint?.timestamp ?: 0L,
+        freshnessWindowMillis = freshnessWindowMillis,
+        nowMillis = nowMillis
+    ).isFresh
+    return latestPoint?.takeIf { isFresh }
 }

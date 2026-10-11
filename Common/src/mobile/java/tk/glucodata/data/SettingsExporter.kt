@@ -11,6 +11,8 @@ import org.json.JSONObject
 import tk.glucodata.BuildConfig
 import tk.glucodata.Natives
 import tk.glucodata.data.journal.JournalEntryEntity
+import tk.glucodata.data.journal.CloneJournalTombstoneEntity
+import tk.glucodata.data.journal.CloneJournalIdentity
 import tk.glucodata.data.journal.JournalFoodEntity
 import tk.glucodata.data.journal.JournalInsulinPresetEntity
 import java.io.File
@@ -20,8 +22,8 @@ import java.util.Locale
 
 object SettingsExporter {
     private const val TAG = "SettingsExporter"
-    private const val SCHEMA = "tk.glucodata.settings-export"
-    private const val SCHEMA_VERSION = 3
+    internal const val SCHEMA = "tk.glucodata.settings-export"
+    private const val SCHEMA_VERSION = 4
 
     private val nativeSettingsFiles = listOf(
         "settings.dat",
@@ -36,6 +38,15 @@ object SettingsExporter {
         val journalEntries: Int = 0,
         val journalInsulinPresets: Int = 0,
         val journalFoods: Int = 0
+    )
+
+    internal data class ValidationSummary(
+        val sharedPreferenceFiles: Int,
+        val preferenceValues: Int,
+        val nativeFiles: Int,
+        val journalEntries: Int,
+        val journalInsulinPresets: Int,
+        val journalFoods: Int
     )
 
     private data class JournalImportSummary(
@@ -100,6 +111,72 @@ object SettingsExporter {
                 Log.e(TAG, "Settings import failed", it)
             }
         }
+    }
+
+    internal fun validatePayload(
+        payload: JSONObject,
+        requireJournalData: Boolean = true
+    ): ValidationSummary {
+        require(payload.optString("schema") == SCHEMA) { "Unsupported settings export" }
+        val schemaVersion = payload.optInt("schemaVersion", 0)
+        require(schemaVersion in 1..SCHEMA_VERSION) {
+            "Unsupported settings export version: $schemaVersion"
+        }
+
+        val exportedPreferences = payload.optJSONObject("sharedPreferences")
+            ?: error("Settings preferences are missing")
+        var preferenceValueCount = 0
+        exportedPreferences.keySet().forEach { name ->
+            val entry = exportedPreferences.optJSONObject(name)
+                ?: error("Invalid shared preferences file: $name")
+            val values = entry.optJSONObject("values")
+                ?: error("Preference values are missing: $name")
+            values.keySet().forEach { key ->
+                validatePreferenceEntry(key, values.optJSONObject(key))
+                preferenceValueCount++
+            }
+        }
+
+        var nativeFileCount = 0
+        val exportedFiles = payload.optJSONObject("nativeSettingsFiles")
+            ?: error("Native settings files are missing")
+        exportedFiles.keySet().forEach { name ->
+            require(name in nativeSettingsFiles) { "Unsupported native settings file: $name" }
+            val entry = exportedFiles.optJSONObject(name)
+                ?: error("Invalid native settings file: $name")
+            val encoded = entry.optString("base64").takeIf { it.isNotBlank() }
+                ?: error("Native settings data is missing: $name")
+            java.util.Base64.getMimeDecoder().decode(encoded)
+            nativeFileCount++
+        }
+
+        val journalData = payload.optJSONObject("journalData")
+        if (requireJournalData && schemaVersion >= 2) {
+            require(journalData != null) { "Settings journal data is missing" }
+        }
+        val journalEntries = journalData?.optJSONArray("entries")
+        val insulinPresets = journalData?.optJSONArray("insulinPresets")
+        val foods = journalData?.optJSONArray("foods")
+        if (journalData != null) {
+            require(journalEntries != null) { "Settings journal entries are missing" }
+            require(insulinPresets != null) { "Settings insulin presets are missing" }
+            if (schemaVersion >= 3) require(foods != null) { "Settings food presets are missing" }
+        }
+        val parsedEntries = journalEntries.toJournalEntries()
+        val parsedInsulins = insulinPresets.toInsulinPresets()
+        val parsedFoods = foods.toFoods()
+        requireFullyParsed("settings journal entries", journalEntries, parsedEntries.size)
+        requireFullyParsed("settings insulin presets", insulinPresets, parsedInsulins.size)
+        requireFullyParsed("settings food presets", foods, parsedFoods.size)
+
+        return ValidationSummary(
+            sharedPreferenceFiles = exportedPreferences.length(),
+            preferenceValues = preferenceValueCount,
+            nativeFiles = nativeFileCount,
+            journalEntries = parsedEntries.size,
+            journalInsulinPresets = parsedInsulins.size,
+            journalFoods = parsedFoods.size
+        )
     }
 
     private suspend fun importPayloadUnchecked(
@@ -256,6 +333,31 @@ object SettingsExporter {
         }
     }
 
+    private fun validatePreferenceEntry(key: String, entry: JSONObject?) {
+        require(entry != null) { "Invalid preference value: $key" }
+        when (entry.optString("type")) {
+            "boolean" -> entry.getBoolean("value")
+            "float" -> entry.getDouble("value")
+            "int" -> entry.getInt("value")
+            "long" -> entry.getLong("value")
+            "string" -> if (!entry.isNull("value")) entry.getString("value")
+            "string_set" -> {
+                val values = entry.getJSONArray("value")
+                for (index in 0 until values.length()) values.getString(index)
+            }
+            "null" -> Unit
+            else -> throw IllegalArgumentException("Unsupported preference type for $key")
+        }
+    }
+
+    private fun requireFullyParsed(label: String, source: JSONArray?, parsedCount: Int) {
+        if (source != null) {
+            require(parsedCount == source.length()) {
+                "$label contains ${source.length() - parsedCount} invalid record(s)"
+            }
+        }
+    }
+
     private fun preferenceEntry(value: Any?): JSONObject {
         return JSONObject()
             .put("type", preferenceType(value))
@@ -350,6 +452,19 @@ object SettingsExporter {
                     journalDao.getFoods().forEach { array.put(it.toJson()) }
                 }
             )
+            .put(
+                "cloneTombstones",
+                JSONArray().also { array ->
+                    journalDao.getCloneJournalTombstones().forEach { tombstone ->
+                        array.put(
+                            JSONObject()
+                                .put("entryId", tombstone.entryId)
+                                .putNullable("recoveryId", tombstone.recoveryId)
+                                .put("deletedAt", tombstone.deletedAt)
+                        )
+                    }
+                }
+            )
     }
 
     private suspend fun importJournalData(context: Context, journalData: JSONObject?): JournalImportSummary {
@@ -358,10 +473,12 @@ object SettingsExporter {
         val insulinPresets = journalData.optJSONArray("insulinPresets").toInsulinPresets()
         val hasFoods = journalData.has("foods")
         val foods = journalData.optJSONArray("foods").toFoods()
+        val cloneTombstones = journalData.optJSONArray("cloneTombstones").toCloneTombstones()
         val journalDao = HistoryDatabase.getInstance(context).journalDao()
 
         journalDao.deleteAllEntries()
         journalDao.deleteAllInsulinPresets()
+        journalDao.deleteAllCloneJournalTombstones()
         if (hasFoods) {
             journalDao.deleteAllFoods()
             if (foods.isNotEmpty()) {
@@ -373,6 +490,9 @@ object SettingsExporter {
         }
         if (entries.isNotEmpty()) {
             journalDao.upsertEntries(entries)
+        }
+        if (cloneTombstones.isNotEmpty()) {
+            journalDao.upsertCloneJournalTombstones(cloneTombstones)
         }
         return JournalImportSummary(
             entries = entries.size,
@@ -398,9 +518,17 @@ object SettingsExporter {
             .putNullable("proteinGrams", proteinGrams)
             .putNullable("fatGrams", fatGrams)
             .put("source", source)
+            .putNullable("originSource", originSource)
             .putNullable("sourceRecordId", sourceRecordId)
+            .putNullable("recoveryId", recoveryId)
             .put("createdAt", createdAt)
             .put("updatedAt", updatedAt)
+            .putNullable("insulinCurveJsonSnapshot", insulinCurveJsonSnapshot)
+            .putNullable("insulinCurveProfileId", insulinCurveProfileId)
+            .putNullable("insulinCurveModelVersion", insulinCurveModelVersion)
+            .putNullable("insulinCurveEvidence", insulinCurveEvidence)
+            .putNullable("insulinBodyWeightKg", insulinBodyWeightKg)
+            .put("insulinCurveWasApproximated", insulinCurveWasApproximated)
     }
 
     private fun JournalInsulinPresetEntity.toJson(): JSONObject {
@@ -414,7 +542,11 @@ object SettingsExporter {
             .put("isBuiltIn", isBuiltIn)
             .put("isArchived", isArchived)
             .put("countsTowardIob", countsTowardIob)
+            .put("useForCalculation", useForCalculation)
             .put("sortOrder", sortOrder)
+            .putNullable("curveProfileId", curveProfileId)
+            .put("curveModelVersion", curveModelVersion)
+            .put("curveEvidence", curveEvidence)
     }
 
     private fun JournalFoodEntity.toJson(): JSONObject {
@@ -455,11 +587,46 @@ object SettingsExporter {
                         proteinGrams = item.optNullableFloat("proteinGrams"),
                         fatGrams = item.optNullableFloat("fatGrams"),
                         source = item.optString("source", "import"),
+                        originSource = item.optNullableString("originSource"),
                         sourceRecordId = item.optNullableString("sourceRecordId"),
+                        recoveryId = CloneJournalIdentity.normalizeRecoveryId(
+                            item.optNullableString("recoveryId")
+                        ) ?: CloneJournalIdentity.newRecoveryId(),
                         createdAt = item.optLong("createdAt", item.getLong("timestamp")),
-                        updatedAt = item.optLong("updatedAt", item.getLong("timestamp"))
+                        updatedAt = item.optLong("updatedAt", item.getLong("timestamp")),
+                        insulinCurveJsonSnapshot = item.optNullableString("insulinCurveJsonSnapshot"),
+                        insulinCurveProfileId = item.optNullableString("insulinCurveProfileId"),
+                        insulinCurveModelVersion = item.optNullableInt("insulinCurveModelVersion"),
+                        insulinCurveEvidence = item.optNullableString("insulinCurveEvidence"),
+                        insulinBodyWeightKg = item.optNullableFloat("insulinBodyWeightKg"),
+                        insulinCurveWasApproximated = item.optBoolean(
+                            "insulinCurveWasApproximated",
+                            false
+                        )
                     )
                 )
+            }
+        }
+    }
+
+    private fun JSONArray?.toCloneTombstones(): List<CloneJournalTombstoneEntity> {
+        if (this == null) return emptyList()
+        return buildList {
+            for (index in 0 until length()) {
+                val item = optJSONObject(index) ?: continue
+                val entryId = item.optLong("entryId", 0L)
+                val deletedAt = item.optLong("deletedAt", 0L)
+                if (entryId > 0L && deletedAt > 0L) {
+                    add(
+                        CloneJournalTombstoneEntity(
+                            entryId = entryId,
+                            deletedAt = deletedAt,
+                            recoveryId = CloneJournalIdentity.normalizeRecoveryId(
+                                item.optNullableString("recoveryId")
+                            ),
+                        )
+                    )
+                }
             }
         }
     }
@@ -505,7 +672,15 @@ object SettingsExporter {
                         isBuiltIn = item.optBoolean("isBuiltIn", false),
                         isArchived = item.optBoolean("isArchived", false),
                         countsTowardIob = item.optBoolean("countsTowardIob", true),
-                        sortOrder = item.optInt("sortOrder", index)
+                        sortOrder = item.optInt("sortOrder", index),
+                        useForCalculation = item.optBoolean(
+                            "useForCalculation",
+                            !(item.optBoolean("isBuiltIn", false) &&
+                                item.optInt("sortOrder", index) in setOf(1, 10))
+                        ),
+                        curveProfileId = item.optNullableString("curveProfileId"),
+                        curveModelVersion = item.optInt("curveModelVersion", 0),
+                        curveEvidence = item.optString("curveEvidence", "unverified")
                     )
                 )
             }
@@ -539,7 +714,7 @@ object SettingsExporter {
     private fun readPayload(context: Context, uri: Uri): JSONObject {
         val inputStream = context.contentResolver.openInputStream(uri)
             ?: error("Could not open import source")
-        val text = inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+        val text = ExportPackageCodec.readUtf8(inputStream)
         return JSONObject(text)
     }
 

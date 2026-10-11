@@ -2,7 +2,11 @@
 
 package tk.glucodata.ui.stats
 
+import android.content.ClipData
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import androidx.compose.ui.graphics.toArgb
 import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -35,6 +39,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,20 +57,31 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Analytics
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DatePickerDialog
@@ -77,7 +93,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SelectableDates
 import androidx.compose.material3.Surface
@@ -85,7 +100,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDateRangePickerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -99,6 +116,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -112,7 +130,6 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -126,10 +143,15 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.withStyle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import tk.glucodata.ui.components.TabScreenDefaults
+import tk.glucodata.ui.components.TabScreenHeader
 import tk.glucodata.R
+import tk.glucodata.ui.components.CompactSheetDragHandle
+import tk.glucodata.ui.components.StableModalBottomSheet
 import tk.glucodata.ui.util.ConnectedButtonGroup
 import tk.glucodata.ui.util.GlucoseFormatter
 import java.text.SimpleDateFormat
@@ -144,16 +166,17 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import tk.glucodata.ui.theme.labelLargeExpressive
 
-private val TirVeryLowColor = Color(0xFFF0A24A)
-private val TirLowColor = Color(0xFFE7C85A)
-private val TirInRangeColor = Color(0xFF4E8A55)
-private val TirHighColor = Color(0xFFC56F33)
-private val TirVeryHighColor = Color(0xFFA44B2D)
+// Band colours live in StatsVisualizations.kt so every stats surface reads the same
+// palette from one place.
 private const val PrefKeyReportPdfStyle = "stats_report_pdf_style"
 
-private enum class TirBand {
+/** Below this a calendar grid is just a row of squares — the daily view already covers it. */
+private const val MIN_CALENDAR_DAYS = 3
+
+internal enum class TirBand {
     VERY_LOW,
     LOW,
     IN_RANGE,
@@ -169,21 +192,13 @@ private data class TirRowDescriptor(
     val color: Color
 )
 
-private data class ScoreTileSpec(
-    val title: String,
-    val value: String,
-    val status: String,
-    val meta: String,
-    val tone: Color,
-    val infoText: String? = null
-)
-
 @Composable
 fun StatsScreen(
     modifier: Modifier = Modifier,
-    viewModel: StatsViewModel = viewModel()
+    viewModel: StatsViewModel = rememberStatsViewModel()
 ) {
-    val uiState by viewModel.uiState.collectAsState()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val isSwitchingRange by viewModel.isSwitchingRange.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val reportPrefs = remember(context) {
@@ -219,8 +234,28 @@ fun StatsScreen(
     }
     var pendingReportStylePref by rememberSaveable { mutableStateOf(reportStylePref) }
     val selectedReportStyle = StatsReportExporter.PdfVisualStyle.fromPref(reportStylePref)
+    val view = LocalView.current
+    LaunchedEffect(context) { StatsLayoutStore.ensureLoaded(context) }
+    val layout by StatsLayoutStore.state.collectAsStateWithLifecycle()
+    val editingLayout by StatsArrangeMode.editing.collectAsStateWithLifecycle()
+    // Every ordinary way out of a mode, not just the button: system back, and simply
+    // leaving the screen.
+    BackHandler(enabled = editingLayout) { StatsArrangeMode.close() }
+    DisposableEffect(Unit) { onDispose { StatsArrangeMode.close() } }
+    val listState = rememberLazyListState()
+    val visibleCards = layout.visibleCards.filter { card -> cardHasContent(card, uiState) }
+    val cardDrag = rememberStatsCardDragState(
+        listState = listState,
+        order = layout.cardOrder,
+        onReordered = StatsLayoutStore::setCardOrder
+    )
     var selectedTirBand by remember(uiState.summary.tir) { mutableStateOf<TirBand?>(null) }
+    // Keyed on the window, not on the data: a new reading must not slam the day sheet shut.
+    var selectedDayDate by remember(uiState.activeRange) { mutableStateOf<java.time.LocalDate?>(null) }
+    val selectedDay = uiState.summary.days.firstOrNull { it.date == selectedDayDate }
     var pendingPatientInfo by remember { mutableStateOf<StatsReportExporter.PatientInfo?>(null) }
+    var exportedReportUri by remember { mutableStateOf<Uri?>(null) }
+
     var isPublishing by remember { mutableStateOf(false) }
     var showDateRangePicker by rememberSaveable { mutableStateOf(false) }
     val clearSelectionInteraction = remember { MutableInteractionSource() }
@@ -261,16 +296,25 @@ fun StatsScreen(
                 patientInfo = pendingPatientInfo,
                 reportStyle = StatsReportExporter.PdfVisualStyle.fromPref(pendingReportStylePref)
             )
-            Toast.makeText(
-                context,
-                if (result.isSuccess) context.getString(R.string.export_successful)
-                else context.getString(
-                    R.string.export_failed_with_error,
-                    result.exceptionOrNull()?.message ?: context.getString(R.string.unknown_error)
-                ),
-                Toast.LENGTH_LONG
-            ).show()
+            result.onSuccess {
+                exportedReportUri = uri
+            }.onFailure { throwable ->
+                Toast.makeText(
+                    context,
+                    context.getString(
+                        R.string.export_failed_with_error,
+                        throwable.message ?: context.getString(R.string.unknown_error)
+                    ),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
+    }
+
+    LaunchedEffect(exportedReportUri) {
+        val shownUri = exportedReportUri ?: return@LaunchedEffect
+        delay(12_000L)
+        if (exportedReportUri == shownUri) exportedReportUri = null
     }
 
     Box(
@@ -288,10 +332,11 @@ fun StatsScreen(
         val showLoadingPlaceholder = uiState.isLoading && uiState.summary.readingCount == 0
 
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 100.dp)
+            contentPadding = TabScreenDefaults.contentPadding()
         ) {
-            item {
+            item(key = "header") {
                 HeaderBlock(onShareClick = {
                     reportDaysInput = uiState.selectedRange?.days
                         ?.takeIf { it > 0 }
@@ -304,14 +349,16 @@ fun StatsScreen(
                 })
             }
 
-            item {
+            item(key = "range") {
                 Spacer(modifier = Modifier.height(4.dp))
                 StatsRangeSelectorControl(
                     selectedRange = uiState.selectedRange,
                     activeRange = uiState.activeRange,
-                    isLoading = uiState.isLoading,
+                    isLoading = uiState.isLoading || isSwitchingRange,
                     hasData = uiState.summary.readingCount > 0,
                     readingCount = uiState.summary.readingCount,
+                    coveragePercent = uiState.summary.coverage.percent
+                        .takeIf { uiState.summary.readingCount > 0 },
                     onRangeSelected = viewModel::setTimeRange,
                     onCustomRangeClick = { showDateRangePicker = true }
                 )
@@ -352,64 +399,84 @@ fun StatsScreen(
                     }
                 }
 
-                // TIR overview
-                item {
-                    Spacer(modifier = Modifier.height(16.dp))
-                    GlycemicOverviewCard(
-                        summary = uiState.summary,
-                        targets = uiState.targets,
-                        unit = uiState.unit,
-                        selectedBand = selectedTirBand,
-                        onBandSelected = { selectedTirBand = it }
+                // Sections render in the user's own order. Long press lifts a card and
+                // drags it inline; the Arrange button opens the list editor instead.
+                itemsIndexed(
+                    items = visibleCards,
+                    key = { _, card -> card.name }
+                ) { index, card ->
+                    val isDragging = cardDrag.dragging == card
+                    val lift by animateFloatAsState(
+                        targetValue = if (isDragging) 1f else 0f,
+                        label = "cardLift"
                     )
-                }
-
-                // Unified metric hierarchy (Avg/Median/A1C/CV/Std Dev/GVI/PSG)
-                item {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    MetricsScoreSection(
-                        summary = uiState.summary,
-                        targets = uiState.targets,
-                        unit = uiState.unit
-                    )
-                }
-
-                // Patterns (AGP / Daily Trend) — new major section
-                item {
-                    Spacer(modifier = Modifier.height(24.dp))
-                    PatternsCard(
-                        agpByHour = uiState.summary.agpByHour,
-                        dailyStats = uiState.summary.dailyStats,
-                        targets = uiState.targets,
-                        unit = uiState.unit,
-                        activeRange = uiState.activeRange
-                    )
-                }
-
-                // Temperature — separate section
-                if (uiState.temperaturePoints.isNotEmpty()) {
-                    item {
-                        Spacer(modifier = Modifier.height(20.dp))
-                        TemperatureOverviewCard(
-                            temperaturePoints = uiState.temperaturePoints
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (isDragging) Modifier else Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null))
+                            .zIndex(if (isDragging) 1f else 0f)
+                            .graphicsLayer {
+                                translationY = if (isDragging) cardDrag.offset else 0f
+                                scaleX = 1f + 0.02f * lift
+                                scaleY = 1f + 0.02f * lift
+                                shadowElevation = 12.dp.toPx() * lift
+                                alpha = 1f - 0.06f * lift
+                            }
+                            .draggableStatsCard(
+                                card = card,
+                                state = cardDrag,
+                                onLift = { view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) },
+                                onTick = { view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK) }
+                            )
+                    ) {
+                        Spacer(
+                            modifier = Modifier.height(if (index == 0) 16.dp else 20.dp)
+                        )
+                        StatsCardContent(
+                            card = card,
+                            uiState = uiState,
+                            layout = layout,
+                            selectedTirBand = selectedTirBand,
+                            onBandSelected = { selectedTirBand = it },
+                            selectedDayDate = selectedDayDate,
+                            onDaySelected = { selectedDayDate = it.date }
                         )
                     }
                 }
 
-                // Insights — separate section
                 item {
                     Spacer(modifier = Modifier.height(20.dp))
-                    InsightsCard(
-                        insights = uiState.summary.insights
-                    )
+                    StatsEditLayoutButton(onClick = { StatsArrangeMode.open() })
                 }
             }
         }
 
+        if (editingLayout) {
+            ArrangeSheet(
+                layout = layout,
+                summary = uiState.summary,
+                targets = uiState.targets,
+                unit = uiState.unit,
+                onDismiss = { StatsArrangeMode.close() }
+            )
+        }
+
+        selectedDay?.let { day ->
+            DayDetailSheet(
+                day = day,
+                readings = uiState.readings,
+                episodes = uiState.summary.episodes,
+                targets = uiState.targets,
+                unit = uiState.unit,
+                onDismiss = { selectedDayDate = null }
+            )
+        }
+
         if (showShareSheet) {
             val parsedReportDays = reportDaysInput.toIntOrNull()?.coerceIn(1, 365)
-            ModalBottomSheet(
-                onDismissRequest = { showShareSheet = false }
+            StableModalBottomSheet(
+                onDismissRequest = { showShareSheet = false },
+                dragHandle = { CompactSheetDragHandle() }
             ) {
                 Column(
                     modifier = Modifier
@@ -599,65 +666,413 @@ fun StatsScreen(
         }
 
         if (showDateRangePicker) {
-            val availableRange = uiState.availableRange
-            val initialRange = clampStatsDateRangeToAvailable(uiState.activeRange, availableRange) ?: availableRange
-            val availableStartDateMillis = availableRange?.startMillis?.let(::toPickerUtcDateMillis)
-            val availableEndDateMillis = availableRange?.endMillis?.let(::toPickerUtcDateMillis)
-            val dateRangePickerState = rememberDateRangePickerState(
-                initialSelectedStartDateMillis = initialRange?.startMillis?.let(::toPickerUtcDateMillis),
-                initialSelectedEndDateMillis = initialRange?.endMillis?.let(::toPickerUtcDateMillis),
-                selectableDates = object : SelectableDates {
-                    override fun isSelectableDate(utcTimeMillis: Long): Boolean {
-                        val earliest = availableStartDateMillis ?: 0L
-                        val latest = availableEndDateMillis ?: toPickerUtcDateMillis(System.currentTimeMillis())
-                        return utcTimeMillis in earliest..latest
-                    }
+            StatsDateRangeSheet(
+                availableRange = uiState.availableRange,
+                activeRange = uiState.activeRange,
+                onDismiss = { showDateRangePicker = false },
+                onApply = { start, end ->
+                    viewModel.setCustomRange(start, end)
+                    showDateRangePicker = false
                 }
             )
-            val canSaveRange =
-                dateRangePickerState.selectedStartDateMillis != null &&
-                    dateRangePickerState.selectedEndDateMillis != null
+        }
 
-            DatePickerDialog(
-                onDismissRequest = { showDateRangePicker = false },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            val start = dateRangePickerState.selectedStartDateMillis
-                                ?.let { pickerUtcDateMillisToLocalStart(it) }
-                                ?: return@TextButton
-                            val end = dateRangePickerState.selectedEndDateMillis
-                                ?.let { pickerUtcDateMillisToLocalEnd(it) }
-                                ?: return@TextButton
-                            viewModel.setCustomRange(start, end)
-                            showDateRangePicker = false
-                        },
-                        enabled = canSaveRange
-                    ) {
-                        Text(text = stringResource(R.string.save))
-                    }
+        AnimatedVisibility(
+            visible = exportedReportUri != null,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            enter = fadeIn(tween(180)) + slideInVertically(tween(220)) { it / 2 },
+            exit = fadeOut(tween(140)) + slideOutVertically(tween(180)) { it / 2 }
+        ) {
+            ReportExportConfirmation(
+                onOpen = {
+                    exportedReportUri?.let { openPdfReport(context, it) }
+                    exportedReportUri = null
                 },
-                dismissButton = {
-                    TextButton(onClick = { showDateRangePicker = false }) {
-                        Text(text = stringResource(R.string.cancel))
-                    }
+                onShare = {
+                    exportedReportUri?.let { sharePdfReport(context, it) }
+                    exportedReportUri = null
                 }
+            )
+        }
+    }
+}
+
+/**
+ * Sections with nothing to show are skipped rather than rendered empty — a sensor
+ * without a thermistor should not leave a temperature placeholder in the list.
+ */
+private fun cardHasContent(card: StatsCard, uiState: StatsUiState): Boolean = when (card) {
+    StatsCard.TEMPERATURE -> uiState.temperaturePoints.isNotEmpty()
+    // Episodes stays even at zero: "none in this window" is the answer someone opened
+    // the card to get, and a section that comes and goes is worse than a quiet one.
+    StatsCard.DAY_BY_DAY -> uiState.summary.days.size >= MIN_CALENDAR_DAYS
+    StatsCard.INSIGHTS -> uiState.summary.insights.isNotEmpty()
+    StatsCard.METRICS -> true
+    else -> true
+}
+
+@Composable
+private fun StatsCardContent(
+    card: StatsCard,
+    uiState: StatsUiState,
+    layout: StatsLayoutState,
+    selectedTirBand: TirBand?,
+    onBandSelected: (TirBand?) -> Unit,
+    selectedDayDate: java.time.LocalDate?,
+    onDaySelected: (DayBreakdown) -> Unit
+) {
+    when (card) {
+        StatsCard.OVERVIEW -> GlycemicOverviewCard(
+            summary = uiState.summary,
+            targets = uiState.targets,
+            unit = uiState.unit,
+            selectedRange = uiState.selectedRange,
+            selectedBand = selectedTirBand,
+            onBandSelected = onBandSelected
+        )
+
+        StatsCard.METRICS -> MetricsSection(
+            metrics = layout.visibleMetrics,
+            wideMetrics = layout.wideMetrics,
+            fullOrder = layout.metricOrder,
+            summary = uiState.summary,
+            targets = uiState.targets,
+            unit = uiState.unit
+        )
+
+        StatsCard.EPISODES -> EpisodesCard(
+            lows = uiState.summary.lowEpisodes,
+            highs = uiState.summary.highEpisodes,
+            episodes = uiState.summary.episodes,
+            unit = uiState.unit
+        )
+
+        StatsCard.PATTERNS -> PatternsCard(
+            agpByHour = uiState.summary.agpByHour,
+            hourlyStats = uiState.summary.hourlyStats,
+            dailyStats = uiState.summary.dailyStats,
+            dayParts = uiState.summary.dayParts,
+            weekdays = uiState.summary.weekdays,
+            targets = uiState.targets,
+            unit = uiState.unit,
+            activeRange = uiState.activeRange
+        )
+
+        StatsCard.DAY_BY_DAY -> DayByDayCard(
+            days = uiState.summary.days,
+            selectedDate = selectedDayDate,
+            onDaySelected = onDaySelected
+        )
+
+        StatsCard.RISK_INDEX -> RiskIndexCard(
+            gri = uiState.summary.gri,
+            risk = uiState.summary.risk,
+            comparison = uiState.summary.comparison
+        )
+
+        StatsCard.TEMPERATURE -> TemperatureOverviewCard(
+            temperaturePoints = uiState.temperaturePoints
+        )
+
+        StatsCard.INSIGHTS -> InsightsCard(insights = uiState.summary.insights)
+    }
+}
+
+/**
+ * Arrange's title bar, fixed above the list.
+ *
+ * A mode needs a frame that stays put. This one carries the name of the mode, what the
+ * gestures do, and the way out — and none of it scrolls away underneath twenty-eight rows
+ * of things to drag.
+ */
+@Composable
+private fun ArrangeSheet(
+    layout: StatsLayoutState,
+    summary: StatsSummary,
+    targets: StatsTargets,
+    unit: GlucoseUnit,
+    onDismiss: () -> Unit
+) {
+    // Built exactly like Show on Dashboard: default sheet state, no height of its own, the
+    // header outside the scrolling part and everything else inside it.
+    //
+    // The previous version pinned the height and then animated it larger off a nested
+    // scroll connection. Both halves of that fought the sheet's own gesture handling — the
+    // connection saw scrolls the sheet needed in order to decide between scrolling and
+    // dismissing, and the animating height moved its drag anchors underneath it — so it
+    // dismissed on an ordinary scroll, and on any scroll begun before the open animation
+    // had settled.
+    StableModalBottomSheet(
+        onDismissRequest = onDismiss,
+        dragHandle = { CompactSheetDragHandle() }
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Fixed: the title says which mode you are in and the button leaves it, so
+            // neither belongs in the part that scrolls away.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 24.dp, end = 16.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                DateRangePicker(
-                    state = dateRangePickerState,
-                    modifier = Modifier.heightIn(max = 448.dp),
-                    title = {},
-                    headline = {
-                        StatsDateRangePickerHeadline(dateRangePickerState)
-                    },
-                    showModeToggle = true
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.stats_arrange_title),
+                        style = MaterialTheme.typography.headlineSmallEmphasized
+                    )
+                    Text(
+                        text = stringResource(R.string.stats_arrange_hint),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Button(onClick = onDismiss) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(text = stringResource(R.string.libre_setup_done))
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 28.dp)
+            ) {
+                StatsLayoutEditor(
+                    layout = layout,
+                    summary = summary,
+                    targets = targets,
+                    unit = unit,
+                    onDone = onDismiss
                 )
             }
         }
     }
 }
 
+@Composable
+private fun MetricsSection(
+    metrics: List<StatsMetric>,
+    wideMetrics: Set<StatsMetric>,
+    fullOrder: List<StatsMetric>,
+    summary: StatsSummary,
+    targets: StatsTargets,
+    unit: GlucoseUnit
+) {
+    var showAll by rememberSaveable { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(emptySet<StatsMetric>()) }
+    // One drag state for both grids so a tile can be dragged across the fold, and one
+    // expansion set so the two halves agree about which tiles are open.
+    val dragState = rememberMetricDragState(
+        order = fullOrder,
+        onReordered = StatsLayoutStore::setMetricOrder
+    )
+    val rows = remember(metrics, wideMetrics) { packMetricRows(metrics, wideMetrics) }
+    val headMetrics = rows.take(StatsMetric.DEFAULT_VISIBLE_ROWS)
+        .flatMap { listOfNotNull(it.first, it.second) }
+    val tailMetrics = rows.drop(StatsMetric.DEFAULT_VISIBLE_ROWS)
+        .flatMap { listOfNotNull(it.first, it.second) }
 
+    val toggleExpanded: (StatsMetric) -> Unit = { metric ->
+        // A long press that turned into a drag must not also open the tile.
+        if (dragState.dragging == null) {
+            expanded = if (metric in expanded) expanded - metric else expanded + metric
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+    ) {
+        // The grid keeps its own even spacing; the disclosure below is deliberately not
+        // part of it.
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            if (metrics.isEmpty()) {
+                SectionEmptyLine(text = stringResource(R.string.stats_metrics_all_hidden))
+            } else {
+                MetricsGrid(
+                    metrics = headMetrics,
+                    wideMetrics = wideMetrics,
+                    summary = summary,
+                    targets = targets,
+                    unit = unit,
+                    expanded = expanded,
+                    onToggleExpanded = toggleExpanded,
+                    dragState = dragState
+                )
+            }
+
+            if (tailMetrics.isNotEmpty()) {
+                AnimatedVisibility(
+                    visible = showAll,
+                    enter = fadeIn(tween(180)) + expandVertically(tween(240)),
+                    exit = fadeOut(tween(140)) + shrinkVertically(tween(200))
+                ) {
+                    MetricsGrid(
+                        metrics = tailMetrics,
+                        wideMetrics = wideMetrics,
+                        summary = summary,
+                        targets = targets,
+                        unit = unit,
+                        expanded = expanded,
+                        onToggleExpanded = toggleExpanded,
+                        dragState = dragState
+                    )
+                }
+            }
+        }
+
+        // Back to the label and chevron this shipped with. Four attempts at replacing it
+        // with a bare glyph produced, in order: a disc with dead space round it, a strip
+        // that read as "scroll down", a full-bleed bar that ran into the tiles, and a
+        // chevron adrift in the gap between two cards. The label is what says this belongs
+        // to the metrics; the padding is tighter than before so it takes less room doing
+        // it.
+        if (tailMetrics.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { showAll = !showAll }
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (showAll) {
+                        stringResource(R.string.stats_fewer_metrics)
+                    } else {
+                        stringResource(R.string.stats_more_metrics)
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Icon(
+                    imageVector = if (showAll) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReportExportConfirmation(
+    onOpen: () -> Unit,
+    onShare: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.inverseSurface,
+        contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+        shadowElevation = 8.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 12.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Filled.CheckCircle,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.inversePrimary,
+                modifier = Modifier.size(24.dp)
+            )
+            Text(
+                text = stringResource(R.string.export_successful),
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.weight(1f),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                Surface(
+                    onClick = onOpen,
+                    shape = RoundedCornerShape(topStartPercent = 50, bottomStartPercent = 50),
+                    color = MaterialTheme.colorScheme.inversePrimary,
+                    contentColor = MaterialTheme.colorScheme.primary
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .height(48.dp)
+                            .padding(horizontal = 16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = stringResource(R.string.open),
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                }
+                Surface(
+                    onClick = onShare,
+                    shape = RoundedCornerShape(topEndPercent = 50, bottomEndPercent = 50),
+                    color = MaterialTheme.colorScheme.inversePrimary,
+                    contentColor = MaterialTheme.colorScheme.primary
+                ) {
+                    Box(
+                        modifier = Modifier.size(48.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Share,
+                            contentDescription = stringResource(R.string.share),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun openPdfReport(context: Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/pdf")
+        clipData = ClipData.newUri(context.contentResolver, "CGM report", uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching { context.startActivity(intent) }
+        .onFailure {
+            Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_SHORT).show()
+        }
+}
+
+private fun sharePdfReport(context: Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/pdf"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        clipData = ClipData.newUri(context.contentResolver, "CGM report", uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching {
+        context.startActivity(Intent.createChooser(intent, context.getString(R.string.share)))
+    }.onFailure {
+        Toast.makeText(context, context.getString(R.string.wentwrong), Toast.LENGTH_SHORT).show()
+
+    }
+}
+
+
+/** A style's printed colours, read from the exporter so the preview can't drift from the PDF. */
 private data class PdfStylePreviewPalette(
     val paper: Color,
     val stripe: Color,
@@ -667,36 +1082,12 @@ private data class PdfStylePreviewPalette(
 
 private fun resolvePdfStylePreviewPalette(
     style: StatsReportExporter.PdfVisualStyle
-): PdfStylePreviewPalette = when (style) {
-    StatsReportExporter.PdfVisualStyle.CURRENT -> PdfStylePreviewPalette(
-        paper = Color(0xFFF5F8FD),
-        stripe = Color(0xFF1A52B0),
-        accent = Color(0xFFD65F3F),
-        text = Color(0xFF1B2637)
-    )
-    StatsReportExporter.PdfVisualStyle.MINIMAL_SWISS -> PdfStylePreviewPalette(
-        paper = Color(0xFFFAFBFD),
-        stripe = Color(0xFF181818),
-        accent = Color(0xFFBB2025),
-        text = Color(0xFF21252C)
-    )
-    StatsReportExporter.PdfVisualStyle.MEDICAL_JOURNAL -> PdfStylePreviewPalette(
-        paper = Color(0xFFF8F6F1),
-        stripe = Color(0xFF295789),
-        accent = Color(0xFF774935),
-        text = Color(0xFF30353F)
-    )
-    StatsReportExporter.PdfVisualStyle.PREMIUM_DARK_INK -> PdfStylePreviewPalette(
-        paper = Color(0xFF1A202B),
-        stripe = Color(0xFF7FABFF),
-        accent = Color(0xFFDB9E6E),
-        text = Color(0xFFE8EDF6)
-    )
-    StatsReportExporter.PdfVisualStyle.ELEGANT_TYPOGRAPHY -> PdfStylePreviewPalette(
-        paper = Color(0xFFFCFBF9),
-        stripe = Color(0xFF56448B),
-        accent = Color(0xFFB07F57),
-        text = Color(0xFF413952)
+): PdfStylePreviewPalette = StatsReportExporter.swatch(style).let {
+    PdfStylePreviewPalette(
+        paper = Color(it.paper),
+        stripe = Color(it.primary),
+        accent = Color(it.secondary),
+        text = Color(it.text)
     )
 }
 
@@ -709,14 +1100,14 @@ private fun PdfVisualStylePicker(
     val styles = remember { StatsReportExporter.PdfVisualStyle.entries.toList() }
     Row(
         modifier = modifier.horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         styles.forEach { style ->
             val selected = style == selectedStyle
             val palette = resolvePdfStylePreviewPalette(style)
             Surface(
                 onClick = { onStyleSelected(style) },
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(16.dp),
                 color = if (selected) {
                     MaterialTheme.colorScheme.primaryContainer
                 } else {
@@ -732,14 +1123,14 @@ private fun PdfVisualStylePicker(
                 Column(
                     modifier = Modifier
                         .widthIn(min = 146.dp)
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(44.dp)
-                            .clip(RoundedCornerShape(10.dp))
+                            .clip(RoundedCornerShape(12.dp))
                             .background(palette.paper)
                     ) {
                         Box(
@@ -760,7 +1151,7 @@ private fun PdfVisualStylePicker(
                                 .align(Alignment.CenterStart)
                                 .padding(start = 16.dp)
                                 .size(width = 78.dp, height = 5.dp)
-                                .clip(RoundedCornerShape(99.dp))
+                                .clip(CircleShape)
                                 .background(palette.text.copy(alpha = 0.7f))
                         )
                         Box(
@@ -768,7 +1159,7 @@ private fun PdfVisualStylePicker(
                                 .align(Alignment.BottomStart)
                                 .padding(start = 16.dp, bottom = 8.dp)
                                 .size(width = 52.dp, height = 4.dp)
-                                .clip(RoundedCornerShape(99.dp))
+                                .clip(CircleShape)
                                 .background(palette.text.copy(alpha = 0.45f))
                         )
                     }
@@ -783,27 +1174,18 @@ private fun PdfVisualStylePicker(
         }
     }
 }
+/**
+ * Every Statistics card: extra-large corners on the leading-top and trailing-bottom, large on
+ * the other two. One shape, so the cards read as a set; they used four slightly different ones.
+ */
+private val StatsCardShape = RoundedCornerShape(topStart = 28.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 28.dp)
+
 @Composable
 private fun HeaderBlock(
     onShareClick: () -> Unit
-)
-{
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = stringResource(R.string.statistics_title),
-            style = MaterialTheme.typography.displaySmall,
-            modifier = Modifier.padding(start = 16.dp)
-        )
-        IconButton(
-            onClick = onShareClick,
-            modifier = Modifier.size(40.dp)
-        ) {
+) {
+    TabScreenHeader(title = stringResource(R.string.statistics_title)) {
+        IconButton(onClick = onShareClick) {
             Icon(
                 imageVector = Icons.Filled.Share,
                 contentDescription = stringResource(R.string.export),
@@ -822,7 +1204,7 @@ private fun LoadingCard() {
     )
 
     Card(
-        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 28.dp),
+        shape = StatsCardShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
         )
@@ -859,11 +1241,11 @@ private fun RangeLoadingCard() {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
@@ -889,7 +1271,7 @@ private fun RangeLoadingCard() {
 @Composable
 private fun EmptyStateCard(title: String, subtitle: String) {
     Card(
-        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 28.dp),
+        shape = StatsCardShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
         )
@@ -905,7 +1287,7 @@ private fun EmptyStateCard(title: String, subtitle: String) {
                 imageVector = Icons.Default.Info,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(26.dp)
+                modifier = Modifier.size(24.dp)
             )
             Text(
                 text = title,
@@ -927,6 +1309,7 @@ private fun GlycemicOverviewCard(
     summary: StatsSummary,
     targets: StatsTargets,
     unit: GlucoseUnit,
+    selectedRange: StatsTimeRange?,
     selectedBand: TirBand?,
     onBandSelected: (TirBand?) -> Unit
 ) {
@@ -934,28 +1317,28 @@ private fun GlycemicOverviewCard(
         TirRowDescriptor(
             band = TirBand.VERY_HIGH,
             label = stringResource(R.string.very_high),
-            rangeLabel = ">= ${formatMgDl(targets.veryHighMgDl, unit)}",
+            rangeLabel = "≥ ${formatMgDl(targets.veryHighMgDl, unit)}",
             percent = summary.tir.veryHighPercent,
             color = TirVeryHighColor
         ),
         TirRowDescriptor(
             band = TirBand.HIGH,
             label = stringResource(R.string.high_range),
-            rangeLabel = "${formatMgDl(targets.highMgDl, unit)}-${formatMgDl(targets.veryHighMgDl, unit)}",
+            rangeLabel = "${formatMgDl(targets.highMgDl, unit)}–${formatMgDl(targets.veryHighMgDl, unit)}",
             percent = summary.tir.highPercent,
             color = TirHighColor
         ),
         TirRowDescriptor(
             band = TirBand.IN_RANGE,
             label = stringResource(R.string.in_range),
-            rangeLabel = "${formatMgDl(targets.lowMgDl, unit)}-${formatMgDl(targets.highMgDl, unit)}",
+            rangeLabel = "${formatMgDl(targets.lowMgDl, unit)}–${formatMgDl(targets.highMgDl, unit)}",
             percent = summary.tir.inRangePercent,
             color = TirInRangeColor
         ),
         TirRowDescriptor(
             band = TirBand.LOW,
             label = stringResource(R.string.low_range),
-            rangeLabel = "${formatMgDl(targets.veryLowMgDl, unit)}-${formatMgDl(targets.lowMgDl, unit)}",
+            rangeLabel = "${formatMgDl(targets.veryLowMgDl, unit)}–${formatMgDl(targets.lowMgDl, unit)}",
             percent = summary.tir.lowPercent,
             color = TirLowColor
         ),
@@ -977,7 +1360,7 @@ private fun GlycemicOverviewCard(
             ) {
                 onBandSelected(null)
             },
-        shape = RoundedCornerShape(topStart = 34.dp, topEnd = 22.dp, bottomStart = 22.dp, bottomEnd = 34.dp),
+        shape = StatsCardShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
         )
@@ -989,19 +1372,36 @@ private fun GlycemicOverviewCard(
             verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                val isCompact = maxWidth < 340.dp
-                val layoutPressure = ((420f - maxWidth.value) / 140f).coerceIn(0f, 1f)
-                val ringBaseSize = if (isCompact) {
-                    (maxWidth * 0.55f).coerceIn(140.dp, 206.dp)
-                } else {
-                    (maxWidth * 0.38f).coerceIn(132.dp, 176.dp)
-                }
-                val ringShrinkFactor = 1f - (0.33f * layoutPressure)
-                val ringSize = (ringBaseSize * ringShrinkFactor).coerceIn(
-                    if (isCompact) 118.dp else 108.dp,
-                    if (isCompact) 206.dp else 176.dp
+                // The band rows are what decide this, not a round number.
+                //
+                // A row needs its label, a 62 dp range column and a 50 dp percentage
+                // column; below about 180 dp it starts eliding the labels. So the ring
+                // keeps whatever is left over and the two only stop sharing a line when
+                // the ring would have to drop under 96 dp — a threshold of 340 dp put a
+                // 360 dp phone into the stacked layout with 150 dp of width to spare,
+                // which is the ring taking a whole row on someone else's device while it
+                // looked fine on a Pixel.
+                val compactText = maxWidth < 372.dp
+                val columns = rememberTirColumnWidths(rows.map { it.rangeLabel }, compactText)
+                // What the widest row actually needs at the current text size: label, range
+                // and percent columns, the two 8dp gaps and the row's 8dp start padding.
+                val widestLabel = rememberTirLabelWidth(rows.map { it.label }, compactText)
+                val minRowsWidth = maxOf(
+                    180.dp,
+                    widestLabel + columns.range + columns.percent + 8.dp * 3
                 )
-                val compactText = layoutPressure > 0.34f
+                val ringSpacing = 8.dp
+                val ringMin = 88.dp
+                val ringMax = 176.dp
+                val isCompact = maxWidth < ringMin + ringSpacing + minRowsWidth
+                val ringSize = if (isCompact) {
+                    (maxWidth * 0.55f).coerceIn(118.dp, 206.dp)
+                } else {
+                    (maxWidth * 0.34f)
+                        .coerceIn(ringMin, ringMax)
+                        // Never at the rows' expense.
+                        .coerceAtMost(maxWidth - ringSpacing - minRowsWidth)
+                }
                 val tirRows: @Composable () -> Unit = {
                     Column(
                         modifier = Modifier.fillMaxWidth(),
@@ -1015,6 +1415,7 @@ private fun GlycemicOverviewCard(
                                 color = row.color,
                                 selected = selectedBand == row.band,
                                 compactText = compactText,
+                                columns = columns,
                                 onClick = {
                                     onBandSelected(if (selectedBand == row.band) null else row.band)
                                 }
@@ -1026,11 +1427,12 @@ private fun GlycemicOverviewCard(
                 if (isCompact) {
                     Column(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         OverviewRing(
                             tir = summary.tir,
+                            comparison = summary.comparison,
                             selectedBand = selectedBand,
                             onBandSelected = onBandSelected,
                             modifier = Modifier.size(ringSize)
@@ -1040,11 +1442,12 @@ private fun GlycemicOverviewCard(
                 } else {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         OverviewRing(
                             tir = summary.tir,
+                            comparison = summary.comparison,
                             selectedBand = selectedBand,
                             onBandSelected = onBandSelected,
                             modifier = Modifier.size(ringSize)
@@ -1055,6 +1458,7 @@ private fun GlycemicOverviewCard(
                     }
                 }
             }
+
         }
     }
 }
@@ -1062,6 +1466,7 @@ private fun GlycemicOverviewCard(
 @Composable
 private fun OverviewRing(
     tir: TimeInRangeBreakdown,
+    comparison: StatsComparison?,
     selectedBand: TirBand?,
     onBandSelected: (TirBand?) -> Unit,
     modifier: Modifier = Modifier
@@ -1178,11 +1583,83 @@ private fun OverviewRing(
                 style = MaterialTheme.typography.headlineLarge
             )
             Text(
-                text = "TIR",
+                text = stringResource(R.string.tir),
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            // The change against the previous period belongs on the number it describes,
+            // not on a line of its own below the card.
+            comparison?.takeIf { abs(it.inRangeDelta) >= 1f }?.let { delta ->
+                val rising = delta.inRangeDelta >= 0f
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(1.dp)
+                ) {
+                    Icon(
+                        imageVector = if (rising) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                        contentDescription = null,
+                        tint = if (rising) TirInRangeColor else TirHighColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = abs(delta.inRangeDelta).roundToInt().toString(),
+                        style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                        color = if (rising) TirInRangeColor else TirHighColor,
+                        maxLines = 1
+                    )
+                }
+            }
         }
+    }
+}
+
+internal data class TirColumnWidths(val range: Dp, val percent: Dp)
+
+@Composable
+private fun tirRangeStyle(compactText: Boolean) = (
+    if (compactText) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium
+).copy(fontFeatureSettings = "tnum")
+
+@Composable
+private fun tirPercentStyle(compactText: Boolean) = (
+    if (compactText) MaterialTheme.typography.labelMediumEmphasized else MaterialTheme.typography.labelLargeEmphasized
+).copy(fontFeatureSettings = "tnum")
+
+/**
+ * The band rows' range and percentage columns, sized to the widest label they will hold so
+ * all five rows line up. They used to be fixed dp widths, which held at the default text
+ * size and cut "9.0–11.0" to "9.0–1…" as soon as the text grew.
+ */
+@Composable
+private fun tirLabelStyle(compactText: Boolean) =
+    if (compactText) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium
+
+@Composable
+private fun rememberTirLabelWidth(labels: List<String>, compactText: Boolean): Dp {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val style = tirLabelStyle(compactText)
+    return remember(labels, density, style) {
+        labels.maxOfOrNull { label ->
+            with(density) { measurer.measure(label, style, maxLines = 1, softWrap = false).size.width.toDp() }
+        } ?: 0.dp
+    }
+}
+
+@Composable
+private fun rememberTirColumnWidths(rangeLabels: List<String>, compactText: Boolean): TirColumnWidths {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val rangeStyle = tirRangeStyle(compactText)
+    val percentStyle = tirPercentStyle(compactText)
+    return remember(rangeLabels, compactText, density, rangeStyle, percentStyle) {
+        fun widthOf(text: String, style: TextStyle): Dp = with(density) {
+            measurer.measure(text, style, maxLines = 1, softWrap = false).size.width.toDp()
+        }
+        TirColumnWidths(
+            range = rangeLabels.maxOfOrNull { widthOf(it, rangeStyle) } ?: 0.dp,
+            percent = widthOf(String.format(Locale.getDefault(), "%.1f%%", 100f), percentStyle),
+        )
     }
 }
 
@@ -1194,25 +1671,14 @@ private fun TirCompactRow(
     color: Color,
     selected: Boolean,
     compactText: Boolean,
+    columns: TirColumnWidths,
     onClick: () -> Unit
 ) {
-    val rangeColumnWidth = if (compactText) 62.dp else 74.dp
-    val percentColumnWidth = if (compactText) 50.dp else 56.dp
-    val labelStyle = if (compactText) {
-        MaterialTheme.typography.bodySmall
-    } else {
-        MaterialTheme.typography.bodyMedium
-    }
-    val rangeStyle = if (compactText) {
-        MaterialTheme.typography.labelSmall
-    } else {
-        MaterialTheme.typography.labelMedium
-    }
-    val percentStyle = if (compactText) {
-        MaterialTheme.typography.labelMedium
-    } else {
-        MaterialTheme.typography.labelLarge
-    }
+    val rangeColumnWidth = columns.range
+    val percentColumnWidth = columns.percent
+    val labelStyle = tirLabelStyle(compactText)
+    val rangeStyle = tirRangeStyle(compactText)
+    val percentStyle = tirPercentStyle(compactText)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1225,9 +1691,9 @@ private fun TirCompactRow(
                 }
             )
             .clickable(onClick = onClick)
-            .padding(start = 8.dp, end = 0.dp, top = if (compactText) 3.dp else 4.dp, bottom = if (compactText) 3.dp else 4.dp),
+            .padding(start = 8.dp, end = 0.dp, top = if (compactText) 4.dp else 4.dp, bottom = if (compactText) 4.dp else 4.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
             text = label,
@@ -1240,7 +1706,7 @@ private fun TirCompactRow(
         )
         Text(
             text = rangeLabel,
-            style = rangeStyle.copy(fontFeatureSettings = "tnum"),
+            style = rangeStyle,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
             modifier = Modifier.width(rangeColumnWidth),
             maxLines = 1,
@@ -1250,10 +1716,7 @@ private fun TirCompactRow(
         )
         Text(
             text = String.format(Locale.getDefault(), "%.1f%%", percent),
-            style = percentStyle.copy(
-                fontFeatureSettings = "tnum",
-                fontWeight = FontWeight.SemiBold
-            ),
+            style = percentStyle,
             color = color.copy(alpha = 0.82f),
             modifier = Modifier.width(percentColumnWidth),
             maxLines = 1,
@@ -1268,632 +1731,24 @@ private fun TirCompactRow(
  * Used for Average and A1c in the GlycemicOverviewCard.
  */
 @Composable
-private fun KeyMetricTile(
-    label: String,
-    value: String,
-    tone: Color,
-    modifier: Modifier = Modifier,
-    suffix: String? = null,
-    infoText: String? = null
-) {
-    var expanded by remember(label, infoText) { mutableStateOf(false) }
-    val expandable = !infoText.isNullOrBlank()
-    val tileShape = RoundedCornerShape(topStart = 16.dp, topEnd = 10.dp, bottomStart = 10.dp, bottomEnd = 16.dp)
-    Box(
-        modifier = modifier
-            .animateContentSize()
-            .graphicsLayer {
-                shape = tileShape
-                clip = true
-            }
-            .background(
-                color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                shape = tileShape
-            )
-            .then(
-                if (expandable) Modifier.clickable { expanded = !expanded } else Modifier
-            )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(IntrinsicSize.Min)
-        ) {
-            // Accent strip
-            Box(
-                modifier = Modifier
-                    .width(3.dp)
-                    .fillMaxHeight()
-                    .background(
-                        tone.copy(alpha = 0.5f),
-                        RoundedCornerShape(topStart = 16.dp, bottomStart = 10.dp)
-                    )
-            )
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(start = 10.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = label,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = tone
-                    )
-                    if (expandable) {
-                        Icon(
-                            imageVector = Icons.Default.Info,
-                            contentDescription = null,
-                            tint = tone.copy(alpha = 0.72f),
-                            modifier = Modifier.size(13.dp)
-                        )
-                    }
-                }
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    Text(
-                        text = value,
-                        style = MaterialTheme.typography.headlineMedium.copy(
-                            fontFeatureSettings = "tnum",
-                            fontWeight = FontWeight.SemiBold
-                        ),
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1
-                    )
-                    if (suffix != null) {
-                        Text(
-                            text = suffix,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                            modifier = Modifier
-                                .padding(bottom = 3.dp)
-                        )
-                    }
-                }
-                AnimatedVisibility(
-                    visible = expandable && expanded,
-                    enter = fadeIn(animationSpec = tween(180)) + expandVertically(animationSpec = tween(220)),
-                    exit = fadeOut(animationSpec = tween(140)) + shrinkVertically(animationSpec = tween(180))
-                ) {
-                    Text(
-                        text = infoText.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 2.dp)
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * Compact secondary metric tile with left accent strip.
- * Used for Median, CV, Std dev — smaller than KeyMetricTile.
- */
-@Composable
-private fun SecondaryMetricTile(
-    label: String,
-    value: String,
-    tone: Color,
-    modifier: Modifier = Modifier,
-    infoText: String? = null
-) {
-    var expanded by remember(label, infoText) { mutableStateOf(false) }
-    val expandable = !infoText.isNullOrBlank()
-    val tileShape = RoundedCornerShape(topStart = 12.dp, topEnd = 8.dp, bottomStart = 8.dp, bottomEnd = 12.dp)
-    Box(
-        modifier = modifier
-            .animateContentSize()
-            .graphicsLayer {
-                shape = tileShape
-                clip = true
-            }
-            .background(
-                color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                shape = tileShape
-            )
-            .then(
-                if (expandable) Modifier.clickable { expanded = !expanded } else Modifier
-            )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(IntrinsicSize.Min)
-        ) {
-            // Accent strip
-            Box(
-                modifier = Modifier
-                    .width(3.dp)
-                    .fillMaxHeight()
-                    .background(
-                        tone.copy(alpha = 0.5f),
-                        RoundedCornerShape(topStart = 12.dp, bottomStart = 8.dp)
-                    )
-            )
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(start = 8.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(1.dp)
-            ) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(3.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = label,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = tone
-                    )
-                    if (expandable) {
-                        Icon(
-                            imageVector = Icons.Default.Info,
-                            contentDescription = null,
-                            tint = tone.copy(alpha = 0.72f),
-                            modifier = Modifier.size(12.dp)
-                        )
-                    }
-                }
-                Text(
-                    text = value,
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontFeatureSettings = "tnum",
-                        fontWeight = FontWeight.SemiBold
-                    ),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1
-                )
-                AnimatedVisibility(
-                    visible = expandable && expanded,
-                    enter = fadeIn(animationSpec = tween(170)) + expandVertically(animationSpec = tween(220)),
-                    exit = fadeOut(animationSpec = tween(130)) + shrinkVertically(animationSpec = tween(180))
-                ) {
-                    Text(
-                        text = infoText.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 2.dp)
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MetricsScoreSection(
-    summary: StatsSummary,
-    targets: StatsTargets,
-    unit: GlucoseUnit
-) {
-    val avgTone = when {
-        summary.avgMgDl < targets.lowMgDl || summary.avgMgDl > targets.highMgDl -> TirVeryHighColor
-        summary.avgMgDl <= targets.lowMgDl + 8f || summary.avgMgDl >= targets.highMgDl - 8f -> TirHighColor
-        else -> TirInRangeColor
-    }
-    val medianTone = when {
-        summary.medianMgDl < targets.lowMgDl || summary.medianMgDl > targets.highMgDl -> TirVeryHighColor
-        summary.medianMgDl <= targets.lowMgDl + 8f || summary.medianMgDl >= targets.highMgDl - 8f -> TirHighColor
-        else -> TirInRangeColor
-    }
-    val a1cTone = when {
-        summary.gmiPercent < 5.7f -> TirInRangeColor
-        summary.gmiPercent < 6.5f -> TirHighColor
-        else -> TirVeryHighColor
-    }
-    val cvTone = when {
-        summary.cvPercent < 32f -> TirInRangeColor
-        summary.cvPercent < 40f -> TirHighColor
-        else -> TirVeryHighColor
-    }
-    val iqrTone = cvTone
-    val stdTone = cvTone
-    val avgStatus = when {
-        summary.avgMgDl < targets.lowMgDl -> stringResource(R.string.low_range)
-        summary.avgMgDl > targets.highMgDl -> stringResource(R.string.high_range)
-        else -> stringResource(R.string.in_range)
-    }
-    val medianStatus = when {
-        summary.medianMgDl < targets.lowMgDl -> stringResource(R.string.low_range)
-        summary.medianMgDl > targets.highMgDl -> stringResource(R.string.high_range)
-        else -> stringResource(R.string.in_range)
-    }
-    val cvStatus = when {
-        summary.cvPercent < 32f -> stringResource(R.string.gvi_good)
-        summary.cvPercent < 40f -> stringResource(R.string.gvi_moderate)
-        else -> stringResource(R.string.gvi_poor)
-    }
-    val stdStatus = when {
-        summary.stdDevMgDl < 18f -> stringResource(R.string.gvi_good)
-        summary.stdDevMgDl < 27f -> stringResource(R.string.gvi_moderate)
-        else -> stringResource(R.string.gvi_poor)
-    }
-    val averageTile = ScoreTileSpec(
-        title = stringResource(R.string.average_glucose),
-        value = formatMgDl(summary.avgMgDl, unit),
-        status = avgStatus,
-        meta = "${stringResource(R.string.range)} ${formatMgDl(targets.lowMgDl, unit)}-${formatMgDl(targets.highMgDl, unit)}",
-        tone = avgTone
-    )
-    val gmiTile = ScoreTileSpec(
-        title = stringResource(R.string.a1c_gmi_label),
-        value = String.format(Locale.getDefault(), "%.1f%%", summary.gmiPercent),
-        status = if (summary.gmiPercent <= 7.0f) stringResource(R.string.gmi_target) else stringResource(R.string.high_range),
-        meta = "${stringResource(R.string.gmi_target)} ${stringResource(R.string.gmi_target_value)}",
-        tone = a1cTone
-    )
-    val medianTile = ScoreTileSpec(
-        title = stringResource(R.string.median),
-        value = formatMgDl(summary.medianMgDl, unit),
-        status = medianStatus,
-        meta = "${stringResource(R.string.typical)} · ${String.format(Locale.getDefault(), "%.0f%% %s", summary.tir.inRangePercent, stringResource(R.string.tir))}",
-        tone = medianTone
-    )
-    val iqrTile = ScoreTileSpec(
-        title = stringResource(R.string.report_iqr_short),
-        value = formatMgDl((summary.p75MgDl - summary.p25MgDl).coerceAtLeast(0f), unit),
-        status = stringResource(R.string.typical),
-        meta = "${formatMgDl(summary.p25MgDl, unit)}-${formatMgDl(summary.p75MgDl, unit)}",
-        tone = iqrTone,
-        infoText = stringResource(R.string.iqr_description)
-    )
-    val stdDevTile = ScoreTileSpec(
-        title = stringResource(R.string.std_dev_short),
-        value = formatMgDl(summary.stdDevMgDl, unit),
-        status = stdStatus,
-        meta = "",
-        tone = stdTone,
-        infoText = stringResource(R.string.std_dev_description)
-    )
-    val cvTile = ScoreTileSpec(
-        title = stringResource(R.string.cv),
-        value = String.format(Locale.getDefault(), "%.1f%%", summary.cvPercent),
-        status = cvStatus,
-        meta = "",
-        tone = cvTone,
-        infoText = stringResource(R.string.cv_description)
-    )
-    val gviTile = ScoreTileSpec(
-        title = stringResource(R.string.gvi),
-        value = String.format(Locale.getDefault(), "%.2f", summary.gvi.value),
-        status = stringResource(summary.gvi.labelResId),
-        meta = "${stringResource(R.string.stability)} ${String.format(Locale.getDefault(), "%.0f%%", summary.gvi.stability)} · ROC ${String.format(Locale.getDefault(), "%.2f", summary.gvi.rateOfChange)}",
-        tone = gviTone(summary.gvi.value),
-        infoText = stringResource(R.string.gvi_description)
-    )
-    val psgTile = ScoreTileSpec(
-        title = stringResource(R.string.psg),
-        value = formatMgDl(summary.psg.baselineMgDl, unit),
-        status = stringResource(summary.psg.labelResId),
-//        meta = "${stringResource(R.string.confidence)} ${String.format(Locale.getDefault(), "%.0f%%", summary.psg.confidence)} · ${stringResource(R.string.stats_trend)} ${if (summary.psg.trend >= 0f) "+" else ""}${String.format(Locale.getDefault(), "%.0f%%", summary.psg.trend * 100f)}",
-        meta = "${String.format(Locale.getDefault(), "%.0f%%", summary.psg.confidence)} · ${stringResource(R.string.stats_trend)} ${if (summary.psg.trend >= 0f) "+" else ""}${String.format(Locale.getDefault(), "%.0f%%", summary.psg.trend * 100f)}",
-        tone = psgTone(summary.psg.labelResId),
-        infoText = stringResource(R.string.psg_description)
-    )
-
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        ScoreTileRow(left = averageTile, right = gmiTile)
-        ScoreTileRow(left = medianTile, right = iqrTile)
-        ScoreTileRow(left = stdDevTile, right = cvTile)
-        ScoreTileRow(left = gviTile, right = psgTile)
-    }
-}
-
-@Composable
-private fun rememberScoreTileNeedsOwnRow(
-    contentWidth: Dp,
-    value: String,
-    status: String
-): Boolean {
-    if (status.isBlank()) return false
-    val density = LocalDensity.current
-    val textMeasurer = rememberTextMeasurer()
-    val statusStyle = MaterialTheme.typography.titleSmall.copy(lineHeight = 20.sp)
-    val valueStyle = MaterialTheme.typography.headlineMedium.copy(fontFeatureSettings = "tnum")
-    return remember(contentWidth, value, status, density, textMeasurer, statusStyle, valueStyle) {
-        val widthPx = with(density) { maxOf(contentWidth, 0.dp).roundToPx() }
-        val titleGapPx = with(density) { 12.dp.roundToPx() }
-        val valueWidthPx = textMeasurer.measure(
-            text = AnnotatedString(value),
-            style = valueStyle,
-            maxLines = 1
-        ).size.width
-        val statusWidthPx = textMeasurer.measure(
-            text = AnnotatedString(status),
-            style = statusStyle,
-            maxLines = 1
-        ).size.width
-        statusWidthPx > (widthPx - valueWidthPx - titleGapPx).coerceAtLeast(0)
-    }
-}
-
-@Composable
-private fun ScoreTileRow(
-    left: ScoreTileSpec,
-    right: ScoreTileSpec,
-    spacing: Dp = 12.dp
-) {
-    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-        val tileContentWidth = ((maxWidth - spacing) / 2f) - 28.dp
-        val useOwnStatusRow = rememberScoreTileNeedsOwnRow(tileContentWidth, left.value, left.status) ||
-            rememberScoreTileNeedsOwnRow(tileContentWidth, right.value, right.status)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(spacing)
-        ) {
-            ScoreTile(
-                title = left.title,
-                value = left.value,
-                status = left.status,
-                meta = left.meta,
-                tone = left.tone,
-                infoText = left.infoText,
-                forceStatusOwnRow = useOwnStatusRow,
-                modifier = Modifier.weight(1f)
-            )
-            ScoreTile(
-                title = right.title,
-                value = right.value,
-                status = right.status,
-                meta = right.meta,
-                tone = right.tone,
-                infoText = right.infoText,
-                forceStatusOwnRow = useOwnStatusRow,
-                modifier = Modifier.weight(1f)
-            )
-        }
-    }
-}
-
-@Composable
-private fun ScoreTile(
-    title: String,
-    value: String,
-    status: String,
-    meta: String,
-    tone: Color,
-    modifier: Modifier = Modifier,
-    infoText: String? = null,
-    forceStatusOwnRow: Boolean? = null
-) {
-    var expanded by remember(title, infoText) { mutableStateOf(false) }
-    val expandable = !infoText.isNullOrBlank()
-    val hasStatus = status.isNotBlank()
-    val hasMeta = meta.isNotBlank()
-    val tileShape = RoundedCornerShape(topStart = 20.dp, topEnd = 12.dp, bottomStart = 12.dp, bottomEnd = 20.dp)
-    val tileColor = tone.copy(alpha = 0.09f)
-        .compositeOver(MaterialTheme.colorScheme.surfaceContainerHigh)
-    val titleStyle = MaterialTheme.typography.titleMedium.copy(lineHeight = 22.sp)
-    val statusStyle = MaterialTheme.typography.titleSmall.copy(lineHeight = 20.sp)
-    val valueStyle = MaterialTheme.typography.headlineMedium.copy(fontFeatureSettings = "tnum")
-    Box(
-        modifier = modifier
-            .animateContentSize()
-            .graphicsLayer {
-                shape = tileShape
-                clip = true
-            }
-            .background(
-                color = tileColor,
-                shape = tileShape
-            )
-            .then(
-                if (expandable) Modifier.clickable { expanded = !expanded } else Modifier
-            )
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(if (hasMeta) 6.dp else 4.dp)
-        ) {
-            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                val density = LocalDensity.current
-                val textMeasurer = rememberTextMeasurer()
-                val titleGapPx = with(density) { 12.dp.roundToPx() }
-                val sharedWidthPx = with(density) { maxWidth.roundToPx() }
-                val autoStatusNeedsOwnRow = remember(
-                    forceStatusOwnRow,
-                    value,
-                    status,
-                    textMeasurer,
-                    density,
-                    valueStyle,
-                    statusStyle,
-                    hasStatus,
-                    sharedWidthPx
-                ) {
-                    if (forceStatusOwnRow != null || !hasStatus) {
-                        false
-                    } else {
-                        val valueWidthPx = textMeasurer.measure(
-                            text = AnnotatedString(value),
-                            style = valueStyle,
-                            maxLines = 1
-                        ).size.width
-                        val statusWidthPx = textMeasurer.measure(
-                            text = AnnotatedString(status),
-                            style = statusStyle,
-                            maxLines = 1
-                        ).size.width
-                        statusWidthPx > (sharedWidthPx - valueWidthPx - titleGapPx).coerceAtLeast(0)
-                    }
-                }
-                val statusNeedsOwnRow = forceStatusOwnRow ?: autoStatusNeedsOwnRow
-
-                if (statusNeedsOwnRow) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.Top
-                        ) {
-                            Row(
-                                modifier = Modifier.weight(1f),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = title,
-                                    style = titleStyle,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                if (expandable) {
-                                    Icon(
-                                        imageVector = Icons.Default.Info,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.74f),
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                }
-                            }
-                            Text(
-                                text = value,
-                                style = valueStyle,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.padding(start = 12.dp),
-                                maxLines = 1,
-                                softWrap = false,
-                                textAlign = TextAlign.End
-                            )
-                        }
-                        Text(
-                            text = status,
-                            style = statusStyle,
-                            color = tone,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(if (hasStatus) 4.dp else 0.dp)
-                        ) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = title,
-                                    style = titleStyle,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                if (expandable) {
-                                    Icon(
-                                        imageVector = Icons.Default.Info,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.74f),
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                }
-                            }
-                            if (hasStatus) {
-                                Text(
-                                    text = status,
-                                    style = statusStyle,
-                                    color = tone,
-                                    modifier = Modifier.padding(top = 2.dp),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                        Text(
-                            text = value,
-                            style = valueStyle,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            modifier = Modifier.padding(start = 12.dp),
-                            maxLines = 1,
-                            softWrap = false,
-                            textAlign = TextAlign.End
-                        )
-                    }
-                }
-            }
-            if (hasMeta) {
-                Text(
-                    text = meta,
-                    style = MaterialTheme.typography.labelMedium.copy(
-                        fontFeatureSettings = "tnum",
-                        lineHeight = 18.sp
-                    ),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.74f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-            AnimatedVisibility(
-                visible = expandable && expanded,
-                enter = fadeIn(animationSpec = tween(180)) + expandVertically(animationSpec = tween(220)),
-                exit = fadeOut(animationSpec = tween(140)) + shrinkVertically(animationSpec = tween(180))
-            ) {
-                Text(
-                    text = infoText.orEmpty(),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 2.dp)
-                )
-            }
-        }
-    }
-}
-
-private fun gviTone(gvi: Float): Color {
-    return when {
-        gvi < 1.25f -> Color(0xFF4CAF50)
-        gvi < 1.55f -> Color(0xFF8BC34A)
-        gvi < 1.90f -> Color(0xFFFF9800)
-        else -> Color(0xFFF44336)
-    }
-}
-
-private fun psgTone(labelResId: Int): Color {
-    return when (labelResId) {
-        R.string.psg_stable -> Color(0xFF4CAF50)
-        R.string.psg_low -> Color(0xFFEF6C00)
-        R.string.psg_elevated -> Color(0xFFD84315)
-        else -> Color(0xFFFFC107)
-    }
-}
-@Composable
 private fun PatternsCard(
     agpByHour: List<AgpHourBin>,
+    hourlyStats: List<HourlyGlucoseStats>,
     dailyStats: List<DailyStats>,
+    dayParts: List<DayPartStats>,
+    weekdays: List<WeekdayStats>,
     targets: StatsTargets,
     unit: GlucoseUnit,
     activeRange: StatsDateRange?
 ) {
     val availableBins = agpByHour.count { it.sampleCount > 0 }
-    val availableTabs = remember(agpByHour, dailyStats) {
+    val availableTabs = remember(agpByHour, dailyStats, dayParts, weekdays) {
         buildList {
             if (availableBins > 0) add(PatternTab.AGP)
-            if (dailyStats.isNotEmpty()) add(PatternTab.DAILY)
+            if (dailyStats.size > 1) add(PatternTab.DAILY)
+            if (hourlyStats.any { it.sampleCount > 0 }) add(PatternTab.TIME_OF_DAY)
+            // Weekday only pays off once more than one week is in view.
+            if (weekdays.count { it.readingCount > 0 } >= 3) add(PatternTab.WEEKDAY)
         }.ifEmpty { listOf(PatternTab.AGP) }
     }
     var selectedTab by remember(availableTabs) { mutableStateOf(availableTabs.first()) }
@@ -1915,38 +1770,79 @@ private fun PatternsCard(
     val selectedAgpBin = agpByHour.getOrNull(selectedAgpHour.coerceIn(0, 23))
     val selectedDaily = dailyStats.getOrNull(selectedDailyIndex.coerceIn(0, dailyStats.lastIndex.coerceAtLeast(0)))
     val dayFormatter = remember { DateTimeFormatter.ofPattern("MMM d") }
-    val headerPrimary = if (selectedTab == PatternTab.AGP) {
-        val hour = selectedAgpHour.coerceIn(0, 23)
-        selectedAgpBin?.medianMgDl?.let { median ->
-            String.format(
-                Locale.getDefault(),
-                "%02d:00 · %s %s",
-                hour,
-                stringResource(R.string.median),
-                formatMgDl(median, unit)
-            )
-        } ?: String.format(Locale.getDefault(), "%02d:00 · %s", hour, stringResource(R.string.stats_agp_no_sample))
-    } else {
-        selectedDaily?.let { day ->
+    val selectedHourly = hourlyStats.getOrNull(selectedAgpHour.coerceIn(0, 23))
+    val bestWeekday = weekdays.filter { it.readingCount > 0 }.maxByOrNull { it.tir.inRangePercent }
+    val headerPrimary = when (selectedTab) {
+        PatternTab.AGP -> {
+            val hour = selectedAgpHour.coerceIn(0, 23)
+            selectedAgpBin?.medianMgDl?.let { median ->
+                String.format(
+                    Locale.getDefault(),
+                    "%02d:00 · %s %s",
+                    hour,
+                    stringResource(R.string.median),
+                    formatMgDl(median, unit)
+                )
+            } ?: String.format(Locale.getDefault(), "%02d:00 · %s", hour, stringResource(R.string.stats_agp_no_sample))
+        }
+
+        PatternTab.DAILY -> selectedDaily?.let { day ->
             "${day.date.format(dayFormatter)} · ${formatMgDl(day.averageMgDl, unit)} ~"
         } ?: windowLabel
+
+        PatternTab.TIME_OF_DAY -> selectedHourly?.takeIf { it.sampleCount > 0 }?.let { hourly ->
+            String.format(
+                Locale.getDefault(),
+                "%02d:00 · %s",
+                hourly.hour,
+                formatMgDl(hourly.averageMgDl, unit)
+            )
+        } ?: String.format(
+            Locale.getDefault(),
+            "%02d:00 · %s",
+            selectedAgpHour.coerceIn(0, 23),
+            stringResource(R.string.stats_agp_no_sample)
+        )
+
+        PatternTab.WEEKDAY -> bestWeekday?.let { weekday ->
+            stringResource(
+                R.string.stats_best_stretch,
+                weekday.dayOfWeek.getDisplayName(java.time.format.TextStyle.FULL, Locale.getDefault())
+            )
+        } ?: windowLabel
     }
-    val headerSecondary = if (selectedTab == PatternTab.AGP) {
-        val iqrLow = selectedAgpBin?.p25MgDl
-        val iqrHigh = selectedAgpBin?.p75MgDl
-        if (iqrLow != null && iqrHigh != null) {
-            "IQR ${formatMgDl(iqrLow, unit)}-${formatMgDl(iqrHigh, unit)}"
-        } else {
-            contextLabel
+    val headerSecondary = when (selectedTab) {
+        PatternTab.AGP -> {
+            val iqrLow = selectedAgpBin?.p25MgDl
+            val iqrHigh = selectedAgpBin?.p75MgDl
+            if (iqrLow != null && iqrHigh != null) {
+                "IQR ${formatMgDl(iqrLow, unit)}–${formatMgDl(iqrHigh, unit)}"
+            } else {
+                contextLabel
+            }
         }
-    } else {
-        selectedDaily?.let { day ->
+
+        PatternTab.DAILY -> selectedDaily?.let { day ->
             String.format(Locale.getDefault(), "%.0f%% TIR", day.inRangePercent)
+        } ?: contextLabel
+
+        PatternTab.TIME_OF_DAY -> selectedHourly?.takeIf { it.sampleCount > 0 }?.let { hourly ->
+            String.format(
+                Locale.getDefault(),
+                "%.0f%% TIR · %.0f%% %s",
+                hourly.tir.inRangePercent,
+                hourly.tir.belowRangePercent,
+                stringResource(R.string.low_range)
+            )
+        } ?: contextLabel
+
+        PatternTab.WEEKDAY -> bestWeekday?.let { weekday ->
+            String.format(Locale.getDefault(), "%.0f%% TIR", weekday.tir.inRangePercent)
         } ?: contextLabel
     }
 
     Card(
-        shape = RoundedCornerShape(topStart = 30.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 30.dp),
+        shape = StatsCardShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow
         )
@@ -1964,10 +1860,11 @@ private fun PatternsCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Top
             ) {
-                val subtitle = if (selectedTab == PatternTab.AGP) {
-                    stringResource(R.string.hourly_patterns)
-                } else {
-                    stringResource(R.string.daily_trends)
+                val subtitle = when (selectedTab) {
+                    PatternTab.AGP -> stringResource(R.string.hourly_patterns)
+                    PatternTab.DAILY -> stringResource(R.string.daily_trends)
+                    PatternTab.TIME_OF_DAY -> stringResource(R.string.stats_time_of_day_subtitle)
+                    PatternTab.WEEKDAY -> stringResource(R.string.stats_weekday_subtitle)
                 }
                 Column(
                     modifier = Modifier.weight(1f),
@@ -1975,7 +1872,7 @@ private fun PatternsCard(
                 ) {
                     Text(
                         text = stringResource(R.string.stats_patterns),
-                        style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold)
+                        style = MaterialTheme.typography.headlineSmallEmphasized
                     )
                     Text(
                         text = subtitle,
@@ -1992,9 +1889,8 @@ private fun PatternsCard(
                 ) {
                     Text(
                         text = headerPrimary,
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontFeatureSettings = "tnum",
-                            fontWeight = FontWeight.SemiBold
+                        style = MaterialTheme.typography.titleMediumEmphasized.copy(
+                            fontFeatureSettings = "tnum"
                         ),
                         color = MaterialTheme.colorScheme.onSurface,
                         textAlign = TextAlign.End,
@@ -2013,16 +1909,23 @@ private fun PatternsCard(
             }
 
             if (availableTabs.size > 1) {
-                val dailyTrendsLabel = stringResource(R.string.daily_trends)
+                val tabLabels = mapOf(
+                    PatternTab.AGP to "AGP",
+                    PatternTab.DAILY to stringResource(R.string.stats_tab_days),
+                    PatternTab.TIME_OF_DAY to stringResource(R.string.stats_tab_hours),
+                    PatternTab.WEEKDAY to stringResource(R.string.stats_tab_weekdays)
+                )
                 ConnectedButtonGroup(
                     options = availableTabs,
                     selectedOption = selectedTab,
                     onOptionSelected = { selectedTab = it },
-                    labelText = { tab -> if (tab == PatternTab.AGP) "AGP" else dailyTrendsLabel },
+                    labelText = { tab -> tabLabels[tab].orEmpty() },
                     label = { tab ->
                         Text(
-                            text = if (tab == PatternTab.AGP) "AGP" else stringResource(R.string.daily_trends),
-                            style = MaterialTheme.typography.labelMedium
+                            text = tabLabels[tab].orEmpty(),
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            softWrap = false
                         )
                     },
                     itemHeight = 38.dp,
@@ -2069,16 +1972,52 @@ private fun PatternsCard(
                                 .height(chartHeight)
                         )
                     }
+
+                    PatternTab.TIME_OF_DAY -> {
+                        // The ribbon is the hour-by-hour read; the six-hour rows below
+                        // are the same day condensed to something you can say out loud.
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            HourlyExposureRibbon(
+                                hourlyStats = hourlyStats,
+                                selectedHour = selectedAgpHour,
+                                onSelectedHourChange = { selectedAgpHour = it },
+                                contentDescription = stringResource(R.string.stats_hourly_exposure),
+                                modifier = Modifier.padding(horizontal = 16.dp)
+                            )
+                            DayPartPatterns(
+                                dayParts = dayParts,
+                                unit = unit,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+
+                    PatternTab.WEEKDAY -> {
+                        WeekdayPatterns(
+                            weekdays = weekdays,
+                            unit = unit,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp)
+                        )
+                    }
                 }
             }
-            Spacer(modifier = Modifier.height(2.dp))
+            Spacer(modifier = Modifier.height(12.dp))
         }
     }
 }
 
 private enum class PatternTab {
     AGP,
-    DAILY
+    DAILY,
+    TIME_OF_DAY,
+    WEEKDAY
 }
 
 @Composable
@@ -2115,6 +2054,12 @@ private fun AgpChart(
     val minY = minOf(values.minOrNull() ?: lowAnchor, lowAnchor - yPadding)
     val maxY = maxOf(values.maxOrNull() ?: highAnchor, highAnchor + yPadding).coerceAtLeast(minY + 10f)
 
+    val chartContext = LocalContext.current
+    val trafficLineColors = remember(chartContext) {
+        chartContext.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+            .getBoolean("glucose_app_chart_range_colors_enabled", false)
+    }
+    val isDarkTheme = tk.glucodata.ui.isAppInDarkTheme()
     val targetBandColor = TirInRangeColor.copy(alpha = 0.16f)
     val iqrBandColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.20f)
     val p10P90Color = MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)
@@ -2157,7 +2102,7 @@ private fun AgpChart(
 
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Box(
             modifier = Modifier
@@ -2219,6 +2164,9 @@ private fun AgpChart(
             var p90Started = false
             val medianPath = Path()
             var medianStarted = false
+            var prevMedianPoint: Offset? = null
+            var prevMedianValue = 0f
+            val medianSegments = mutableListOf<Triple<Offset, Offset, Float>>()
 
             val upperIqr = mutableListOf<Offset>()
             val lowerIqr = mutableListOf<Offset>()
@@ -2261,8 +2209,15 @@ private fun AgpChart(
                     } else {
                         medianPath.lineTo(x, y)
                     }
+                    val point = Offset(x, y)
+                    prevMedianPoint?.let { previous ->
+                        medianSegments += Triple(previous, point, (median + prevMedianValue) / 2f)
+                    }
+                    prevMedianPoint = point
+                    prevMedianValue = median
                 } else {
                     medianStarted = false
+                    prevMedianPoint = null
                 }
 
                 bin.p75MgDl?.let { upperIqr += Offset(x, yFor(it)) }
@@ -2288,11 +2243,35 @@ private fun AgpChart(
                 color = p10P90Color,
                 style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round)
             )
-            drawPath(
-                path = medianPath,
-                color = medianColor,
-                style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
-            )
+            if (trafficLineColors) {
+                val medianFallbackArgb = medianColor.toArgb()
+                medianSegments.forEach { (segmentStart, segmentEnd, valueMg) ->
+                    drawLine(
+                        color = Color(
+                            tk.glucodata.GlucoseRangeColors.trafficColorForValue(
+                                valueMg,
+                                targets.lowMgDl,
+                                targets.highMgDl,
+                                targets.veryLowMgDl,
+                                targets.veryHighMgDl,
+                                isDarkTheme,
+                                false,
+                                medianFallbackArgb
+                            )
+                        ),
+                        start = segmentStart,
+                        end = segmentEnd,
+                        strokeWidth = 3.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                }
+            } else {
+                drawPath(
+                    path = medianPath,
+                    color = medianColor,
+                    style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
+                )
+            }
 
             tickHours.forEach { hour ->
                 val x = xForHour(hour)
@@ -2362,15 +2341,15 @@ private fun AgpChart(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState())
-                .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             LegendDot(
                 color = targetBandColor,
-                label = "${stringResource(R.string.in_range)} ${formatMgDl(targets.lowMgDl, unit)}-${formatMgDl(targets.highMgDl, unit)}"
+                label = "${stringResource(R.string.in_range)} ${formatMgDl(targets.lowMgDl, unit)}–${formatMgDl(targets.highMgDl, unit)}"
             )
-            LegendDot(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f), label = "P10-90")
-            LegendDot(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f), label = "IQR")
+            LegendDot(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f), label = stringResource(R.string.report_p10_p90))
+            LegendDot(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f), label = stringResource(R.string.report_iqr_short))
             LegendDot(color = MaterialTheme.colorScheme.primary, label = stringResource(R.string.median))
             LegendDot(color = selectorColor, label = stringResource(R.string.stats_selected))
         }
@@ -2510,7 +2489,7 @@ private fun DailyTrendSparkline(
                 val targetTop = yFor(targets.highMgDl)
                 val targetBottom = yFor(targets.lowMgDl)
                 drawRoundRect(
-                    color = Color(0xFF43A047).copy(alpha = 0.14f),
+                    color = TirInRangeColor.copy(alpha = 0.14f),
                     topLeft = Offset(horizontalPadding, targetTop),
                     size = Size(width, targetBottom - targetTop),
                     cornerRadius = CornerRadius(8.dp.toPx())
@@ -2556,11 +2535,9 @@ private fun DailyTrendSparkline(
                 dailyStats.forEachIndexed { index, day ->
                     val x = xForIndex(index)
                     val y = yFor(day.averageMgDl)
-                    val tone = when {
-                        day.inRangePercent >= 70f -> Color(0xFF2E7D32)
-                        day.inRangePercent >= 50f -> Color(0xFFF9A825)
-                        else -> Color(0xFFD84315)
-                    }
+                    // Same scale as the day-by-day grid, so one day is one colour
+                    // whichever view you look at it in.
+                    val tone = tirHeatColor(day.inRangePercent)
                     drawCircle(
                         color = tone,
                         radius = if (index == safeSelectedIndex) 4.8.dp.toPx() else 3.dp.toPx(),
@@ -2621,9 +2598,9 @@ private fun DailyTrendSparkline(
                 .padding(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            LegendDot(color = Color(0xFF2E7D32), label = ">=70%")
-            LegendDot(color = Color(0xFFF9A825), label = "50-69%")
-            LegendDot(color = Color(0xFFD84315), label = "<50%")
+            LegendDot(color = tirHeatColor(85f), label = "≥${formatLocalePercent(70f)}")
+            LegendDot(color = tirHeatColor(60f), label = "${formatLocalePercent(50f)}–${formatLocalePercent(69f)}")
+            LegendDot(color = tirHeatColor(30f), label = "<${formatLocalePercent(50f)}")
         }
 
         Spacer(modifier = Modifier.height(2.dp))
@@ -2644,7 +2621,7 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
     val resolvedIndex = (selectedIndex ?: sampledPoints.lastIndex).coerceIn(0, sampledPoints.lastIndex)
     val selected = sampledPoints.getOrNull(resolvedIndex) ?: sampledPoints.last()
     val selectedTone by animateColorAsState(
-        targetValue = if (selectedIndex == null) Color(0xFF00838F) else Color(0xFF0277BD),
+        targetValue = if (selectedIndex == null) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary,
         label = "tempSelectedTone"
     )
     val timeLabel = remember(selected.timestamp) {
@@ -2653,7 +2630,7 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
     }
 
     Card(
-        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 28.dp),
+        shape = StatsCardShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainer
         )
@@ -2661,7 +2638,7 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
         Column(
             modifier = Modifier
                 .fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier
@@ -2673,7 +2650,7 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
                         text = stringResource(R.string.stats_temperature_title),
-                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Medium)
+                        style = MaterialTheme.typography.titleLarge
                     )
                     Text(
                         text = if (selectedIndex == null) {
@@ -2687,9 +2664,8 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
                 }
                 Text(
                     text = "${String.format(Locale.getDefault(), "%.1f", selected.temperatureCelsius)} °C",
-                    style = MaterialTheme.typography.headlineMedium.copy(
-                        fontFeatureSettings = "tnum",
-                        fontWeight = FontWeight.SemiBold
+                    style = MaterialTheme.typography.headlineMediumEmphasized.copy(
+                        fontFeatureSettings = "tnum"
                     ),
                     color = selectedTone
                 )
@@ -2719,7 +2695,7 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 TemperatureStat(
                     label = stringResource(R.string.min),
@@ -2737,7 +2713,7 @@ private fun TemperatureOverviewCard(temperaturePoints: List<TemperaturePoint>) {
                     modifier = Modifier.weight(1f)
                 )
             }
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }
@@ -2765,7 +2741,7 @@ private fun TemperatureSparkline(
     }
     var viewportStart by remember(points) { mutableFloatStateOf(0f) }
     var visibleSpan by remember(points, maxVisibleSpan) { mutableFloatStateOf(maxVisibleSpan) }
-    val lineColor = Color(0xFF00838F)
+    val lineColor = MaterialTheme.colorScheme.tertiary
     val selectorColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f)
 
     val clampedViewportStart = { start: Float, span: Float ->
@@ -2919,7 +2895,7 @@ private fun InsightsCard(insights: List<StatsInsight>) {
         exit = fadeOut(animationSpec = tween(180)) + slideOutVertically(targetOffsetY = { it / 5 })
     ) {
         Card(
-            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 26.dp),
+            shape = StatsCardShape,
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceContainerLow
             )
@@ -2928,11 +2904,11 @@ private fun InsightsCard(insights: List<StatsInsight>) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
                     text = stringResource(R.string.insights),
-                    style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold)
+                    style = MaterialTheme.typography.headlineSmallEmphasized
                 )
 
                 Spacer(modifier = Modifier.height(4.dp))
@@ -2953,31 +2929,18 @@ private fun InsightsCard(insights: List<StatsInsight>) {
 
 @Composable
 private fun InsightRow(insight: StatsInsight) {
-    val (bgColor, contentColor, icon) = when (insight.severity) {
-        InsightSeverity.POSITIVE -> Triple(
-            Color(0xFF2E7D32).copy(alpha = 0.16f),
-            Color(0xFF2E7D32),
-            Icons.Default.Shield
-        )
-
-        InsightSeverity.ATTENTION -> Triple(
-            Color(0xFFF9A825).copy(alpha = 0.17f),
-            Color(0xFFF57F17),
-            Icons.Default.WarningAmber
-        )
-
-        InsightSeverity.CAUTION -> Triple(
-            MaterialTheme.colorScheme.errorContainer,
-            MaterialTheme.colorScheme.error,
-            Icons.Default.ErrorOutline
-        )
+    val (contentColor, icon) = when (insight.severity) {
+        InsightSeverity.POSITIVE -> TirInRangeColor to Icons.Default.Shield
+        InsightSeverity.ATTENTION -> TirHighColor to Icons.Default.WarningAmber
+        InsightSeverity.CAUTION -> TirVeryHighColor to Icons.Default.ErrorOutline
     }
+    val bgColor = contentColor.copy(alpha = 0.16f)
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.Top
     ) {
         Surface(
@@ -3001,7 +2964,7 @@ private fun InsightRow(insight: StatsInsight) {
         ) {
             Text(
                 text = insight.title,
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                style = MaterialTheme.typography.titleMediumEmphasized,
                 color = contentColor
             )
             Text(
@@ -3046,7 +3009,7 @@ private fun downsampleTemperaturePoints(
 private fun LegendDot(color: Color, label: String) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(7.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Box(
             modifier = Modifier
@@ -3062,13 +3025,9 @@ private fun LegendDot(color: Color, label: String) {
     }
 }
 
-private fun formatMgDl(valueMgDl: Float, unit: GlucoseUnit): String {
+internal fun formatMgDl(valueMgDl: Float, unit: GlucoseUnit): String {
     return GlucoseFormatter.formatFromMgDl(
         valueMgDl = valueMgDl,
         isMmol = unit == GlucoseUnit.MMOL
     )
-}
-
-private fun unitLabel(unit: GlucoseUnit): String {
-    return if (unit == GlucoseUnit.MMOL) "mmol/L" else "mg/dL"
 }

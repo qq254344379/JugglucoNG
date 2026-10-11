@@ -5,7 +5,9 @@ package tk.glucodata.ui
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.widget.Toast
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatDelegate
@@ -48,6 +50,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
+import tk.glucodata.ui.components.TabScreenDefaults
+import tk.glucodata.ui.components.TabScreenHeader
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.ui.util.findActivity
 import tk.glucodata.ui.util.fullRestart
 import tk.glucodata.ui.util.hardRestart
@@ -62,10 +67,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tk.glucodata.BuildConfig
 import tk.glucodata.DataSmoothing
+import tk.glucodata.HealthConnection
+import tk.glucodata.MainActivity
 import tk.glucodata.Natives
+import tk.glucodata.OutboundApiSettings
 import tk.glucodata.R
 import tk.glucodata.SensorBluetooth
+import tk.glucodata.SensorSourceResolver
+import tk.glucodata.alerts.SensorHandoverRuntime
 import tk.glucodata.data.calibration.CalibrationManager
+import tk.glucodata.data.ScheduledBackupSettings
+import tk.glucodata.data.ScheduledBackupWorker
+import tk.glucodata.drivers.ManagedSensorRuntime
 import tk.glucodata.ui.components.StyledSwitch
 import tk.glucodata.ui.theme.labelLargeExpressive
 import tk.glucodata.ui.viewmodel.DashboardViewModel
@@ -92,60 +105,79 @@ fun ExpressiveSettingsScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val mqAccountState = tk.glucodata.drivers.mq.MQRegistry.loadAccountState(context)
-    val showMqAccount =
-        tk.glucodata.drivers.mq.MQRegistry.persistedRecords(context).isNotEmpty() ||
-            mqAccountState.hasCredentials ||
-            mqAccountState.hasToken ||
-            tk.glucodata.drivers.mq.MQRegistry.isCloudSyncEnabled(context)
+    val sensorStatusRevision by tk.glucodata.UiRefreshBus.revision.collectAsStateWithLifecycle()
+    val showMqAccount = remember(context, sensorStatusRevision) {
+        tk.glucodata.drivers.mq.MQRegistry.persistedRecords(context).isNotEmpty()
+    }
+    // LibreView is relevant whenever the account is already set up *or* a Libre-family
+    // sensor is active — the account no longer has to be configured in the setup wizard first.
+    val showLibreView = remember {
+        runCatching { Natives.getuselibreview() }.getOrDefault(false) ||
+            runCatching { Natives.getlibreAccountIDnumber() }.getOrDefault(0L) > 0L ||
+            hasActiveLibreSensorForLibreView()
+    }
+    val showOttaiSettings = remember {
+        SensorBluetooth.mygatts().any { callback ->
+            (callback as? tk.glucodata.drivers.ottai.OttaiDriver)?.isUiEnabled() == true
+        }
+    }
 
     // States
-    val unit by viewModel.unit.collectAsState()
+    val unit by viewModel.unit.collectAsStateWithLifecycle()
     val isMmol = tk.glucodata.ui.util.GlucoseFormatter.isMmol(unit)
-    val patchedLibreEnabled by viewModel.patchedLibreBroadcastEnabled.collectAsState()
-    val notificationChartEnabled by viewModel.notificationChartEnabled.collectAsState()
-    val chartSmoothingMinutes by viewModel.chartSmoothingMinutes.collectAsState()
-    val dataSmoothingGraphOnly by viewModel.dataSmoothingGraphOnly.collectAsState()
-    val dataSmoothingCollapseChunks by viewModel.dataSmoothingCollapseChunks.collectAsState()
-    val dataSmoothingExchangeOnly by viewModel.dataSmoothingExchangeOnly.collectAsState()
-    val previewWindowMode by viewModel.previewWindowMode.collectAsState()
-    val journalEnabled by viewModel.journalEnabled.collectAsState()
-    val predictiveSimulationEnabled by viewModel.predictiveSimulationEnabled.collectAsState()
-    val predictionTrendMomentumEnabled by viewModel.predictionTrendMomentumEnabled.collectAsState()
-    val predictionCarbRatioGramsPerUnit by viewModel.predictionCarbRatioGramsPerUnit.collectAsState()
-    val predictionInsulinSensitivityMgDlPerUnit by viewModel.predictionInsulinSensitivityMgDlPerUnit.collectAsState()
-    val predictionCarbAbsorptionGramsPerHour by viewModel.predictionCarbAbsorptionGramsPerHour.collectAsState()
-    val predictionHorizonMinutes by viewModel.predictionHorizonMinutes.collectAsState()
-    val alertsSummary by viewModel.alertsSummary.collectAsState()
-    val viewMode by viewModel.viewMode.collectAsState()
+    val patchedLibreEnabled by viewModel.patchedLibreBroadcastEnabled.collectAsStateWithLifecycle()
+    val notificationChartEnabled by viewModel.notificationChartEnabled.collectAsStateWithLifecycle()
+    val chartSmoothingMinutes by viewModel.chartSmoothingMinutes.collectAsStateWithLifecycle()
+    val dataSmoothingGraphOnly by viewModel.dataSmoothingGraphOnly.collectAsStateWithLifecycle()
+    val dataSmoothingCollapseChunks by viewModel.dataSmoothingCollapseChunks.collectAsStateWithLifecycle()
+    val dataSmoothingExchangeOnly by viewModel.dataSmoothingExchangeOnly.collectAsStateWithLifecycle()
+    val journalEnabled by viewModel.journalEnabled.collectAsStateWithLifecycle()
+    val predictiveSimulationEnabled by viewModel.predictiveSimulationEnabled.collectAsStateWithLifecycle()
+    val alertsMasterEnabled by viewModel.alertsMasterEnabled.collectAsStateWithLifecycle()
+    var healthConnectEnabled by rememberSaveable { mutableStateOf(Natives.gethealthConnect()) }
+    val viewMode by viewModel.viewMode.collectAsStateWithLifecycle()
+    val sensorName by viewModel.sensorName.collectAsStateWithLifecycle()
     val isRawCalibrationMode = viewMode == 1 || viewMode == 3
-    val calibrationEnabledRaw by CalibrationManager.isEnabledForRaw.collectAsState()
-    val calibrationEnabledAuto by CalibrationManager.isEnabledForAuto.collectAsState()
-    val calibrationEnabled = if (isRawCalibrationMode) calibrationEnabledRaw else calibrationEnabledAuto
+    val calibrationRevision by CalibrationManager.revision.collectAsStateWithLifecycle()
+    val calibrationEnabled = remember(isRawCalibrationMode, sensorName, calibrationRevision) {
+        CalibrationManager.isEnabledForMode(isRawCalibrationMode, sensorName)
+    }
     val calibrationModeLabel = if (isRawCalibrationMode) "Raw" else "Auto"
-    
+
+    // Rows that carry a master switch read the same state their own screen reads. The
+    // system-granted ones can change while this screen is in the background, so they are
+    // re-read on resume rather than only at first composition.
+    val floatingOverlayEnabled by viewModel.floatingRepository.isEnabled.collectAsStateWithLifecycle(initialValue = false)
+    var floatingOverlayAllowed by remember {
+        mutableStateOf(android.provider.Settings.canDrawOverlays(context))
+    }
+    var aodServiceEnabled by remember { mutableStateOf(isAodAccessibilityEnabled(context)) }
+    val insulinPensEnabled by tk.glucodata.InsulinPenManager.enabled.collectAsStateWithLifecycle()
+    var webServerActive by remember { mutableStateOf(Natives.getusexdripwebserver()) }
+    var nightscoutActive by remember { mutableStateOf(isNightscoutActive(context)) }
+
     // Auto-refresh data when screen becomes active (e.g. returning from Alerts screen)
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 viewModel.refreshData()
+                floatingOverlayAllowed = android.provider.Settings.canDrawOverlays(context)
+                aodServiceEnabled = isAodAccessibilityEnabled(context)
+                webServerActive = Natives.getusexdripwebserver()
+                nightscoutActive = isNightscoutActive(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val hasLowAlarm by viewModel.hasLowAlarm.collectAsState()
-    val lowAlarmValue by viewModel.lowAlarmThreshold.collectAsState()
-    val lowAlarmSoundMode by viewModel.lowAlarmSoundMode.collectAsState()
-    val hasHighAlarm by viewModel.hasHighAlarm.collectAsState()
-    val highAlarmValue by viewModel.highAlarmThreshold.collectAsState()
-    val highAlarmSoundMode by viewModel.highAlarmSoundMode.collectAsState()
-    val graphLowValue by viewModel.graphLow.collectAsState()
-    val graphHighValue by viewModel.graphHigh.collectAsState()
-    val targetLowValue by viewModel.targetLow.collectAsState()
-    val targetHighValue by viewModel.targetHigh.collectAsState()
+    val hasLowAlarm by viewModel.hasLowAlarm.collectAsStateWithLifecycle()
+    val lowAlarmValue by viewModel.lowAlarmThreshold.collectAsStateWithLifecycle()
+    val lowAlarmSoundMode by viewModel.lowAlarmSoundMode.collectAsStateWithLifecycle()
+    val hasHighAlarm by viewModel.hasHighAlarm.collectAsStateWithLifecycle()
+    val highAlarmValue by viewModel.highAlarmThreshold.collectAsStateWithLifecycle()
+    val highAlarmSoundMode by viewModel.highAlarmSoundMode.collectAsStateWithLifecycle()
 
     // Dialog states
     var showUnitDialog by remember { mutableStateOf(false) }
@@ -154,19 +186,38 @@ fun ExpressiveSettingsScreen(
     var showClearHistoryDialog by remember { mutableStateOf(false) }
     var showClearDataDialog by remember { mutableStateOf(false) }
     var showFactoryResetDialog by remember { mutableStateOf(false) }
-    var showPreviewWindowDialog by remember { mutableStateOf(false) }
     var isClearing by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
+    var showScheduledBackupDialog by remember { mutableStateOf(false) }
+    var scheduledBackupConfig by remember {
+        mutableStateOf(ScheduledBackupSettings.load(context))
+    }
+    LaunchedEffect(Unit) {
+        ScheduledBackupWorker.initialize(context)
+    }
     var pendingSettingsImportUri by remember { mutableStateOf<Uri?>(null) }
     var pendingExportPackageImportUri by remember { mutableStateOf<Uri?>(null) }
-    var glucoseRangeExpanded by rememberSaveable { mutableStateOf(false) }
-    var predictiveSimulationExpanded by rememberSaveable { mutableStateOf(false) }
 
 
 
     // Advanced settings
     var turbo by remember { mutableStateOf(Natives.getpriority()) }
     var autoConnect by remember { mutableStateOf(Natives.getAndroid13()) }
+    val handoverPrefs = remember {
+        context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+    }
+    var sensorHandoverEnabled by remember {
+        mutableStateOf(handoverPrefs.getBoolean(SensorHandoverRuntime.PREF_ENABLED, false))
+    }
+    var sensorHandoverAction by remember {
+        mutableStateOf(
+            handoverPrefs.getInt(
+                SensorHandoverRuntime.PREF_OLD_ACTION,
+                SensorHandoverRuntime.OLD_ACTION_DEACTIVATE
+            )
+        )
+    }
+    var showSensorHandoverActionDialog by remember { mutableStateOf(false) }
 
     val currentLocale = AppCompatDelegate.getApplicationLocales().get(0) ?: Locale.getDefault()
     val currentLangName = currentLocale.displayLanguage.replaceFirstChar { it.uppercase() }
@@ -192,25 +243,14 @@ fun ExpressiveSettingsScreen(
             }
         }.joinToString(" · ")
     }
-    val previewWindowLabel = when (previewWindowMode) {
-        1 -> stringResource(R.string.preview_window_always)
-        2 -> stringResource(R.string.preview_window_never)
-        else -> stringResource(R.string.preview_window_expanded_only)
-    }
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding(), // Add status bar padding
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 100.dp)
+        contentPadding = TabScreenDefaults.contentPadding()
     ) {
-        // Title
         item(key = "title") {
-            Text(
-                text = stringResource(R.string.settings),
-                style = MaterialTheme.typography.displaySmall,
-                modifier = Modifier.padding(start = 16.dp, bottom = 24.dp)
-            )
+            TabScreenHeader(title = stringResource(R.string.settings))
         }
 
         item(key = "general_group") {
@@ -240,7 +280,7 @@ fun ExpressiveSettingsScreen(
             val glucoseColor = MaterialTheme.colorScheme.primary
             Column(
                 verticalArrangement = Arrangement.spacedBy(2.dp),
-                modifier = Modifier.padding(top = 10.dp)
+                modifier = Modifier.padding(top = 8.dp)
             ) {
                 SettingsItem(
                     title = stringResource(R.string.unit),
@@ -251,54 +291,65 @@ fun ExpressiveSettingsScreen(
                     onClick = { showUnitDialog = true }
                 )
 
-                GlucoseRangeExpandableSettingsItem(
-                    targetLowValue = targetLowValue,
-                    targetHighValue = targetHighValue,
-                    chartLowValue = graphLowValue,
-                    chartHighValue = graphHighValue,
-                    isMmol = isMmol,
-                    expanded = glucoseRangeExpanded,
-                    onExpandedChange = { glucoseRangeExpanded = it },
-                    onTargetRangeChange = { low, high -> viewModel.setTargetRange(low, high) },
-                    onChartRangeChange = { low, high -> viewModel.setGraphRange(low, high) },
+                SettingsItem(
+                    title = stringResource(R.string.display_colors_title),
+                    subtitle = stringResource(R.string.display_colors_desc),
+                    icon = Icons.Default.Palette,
+                    iconTint = glucoseColor,
+                    position = CardPosition.MIDDLE,
+                    onClick = { navController.navigate("settings/display-colors") }
+                )
+
+                SettingsNavSwitchItem(
+                    title = stringResource(R.string.manual_calibration),
+                    subtitle = "$calibrationModeLabel · ${
+                        stringResource(
+                            if (calibrationEnabled) R.string.enabled_status else R.string.disabled_status
+                        )
+                    }",
+                    checked = calibrationEnabled,
+                    onCheckedChange = {
+                        CalibrationManager.setEnabledForMode(isRawCalibrationMode, it, sensorName)
+                    },
+                    onClick = { navController.navigate("settings/calibrations") },
+                    icon = Icons.Default.WaterDrop,
                     iconTint = glucoseColor,
                     position = CardPosition.MIDDLE
                 )
 
-                ManualCalibrationSettingsItem(
-                    calibrationEnabled = calibrationEnabled,
-                    modeLabel = calibrationModeLabel,
-                    onToggleEnabled = { CalibrationManager.setEnabledForMode(isRawCalibrationMode, it) },
-                    onOpenCalibration = { navController.navigate("settings/calibrations") },
+                SettingsNavSwitchItem(
+                    title = stringResource(R.string.graph_smoothing_title),
+                    subtitle = graphSmoothingLabel,
+                    checked = chartSmoothingMinutes > 0,
+                    onCheckedChange = { viewModel.setDataSmoothingEnabled(it) },
+                    onClick = { navController.navigate("settings/data-smoothing") },
+                    icon = Icons.AutoMirrored.Filled.TrendingUp,
                     iconTint = glucoseColor,
                     position = CardPosition.MIDDLE
                 )
 
-                JournalSettingsItem(
-                    journalEnabled = journalEnabled,
-                    onToggleEnabled = { viewModel.setJournalEnabled(it) },
-                    onOpenJournal = { navController.navigate("settings/journal") },
+                SettingsNavSwitchItem(
+                    title = stringResource(R.string.journal_title),
+                    subtitle = stringResource(
+                        if (journalEnabled) R.string.enabled_status else R.string.disabled_status
+                    ),
+                    checked = journalEnabled,
+                    onCheckedChange = { viewModel.setJournalEnabled(it) },
+                    onClick = { navController.navigate("settings/journal") },
+                    icon = Icons.Default.Vaccines,
                     iconTint = glucoseColor,
                     position = CardPosition.MIDDLE
                 )
 
-                PredictiveSimulationExpandableSettingsItem(
-                    journalEnabled = journalEnabled,
-                    predictiveSimulationEnabled = predictiveSimulationEnabled,
-                    trendMomentumEnabled = predictionTrendMomentumEnabled,
-                    carbRatioGramsPerUnit = predictionCarbRatioGramsPerUnit,
-                    insulinSensitivityMgDlPerUnit = predictionInsulinSensitivityMgDlPerUnit,
-                    carbAbsorptionGramsPerHour = predictionCarbAbsorptionGramsPerHour,
-                    horizonMinutes = predictionHorizonMinutes,
-                    isMmol = isMmol,
-                    expanded = predictiveSimulationExpanded,
-                    onExpandedChange = { predictiveSimulationExpanded = it },
-                    onToggleSimulation = { viewModel.setPredictiveSimulationEnabled(it) },
-                    onToggleTrendMomentum = { viewModel.setPredictionTrendMomentumEnabled(it) },
-                    onCarbRatioChange = { viewModel.setPredictionCarbRatioGramsPerUnit(it) },
-                    onInsulinSensitivityChange = { viewModel.setPredictionInsulinSensitivityMgDlPerUnit(it) },
-                    onCarbAbsorptionChange = { viewModel.setPredictionCarbAbsorptionGramsPerHour(it) },
-                    onHorizonChange = { viewModel.setPredictionHorizonMinutes(it) },
+                SettingsNavSwitchItem(
+                    title = stringResource(R.string.predictive_simulation_title),
+                    subtitle = stringResource(
+                        if (predictiveSimulationEnabled) R.string.enabled_status else R.string.disabled_status
+                    ),
+                    checked = predictiveSimulationEnabled,
+                    onCheckedChange = { viewModel.setPredictiveSimulationEnabled(it) },
+                    onClick = { navController.navigate("settings/predictive-simulation") },
+                    icon = Icons.AutoMirrored.Filled.ShowChart,
                     iconTint = glucoseColor,
                     position = CardPosition.BOTTOM
                 )
@@ -312,14 +363,17 @@ fun ExpressiveSettingsScreen(
             // Theme: Secondary (Accent)
             val notifColor = MaterialTheme.colorScheme.secondary
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                SettingsItem(
+                SettingsNavSwitchItem(
                     title = stringResource(R.string.glucose_alerts_title),
-                    subtitle = alertsSummary,
+                    subtitle = stringResource(
+                        if (alertsMasterEnabled) R.string.global_active else R.string.global_all_alerts_disabled
+                    ),
+                    checked = alertsMasterEnabled,
+                    onCheckedChange = { viewModel.setAlertsMasterEnabled(it) },
+                    onClick = { navController.navigate("settings/alerts") },
                     icon = Icons.Default.AddAlert,
                     iconTint = MaterialTheme.colorScheme.error,
-                    showArrow = true,
                     position = CardPosition.TOP,
-                    onClick = { navController.navigate("settings/alerts") }
                 )
 
                 SettingsItem(
@@ -330,21 +384,53 @@ fun ExpressiveSettingsScreen(
                     position = CardPosition.MIDDLE,
                     onClick = { navController.navigate("settings/notification-display") }
                 )
-                SettingsItem(
+                SettingsNavSwitchItem(
                     title = stringResource(R.string.floatglucose),
-                    subtitle = stringResource(R.string.enable_overlay_desc),
+                    subtitle = when {
+                        !floatingOverlayAllowed -> stringResource(R.string.floating_permission_required)
+                        floatingOverlayEnabled -> stringResource(R.string.enabled_status)
+                        else -> stringResource(R.string.disabled_status)
+                    },
+                    checked = floatingOverlayEnabled,
+                    // The overlay cannot start without the system grant, so the switch
+                    // sends you to give it rather than flipping to a state it can't hold.
+                    onCheckedChange = { enabled ->
+                        if (enabled && !floatingOverlayAllowed) {
+                            context.startActivity(
+                                Intent(
+                                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            )
+                        } else {
+                            viewModel.toggleFloatingGlucose(enabled)
+                        }
+                    },
+                    onClick = { navController.navigate("settings/floating-display") },
                     icon = Icons.Default.PictureInPicture,
                     iconTint = notifColor,
-                    position = CardPosition.MIDDLE,
-                    onClick = { navController.navigate("settings/floating-display") }
+                    position = CardPosition.MIDDLE
                 )
-                SettingsItem(
+                SettingsNavSwitchItem(
                     title = stringResource(R.string.lock_screen_aod),
-                    subtitle = stringResource(R.string.customize_always_on_display),
+                    subtitle = if (aodServiceEnabled) {
+                        stringResource(R.string.accessibility_service_enabled)
+                    } else {
+                        stringResource(R.string.open_accessibility_settings)
+                    },
+                    checked = aodServiceEnabled,
+                    // The lock-screen overlay is an accessibility service: only the system
+                    // settings screen can turn it on or off.
+                    onCheckedChange = {
+                        context.startActivity(
+                            Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    },
+                    onClick = { navController.navigate("settings/aod-display") },
                     icon = Icons.Default.Visibility,
                     iconTint = notifColor,
-                    position = CardPosition.BOTTOM,
-                    onClick = { navController.navigate("settings/aod-display") }
+                    position = CardPosition.BOTTOM
                 )
             }
         }
@@ -361,8 +447,10 @@ fun ExpressiveSettingsScreen(
         item(key = "exchange_group") {
             // Theme: Tertiary (Apps/Services)
             val exchangeColor = MaterialTheme.colorScheme.tertiary
-            val xdripEnabled by viewModel.xDripBroadcastEnabled.collectAsState()
-            val glucodataBroadcastEnabled by viewModel.glucodataBroadcastEnabled.collectAsState()
+            val xdripEnabled by viewModel.xDripBroadcastEnabled.collectAsStateWithLifecycle()
+            val glucodataBroadcastEnabled by viewModel.glucodataBroadcastEnabled.collectAsStateWithLifecycle()
+            val broadcastComputedTrend by viewModel.broadcastComputedTrend.collectAsStateWithLifecycle()
+            val xdripReportAsLibre2 by viewModel.xdripReportAsLibre2.collectAsStateWithLifecycle()
 
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 SettingsSwitchItem(
@@ -383,19 +471,70 @@ fun ExpressiveSettingsScreen(
                     position = CardPosition.MIDDLE,
                     onCheckedChange = { viewModel.toggleXDripBroadcast(it) }
                 )
+                // Only the xDrip-style broadcast carries the source name. Stay visible while
+                // enabled, so turning the broadcast off does not strand the claim out of reach.
+                if (xdripEnabled || xdripReportAsLibre2) {
+                    SettingsSwitchItem(
+                        title = stringResource(R.string.xdrip_report_as_libre2_title),
+                        subtitle = stringResource(R.string.xdrip_report_as_libre2_desc),
+                        checked = xdripReportAsLibre2,
+                        icon = Icons.Default.Badge,
+                        iconTint = exchangeColor,
+                        position = CardPosition.MIDDLE,
+                        onCheckedChange = { viewModel.setXdripReportAsLibre2(it) }
+                    )
+                }
                 SettingsSwitchItem(
                     title = stringResource(R.string.aaps_broadcast),
                     subtitle = stringResource(R.string.glucodata_subtitle),
                     checked = glucodataBroadcastEnabled,
-                    icon = Icons.AutoMirrored.Filled.Send, 
+                    icon = Icons.AutoMirrored.Filled.Send,
                     iconTint = exchangeColor,
                     position = CardPosition.MIDDLE,
                     onCheckedChange = { viewModel.toggleGlucodataBroadcast(it) }
                 )
+                // The computed trend only ever reaches an ExchangeGlucosePayload consumer, so the
+                // row is noise until one of them is on. Stay visible while the setting itself is
+                // enabled, otherwise turning the last consumer off would strand it out of reach.
+                val anyExchangeConsumer = patchedLibreEnabled || xdripEnabled || glucodataBroadcastEnabled ||
+                        OutboundApiSettings.isEnabled() ||
+                        Natives.getgadgetbridge() ||
+                        Natives.getwatchdrip()
+                if (anyExchangeConsumer || broadcastComputedTrend) {
+                    SettingsSwitchItem(
+                        title = stringResource(R.string.broadcast_computed_trend_title),
+                        subtitle = stringResource(R.string.broadcast_computed_trend_desc),
+                        checked = broadcastComputedTrend,
+                        icon = Icons.AutoMirrored.Filled.TrendingUp,
+                        iconTint = exchangeColor,
+                        position = CardPosition.MIDDLE,
+                        onCheckedChange = { viewModel.setBroadcastComputedTrend(it) }
+                    )
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    SettingsSwitchItem(
+                        title = stringResource(R.string.health_connect_title),
+                        subtitle = stringResource(R.string.health_connect_desc),
+                        checked = healthConnectEnabled,
+                        icon = Icons.Default.HealthAndSafety,
+                        iconTint = exchangeColor,
+                        position = CardPosition.MIDDLE,
+                        onCheckedChange = { enabled ->
+                            Natives.sethealthConnect(enabled)
+                            healthConnectEnabled = enabled
+                            if (enabled) {
+                                MainActivity.tryHealth = 5
+                                (context.findActivity() as? MainActivity)?.let(HealthConnection::init)
+                            } else {
+                                MainActivity.tryHealth = 0
+                                HealthConnection.stop()
+                            }
+                        }
+                    )
+                }
                 SettingsItem(
                     title = stringResource(R.string.outbound_api_title),
                     subtitle = stringResource(R.string.outbound_api_desc),
-                    showArrow = true,
                     icon = Icons.Default.CloudUpload,
                     iconTint = exchangeColor,
                     position = CardPosition.MIDDLE,
@@ -404,28 +543,31 @@ fun ExpressiveSettingsScreen(
                 SettingsItem(
                     title = stringResource(R.string.mirror),
                     subtitle = stringResource(R.string.mirror_desc),
-                    showArrow = true,
                     icon = Icons.Default.Devices,
                     iconTint = exchangeColor,
                     position = CardPosition.MIDDLE,
                     onClick = { navController.navigate("settings/mirror") }
                 )
                 // Edit 67b: Determine if LibreView is visible to adjust card positions
-                val showLibreView = Natives.getuselibreview() || Natives.getlibreAccountIDnumber() > 0L
-                SettingsItem(
+                SettingsNavSwitchItem(
                     title = stringResource(R.string.nightscout_config),
-                    subtitle = stringResource(R.string.nightscout_desc),
-                    showArrow = true,
+                    subtitle = stringResource(
+                        if (nightscoutActive) R.string.enabled_status else R.string.disabled_status
+                    ),
+                    checked = nightscoutActive,
+                    onCheckedChange = {
+                        setNightscoutActive(context, it)
+                        nightscoutActive = it
+                    },
+                    onClick = { navController.navigate("settings/nightscout") },
                     icon = Icons.Default.CloudUpload,
                     iconTint = exchangeColor,
-                    position = CardPosition.MIDDLE,
-                    onClick = { navController.navigate("settings/nightscout") }
+                    position = CardPosition.MIDDLE
                 )
                 if (showLibreView) {
                     SettingsItem(
                         title = stringResource(R.string.libreview_config),
                         subtitle = stringResource(R.string.libreview_desc),
-                        showArrow = true,
                         icon = Icons.Default.Cloud,
                         iconTint = exchangeColor,
                         position = CardPosition.MIDDLE,
@@ -436,30 +578,64 @@ fun ExpressiveSettingsScreen(
                     SettingsItem(
                         title = stringResource(R.string.mq_account_title),
                         subtitle = stringResource(R.string.mq_account_linked_desc),
-                        showArrow = true,
                         icon = Icons.Default.Cloud,
                         iconTint = exchangeColor,
                         position = CardPosition.MIDDLE,
                         onClick = { navController.navigate("settings/mq-account") }
                     )
                 }
+                if (showOttaiSettings) {
+                    SettingsItem(
+                        title = stringResource(R.string.ottai_setup_title),
+                        subtitle = stringResource(R.string.ottai_settings_desc),
+                        icon = Icons.Default.Sensors,
+                        iconTint = exchangeColor,
+                        position = CardPosition.MIDDLE,
+                        onClick = { navController.navigate("settings/ottai") }
+                    )
+                }
+                SettingsItem(
+                    title = stringResource(R.string.meterlist),
+                    subtitle = stringResource(R.string.glucose_meters_desc),
+                    icon = Icons.Default.Bloodtype,
+                    iconTint = exchangeColor,
+                    position = CardPosition.MIDDLE,
+                    onClick = { navController.navigate("settings/glucose-meters") }
+                )
+                SettingsNavSwitchItem(
+                    title = stringResource(R.string.insulin_pens_title),
+                    subtitle = stringResource(
+                        if (insulinPensEnabled) R.string.enabled_status else R.string.disabled_status
+                    ),
+                    checked = insulinPensEnabled,
+                    onCheckedChange = { tk.glucodata.InsulinPenManager.setEnabled(it) },
+                    onClick = { navController.navigate("settings/insulin-pens") },
+                    icon = Icons.Default.Vaccines,
+                    iconTint = exchangeColor,
+                    position = CardPosition.MIDDLE
+                )
                 SettingsItem(
                     title = stringResource(R.string.watches),
                     subtitle = "WearOS, Watchdrip, GadgetBridge, Kerfstok",
-                    showArrow = true,
                     icon = Icons.Default.Devices,
                     iconTint = exchangeColor,
                     position = CardPosition.MIDDLE,
                     onClick = { navController.navigate("settings/watch") }
                 )
-                SettingsItem(
+                SettingsNavSwitchItem(
                     title = stringResource(R.string.webserver),
-                    subtitle = stringResource(R.string.web_server_desc),
-                    showArrow = true,
+                    subtitle = stringResource(
+                        if (webServerActive) R.string.enabled_status else R.string.disabled_status
+                    ),
+                    checked = webServerActive,
+                    onCheckedChange = {
+                        Natives.setusexdripwebserver(it)
+                        webServerActive = it
+                    },
+                    onClick = { navController.navigate("settings/webserver") },
                     icon = Icons.Default.Language,
                     iconTint = exchangeColor,
-                    position = CardPosition.BOTTOM,
-                    onClick = { navController.navigate("settings/webserver") }
+                    position = CardPosition.BOTTOM
                 )
             }
         }
@@ -488,28 +664,35 @@ fun ExpressiveSettingsScreen(
                     position = CardPosition.MIDDLE,
                     onCheckedChange = { SensorBluetooth.setAutoconnect(it); autoConnect = it }
                 )
-                SettingsItem(
-                    title = stringResource(R.string.graph_smoothing_title),
-                    subtitle = graphSmoothingLabel,
-                    showArrow = true,
-                    icon = Icons.AutoMirrored.Filled.TrendingUp,
+                SettingsSwitchItem(
+                    title = stringResource(R.string.sensor_handover_title),
+                    subtitle = stringResource(R.string.sensor_handover_desc),
+                    checked = sensorHandoverEnabled,
+                    icon = Icons.Default.SwapHoriz,
                     iconTint = advColor,
                     position = CardPosition.MIDDLE,
-                    onClick = { navController.navigate("settings/data-smoothing") }
+                    onCheckedChange = {
+                        handoverPrefs.edit().putBoolean(SensorHandoverRuntime.PREF_ENABLED, it).apply()
+                        sensorHandoverEnabled = it
+                    }
                 )
-                SettingsItem(
-                    title = stringResource(R.string.preview_window_title),
-                    subtitle = previewWindowLabel,
-                    showArrow = true,
-                    icon = Icons.Default.CropSquare,
-                    iconTint = advColor,
-                    position = CardPosition.MIDDLE,
-                    onClick = { showPreviewWindowDialog = true }
-                )
+                if (sensorHandoverEnabled) {
+                    SettingsItem(
+                        title = stringResource(R.string.sensor_handover_old_action_title),
+                        subtitle = if (sensorHandoverAction == SensorHandoverRuntime.OLD_ACTION_REMOVE) {
+                            stringResource(R.string.sensor_handover_action_remove)
+                        } else {
+                            stringResource(R.string.sensor_handover_action_deactivate)
+                        },
+                        icon = Icons.Default.DeleteSweep,
+                        iconTint = advColor,
+                        position = CardPosition.MIDDLE,
+                        onClick = { showSensorHandoverActionDialog = true }
+                    )
+                }
                 SettingsItem(
                     title = stringResource(R.string.cgm_readiness_title),
                     subtitle = stringResource(R.string.cgm_readiness_settings_desc),
-                    showArrow = true,
                     icon = Icons.Default.Security,
                     iconTint = advColor,
                     position = CardPosition.MIDDLE,
@@ -518,7 +701,6 @@ fun ExpressiveSettingsScreen(
                 SettingsItem(
                     title = stringResource(R.string.debug_logs),
                     subtitle = stringResource(R.string.debug_logs_desc),
-                    showArrow = true,
                     icon = Icons.Default.BugReport,
                     iconTint = advColor,
                     position = CardPosition.BOTTOM,
@@ -538,26 +720,25 @@ fun ExpressiveSettingsScreen(
                 onResult = { uri ->
                     if (uri != null) {
                         scope.launch {
-                            if (tk.glucodata.data.SettingsExporter.isSettingsExport(context, uri)) {
-                                withContext(Dispatchers.Main) {
-                                    pendingSettingsImportUri = uri
+                            when (tk.glucodata.data.ExportPackageExporter.detectImportFileType(context, uri)) {
+                                tk.glucodata.data.ExportPackageExporter.ImportFileType.SETTINGS -> {
+                                    withContext(Dispatchers.Main) { pendingSettingsImportUri = uri }
                                 }
-                            } else if (tk.glucodata.data.ExportPackageExporter.isExportPackage(context, uri)) {
-                                withContext(Dispatchers.Main) {
-                                    pendingExportPackageImportUri = uri
+                                tk.glucodata.data.ExportPackageExporter.ImportFileType.EXPORT_PACKAGE -> {
+                                    withContext(Dispatchers.Main) { pendingExportPackageImportUri = uri }
                                 }
-                            } else {
-                                // Show loading? For now just toast result
-                                val result = tk.glucodata.data.HistoryExporter.importFromCsv(context, uri)
-                                withContext(Dispatchers.Main) {
-                                    val msg = if (result.success)
-                                        context.getString(R.string.imported_readings_count, result.successCount)
-                                    else
-                                        context.getString(
-                                            R.string.import_failed_with_error,
-                                            result.errorMessage ?: context.getString(R.string.unknown_error)
-                                        )
-                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                tk.glucodata.data.ExportPackageExporter.ImportFileType.OTHER -> {
+                                    val result = tk.glucodata.data.HistoryExporter.importFromCsv(context, uri)
+                                    withContext(Dispatchers.Main) {
+                                        val msg = if (result.success)
+                                            context.getString(R.string.imported_readings_count, result.successCount)
+                                        else
+                                            context.getString(
+                                                R.string.import_failed_with_error,
+                                                result.errorMessage ?: context.getString(R.string.unknown_error)
+                                            )
+                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    }
                                 }
                             }
                         }
@@ -565,12 +746,27 @@ fun ExpressiveSettingsScreen(
                 }
             )
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                AppUpdatesSettingsItem(
+                    iconTint = dataColor,
+                    position = CardPosition.TOP,
+                    onOpen = { navController.navigate("settings/app-updates") }
+                )
+
+                SettingsItem(
+                    title = stringResource(R.string.scheduled_backup_title),
+                    subtitle = scheduledBackupSummary(scheduledBackupConfig),
+                    icon = Icons.Default.Backup,
+                    iconTint = dataColor,
+                    position = CardPosition.MIDDLE,
+                    onClick = { showScheduledBackupDialog = true }
+                )
+
                 SettingsItem(
                     title = stringResource(R.string.export_data_settings),
                     subtitle = stringResource(R.string.export_data_settings_desc),
                     icon = androidx.compose.material.icons.Icons.Default.CloudUpload,
                     iconTint = dataColor,
-                    position = CardPosition.TOP,
+                    position = CardPosition.MIDDLE,
                     onClick = { showExportDialog = true }
                 )
 
@@ -579,10 +775,44 @@ fun ExpressiveSettingsScreen(
                     subtitle = stringResource(R.string.import_data_settings_desc),
                     icon = Icons.Default.FolderOpen,
                     iconTint = dataColor,
-                    position = CardPosition.BOTTOM,
+                    position = CardPosition.MIDDLE,
                     onClick = { 
-                        importLauncher.launch(arrayOf("application/json", "text/*", "text/csv", "*/*"))
+                        importLauncher.launch(
+                            arrayOf(
+                                "application/json",
+                                "application/gzip",
+                                "application/zstd",
+                                "text/*",
+                                "text/csv",
+                                "text/tab-separated-values",
+                                "*/*"
+                            )
+                        )
                     }
+                )
+
+                // A reading's displayed value is a record, not a derivation —
+                // see tk.glucodata.data.ReadingDisplay. Its subtitle carries the
+                // current behaviour so the common question is answered in place.
+                val freezeDisplayedValues by tk.glucodata.data.calibration.CalibrationManager
+                    .freezeDisplayedValues.collectAsStateWithLifecycle()
+                SettingsSwitchItem(
+                    title = stringResource(R.string.freeze_displayed_values),
+                    subtitle = stringResource(
+                        if (freezeDisplayedValues) {
+                            R.string.freeze_displayed_values_on
+                        } else {
+                            R.string.freeze_displayed_values_off
+                        }
+                    ),
+                    checked = freezeDisplayedValues,
+                    onCheckedChange = {
+                        tk.glucodata.data.calibration.CalibrationManager
+                            .setFreezeDisplayedValues(it)
+                    },
+                    icon = Icons.Default.Lock,
+                    iconTint = dataColor,
+                    position = CardPosition.BOTTOM
                 )
             }
         }
@@ -638,7 +868,8 @@ fun ExpressiveSettingsScreen(
             ) {
                 Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(stringResource(R.string.about_text), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
+                // ui-guardrails: allow text_literal - a version number, the same in every language
                 Text(
                     text = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
                     style = MaterialTheme.typography.labelMedium,
@@ -655,13 +886,14 @@ fun ExpressiveSettingsScreen(
         context.findActivity()?.hardRestart() 
     }, { showUnitDialog = false })
     if (showThemeDialog) ThemePickerDialog(themeMode, { onThemeChanged(it); showThemeDialog = false }, { showThemeDialog = false })
-    if (showPreviewWindowDialog) PreviewWindowPickerDialog(
-        currentMode = previewWindowMode,
+    if (showSensorHandoverActionDialog) SensorHandoverActionPickerDialog(
+        currentAction = sensorHandoverAction,
         onSelect = {
-            viewModel.setPreviewWindowMode(it)
-            showPreviewWindowDialog = false
+            handoverPrefs.edit().putInt(SensorHandoverRuntime.PREF_OLD_ACTION, it).apply()
+            sensorHandoverAction = it
+            showSensorHandoverActionDialog = false
         },
-        onDismiss = { showPreviewWindowDialog = false }
+        onDismiss = { showSensorHandoverActionDialog = false }
     )
     if (showLanguageDialog) LanguagePickerDialog { showLanguageDialog = false }
     if (showClearHistoryDialog) ConfirmActionDialog(stringResource(R.string.clean_history_confirm), stringResource(R.string.clear_history_desc_long), Icons.Filled.History, { scope.launch { tk.glucodata.data.DataManagement.clearHistory() }; showClearHistoryDialog = false }, { showClearHistoryDialog = false })
@@ -696,10 +928,18 @@ fun ExpressiveSettingsScreen(
     )
     
     if (showExportDialog) {
-        val sheetState = rememberModalBottomSheetState()
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ExportDataSettingsSheet(
             onDismiss = { showExportDialog = false },
             sheetState = sheetState
+        )
+    }
+    if (showScheduledBackupDialog) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ScheduledBackupSettingsSheet(
+            onDismiss = { showScheduledBackupDialog = false },
+            sheetState = sheetState,
+            onConfigurationChanged = { scheduledBackupConfig = it }
         )
     }
     pendingSettingsImportUri?.let { uri ->
@@ -760,10 +1000,16 @@ fun ExpressiveSettingsScreen(
                                 },
                                 Toast.LENGTH_LONG
                             ).show()
-                            if (summary.restartRequired) {
-                                context.findActivity()?.fullRestart()
+                            if (summary.historyReadings > 0) {
+                                // Pin the imported serial for display (when idle) so the
+                                // dashboard chart shows the imported glucose. Persisted, so
+                                // it survives the restart below.
+                                viewModel.onHistoryImported(summary.historyDisplaySerial)
                             } else {
                                 viewModel.refreshData()
+                            }
+                            if (summary.restartRequired) {
+                                context.findActivity()?.fullRestart()
                             }
                         } else {
                             Toast.makeText(
@@ -787,589 +1033,96 @@ fun ExpressiveSettingsScreen(
 
 }
 
+
 @Composable
-private fun SettingsLeadingIcon(
-    icon: ImageVector,
-    tint: Color
+fun PredictiveSimulationSettingsScreen(
+    navController: NavController,
+    viewModel: DashboardViewModel
 ) {
-    Surface(
-        modifier = Modifier.size(40.dp),
-        shape = RoundedCornerShape(12.dp),
-        color = tint.copy(alpha = 0.12f)
-    ) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = tint,
-                modifier = Modifier.size(24.dp)
+    val journalEnabled by viewModel.journalEnabled.collectAsStateWithLifecycle()
+    val predictiveSimulationEnabled by viewModel.predictiveSimulationEnabled.collectAsStateWithLifecycle()
+    val notificationChartPredictionEnabled by viewModel.predictiveSimulationNotificationChartEnabled.collectAsStateWithLifecycle()
+    val trendMomentumEnabled by viewModel.predictionTrendMomentumEnabled.collectAsStateWithLifecycle()
+    val modelProfile by viewModel.predictionModelProfile.collectAsStateWithLifecycle()
+    val horizonMinutes by viewModel.predictionHorizonMinutes.collectAsStateWithLifecycle()
+
+    Scaffold(
+        contentWindowInsets = WindowInsets(0.dp),
+        topBar = {
+            AppTopBar(
+                title = stringResource(R.string.predictive_simulation_title),
+                onNavigateBack = { navController.popBackStack() },
             )
         }
-    }
-}
-
-@Composable
-private fun GlucoseRangeExpandableSettingsItem(
-    targetLowValue: Float,
-    targetHighValue: Float,
-    chartLowValue: Float,
-    chartHighValue: Float,
-    isMmol: Boolean,
-    expanded: Boolean,
-    onExpandedChange: (Boolean) -> Unit,
-    onTargetRangeChange: (Float, Float) -> Unit,
-    onChartRangeChange: (Float, Float) -> Unit,
-    iconTint: Color,
-    position: CardPosition
-) {
-    val valueStep = if (isMmol) 0.1f else 1f
-    val targetLowBounds = if (isMmol) 2.0f..8.0f else 40f..140f
-    val targetHighBounds = if (isMmol) 6.0f..16.0f else 100f..350f
-    val chartLowBounds = if (isMmol) 0.0f..12.0f else 0f..216f
-    val chartHighBounds = if (isMmol) 4.0f..30.0f else 72f..540f
-    val normalizedTargetLow = clampLowerRangeValue(
-        value = targetLowValue,
-        upperValue = targetHighValue,
-        bounds = targetLowBounds,
-        step = valueStep,
-        isMmol = isMmol
-    )
-    val normalizedTargetHigh = clampUpperRangeValue(
-        value = targetHighValue,
-        lowerValue = normalizedTargetLow,
-        bounds = targetHighBounds,
-        step = valueStep,
-        isMmol = isMmol
-    )
-    val normalizedChartLow = clampLowerRangeValue(
-        value = chartLowValue,
-        upperValue = chartHighValue,
-        bounds = chartLowBounds,
-        step = valueStep,
-        isMmol = isMmol
-    )
-    val normalizedChartHigh = clampUpperRangeValue(
-        value = chartHighValue,
-        lowerValue = normalizedChartLow,
-        bounds = chartHighBounds,
-        step = valueStep,
-        isMmol = isMmol
-    )
-    val chevronRotation by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "glucoseRangeChevron"
-    )
-    var targetLowSlider by remember(targetLowValue, targetHighValue, isMmol) {
-        mutableFloatStateOf(normalizedTargetLow)
-    }
-    var targetHighSlider by remember(targetLowValue, targetHighValue, isMmol) {
-        mutableFloatStateOf(normalizedTargetHigh)
-    }
-    var chartLowSlider by remember(chartLowValue, chartHighValue, isMmol) {
-        mutableFloatStateOf(normalizedChartLow)
-    }
-    var chartHighSlider by remember(chartLowValue, chartHighValue, isMmol) {
-        mutableFloatStateOf(normalizedChartHigh)
-    }
-
-    val targetSummary = remember(targetLowSlider, targetHighSlider, isMmol) {
-        formatRangeSummary(targetLowSlider, targetHighSlider, isMmol)
-    }
-    val chartSummary = remember(chartLowSlider, chartHighSlider, isMmol) {
-        formatRangeSummary(chartLowSlider, chartHighSlider, isMmol)
-    }
-    val targetShortTitle = stringResource(R.string.target_short_title)
-    val chartShortTitle = stringResource(R.string.chart_short_title)
-    val targetTitle = stringResource(R.string.target_range_title)
-    val chartTitle = stringResource(R.string.chart_limits_title)
-    val collapsedSummary = remember(targetShortTitle, chartShortTitle, targetSummary, chartSummary) {
-        "$targetShortTitle $targetSummary • $chartShortTitle $chartSummary"
-    }
-
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = cardShape(position),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh
-    ) {
-        Column {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onExpandedChange(!expanded) }
-                    .padding(horizontal = 16.dp, vertical = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                SettingsLeadingIcon(icon = Icons.Default.TrackChanges, tint = iconTint)
-                Spacer(modifier = Modifier.width(12.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = stringResource(R.string.glucose_range_title),
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Text(
-                        modifier = Modifier.padding(top = 2.dp),
-                        text = collapsedSummary,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Icon(
-                    imageVector = Icons.Default.ExpandMore,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.graphicsLayer { rotationZ = chevronRotation }
-                )
-            }
-
-            AnimatedVisibility(
-                visible = expanded,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut()
-            ) {
-                Column {
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-
-                    Column(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        GlucoseRangeEditorSection(
-                            title = targetTitle,
-                            lowLabel = stringResource(R.string.low_label),
-                            highLabel = stringResource(R.string.high_label),
-                            lowValue = targetLowSlider,
-                            highValue = targetHighSlider,
-                            lowBounds = targetLowBounds,
-                            highBounds = targetHighBounds,
-                            isMmol = isMmol,
-                            onLowValueChange = { candidate ->
-                                targetLowSlider = clampLowerRangeValue(
-                                    value = candidate,
-                                    upperValue = targetHighSlider,
-                                    bounds = targetLowBounds,
-                                    step = valueStep,
-                                    isMmol = isMmol
-                                )
-                            },
-                            onHighValueChange = { candidate ->
-                                targetHighSlider = clampUpperRangeValue(
-                                    value = candidate,
-                                    lowerValue = targetLowSlider,
-                                    bounds = targetHighBounds,
-                                    step = valueStep,
-                                    isMmol = isMmol
-                                )
-                            },
-                            onLowValueChangeFinished = {
-                                onTargetRangeChange(targetLowSlider, targetHighSlider)
-                            },
-                            onHighValueChangeFinished = {
-                                onTargetRangeChange(targetLowSlider, targetHighSlider)
-                            }
-                        )
-
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-
-                        GlucoseRangeEditorSection(
-                            title = chartTitle,
-                            lowLabel = stringResource(R.string.low_label),
-                            highLabel = stringResource(R.string.high_label),
-                            lowValue = chartLowSlider,
-                            highValue = chartHighSlider,
-                            lowBounds = chartLowBounds,
-                            highBounds = chartHighBounds,
-                            isMmol = isMmol,
-                            onLowValueChange = { candidate ->
-                                chartLowSlider = clampLowerRangeValue(
-                                    value = candidate,
-                                    upperValue = chartHighSlider,
-                                    bounds = chartLowBounds,
-                                    step = valueStep,
-                                    isMmol = isMmol
-                                )
-                            },
-                            onHighValueChange = { candidate ->
-                                chartHighSlider = clampUpperRangeValue(
-                                    value = candidate,
-                                    lowerValue = chartLowSlider,
-                                    bounds = chartHighBounds,
-                                    step = valueStep,
-                                    isMmol = isMmol
-                                )
-                            },
-                            onLowValueChangeFinished = {
-                                onChartRangeChange(chartLowSlider, chartHighSlider)
-                            },
-                            onHighValueChangeFinished = {
-                                onChartRangeChange(chartLowSlider, chartHighSlider)
-                            }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun GlucoseRangeEditorSection(
-    title: String,
-    lowLabel: String,
-    highLabel: String,
-    lowValue: Float,
-    highValue: Float,
-    lowBounds: ClosedFloatingPointRange<Float>,
-    highBounds: ClosedFloatingPointRange<Float>,
-    isMmol: Boolean,
-    onLowValueChange: (Float) -> Unit,
-    onHighValueChange: (Float) -> Unit,
-    onLowValueChangeFinished: () -> Unit,
-    onHighValueChangeFinished: () -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.SemiBold
-        )
-        Text(
-            text = "$lowLabel: ${formatRangeValue(lowValue, isMmol)}",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Slider(
-            value = lowValue,
-            onValueChange = onLowValueChange,
-            onValueChangeFinished = onLowValueChangeFinished,
-            valueRange = lowBounds
-        )
-        Text(
-            text = "$highLabel: ${formatRangeValue(highValue, isMmol)}",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Slider(
-            value = highValue,
-            onValueChange = onHighValueChange,
-            onValueChangeFinished = onHighValueChangeFinished,
-            valueRange = highBounds
-        )
-    }
-}
-
-private fun formatRangeSummary(lowValue: Float, highValue: Float, isMmol: Boolean): String {
-    return "${formatRangeValue(lowValue, isMmol)}-${formatRangeValue(highValue, isMmol)}"
-}
-
-private fun formatRangeValue(value: Float, isMmol: Boolean): String {
-    return if (isMmol) {
-        String.format(Locale.getDefault(), "%.1f", value)
-    } else {
-        value.roundToInt().toString()
-    }
-}
-
-private fun clampLowerRangeValue(
-    value: Float,
-    upperValue: Float,
-    bounds: ClosedFloatingPointRange<Float>,
-    step: Float,
-    isMmol: Boolean
-): Float {
-    val maxValue = minOf(bounds.endInclusive, upperValue - step)
-    if (maxValue < bounds.start) {
-        return snapRangeValue(bounds.start, isMmol)
-    }
-    return snapRangeValue(value, isMmol).coerceIn(bounds.start, maxValue)
-}
-
-private fun clampUpperRangeValue(
-    value: Float,
-    lowerValue: Float,
-    bounds: ClosedFloatingPointRange<Float>,
-    step: Float,
-    isMmol: Boolean
-): Float {
-    val minValue = maxOf(bounds.start, lowerValue + step)
-    if (minValue > bounds.endInclusive) {
-        return snapRangeValue(bounds.endInclusive, isMmol)
-    }
-    return snapRangeValue(value, isMmol).coerceIn(minValue, bounds.endInclusive)
-}
-
-private fun snapRangeValue(value: Float, isMmol: Boolean): Float {
-    return if (isMmol) {
-        (value * 10f).roundToInt() / 10f
-    } else {
-        value.roundToInt().toFloat()
-    }
-}
-
-@Composable
-private fun ManualCalibrationSettingsItem(
-    calibrationEnabled: Boolean,
-    modeLabel: String,
-    onToggleEnabled: (Boolean) -> Unit,
-    onOpenCalibration: () -> Unit,
-    iconTint: Color,
-    position: CardPosition
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        onClick = onOpenCalibration,
-        shape = cardShape(position),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh
-    ) {
-        Row(
+    ) { padding ->
+        LazyColumn(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .fillMaxSize()
+                .padding(padding),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            SettingsLeadingIcon(icon = Icons.Default.WaterDrop, tint = iconTint)
-            Spacer(modifier = Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = stringResource(R.string.manual_calibration),
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Text(
-                    text = "$modeLabel - ${if (calibrationEnabled) "active" else "paused"}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1
+            item(key = "master") {
+                MasterSwitchCard(
+                    title = stringResource(R.string.predictive_simulation_title),
+                    subtitle = stringResource(R.string.predictive_simulation_summary),
+                    checked = predictiveSimulationEnabled,
+                    onCheckedChange = { viewModel.setPredictiveSimulationEnabled(it) },
+                    icon = Icons.AutoMirrored.Filled.ShowChart,
+                    iconTint = MaterialTheme.colorScheme.primary
                 )
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.ChevronRight,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                VerticalDivider(
-                    modifier = Modifier.height(30.dp),
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                StyledSwitch(
-                    checked = calibrationEnabled,
-                    onCheckedChange = onToggleEnabled
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun JournalSettingsItem(
-    journalEnabled: Boolean,
-    onToggleEnabled: (Boolean) -> Unit,
-    onOpenJournal: () -> Unit,
-    iconTint: Color,
-    position: CardPosition
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        onClick = onOpenJournal,
-        shape = cardShape(position),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            SettingsLeadingIcon(icon = Icons.Default.Vaccines, tint = iconTint)
-            Spacer(modifier = Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = stringResource(R.string.journal_title),
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Text(
-                    text = stringResource(if (journalEnabled) R.string.enabled_status else R.string.disabled_status),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1
-                )
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.ChevronRight,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                VerticalDivider(
-                    modifier = Modifier.height(30.dp),
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                StyledSwitch(
-                    checked = journalEnabled,
-                    onCheckedChange = onToggleEnabled
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun PredictiveSimulationExpandableSettingsItem(
-    journalEnabled: Boolean,
-    predictiveSimulationEnabled: Boolean,
-    trendMomentumEnabled: Boolean,
-    carbRatioGramsPerUnit: Float,
-    insulinSensitivityMgDlPerUnit: Float,
-    carbAbsorptionGramsPerHour: Float,
-    horizonMinutes: Int,
-    isMmol: Boolean,
-    expanded: Boolean,
-    onExpandedChange: (Boolean) -> Unit,
-    onToggleSimulation: (Boolean) -> Unit,
-    onToggleTrendMomentum: (Boolean) -> Unit,
-    onCarbRatioChange: (Float) -> Unit,
-    onInsulinSensitivityChange: (Float) -> Unit,
-    onCarbAbsorptionChange: (Float) -> Unit,
-    onHorizonChange: (Int) -> Unit,
-    iconTint: Color,
-    position: CardPosition
-) {
-    val chevronRotation by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "predictiveSimulationChevron"
-    )
-    val insulinSensitivityDisplay = remember(insulinSensitivityMgDlPerUnit, isMmol) {
-        tk.glucodata.ui.util.GlucoseFormatter.displayFromMgDl(insulinSensitivityMgDlPerUnit, isMmol)
-    }
-    val sensitivityValue = if (isMmol) {
-        stringResource(R.string.predictive_sensitivity_value_mmol, insulinSensitivityDisplay)
-    } else {
-        stringResource(R.string.predictive_sensitivity_value_mgdl, insulinSensitivityMgDlPerUnit)
-    }
-    val sensitivityRange = if (isMmol) 0.6f..10f else 10f..180f
-
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = cardShape(position),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh
-    ) {
-        Column {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onExpandedChange(!expanded) }
-                    .padding(horizontal = 16.dp, vertical = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                SettingsLeadingIcon(icon = Icons.AutoMirrored.Filled.ShowChart, tint = iconTint)
-                Spacer(modifier = Modifier.width(12.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = stringResource(R.string.predictive_simulation_title),
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Text(
-                        modifier = Modifier.padding(top = 2.dp),
-                        text = stringResource(R.string.predictive_simulation_summary),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.ExpandMore,
-                        contentDescription = stringResource(
-                            if (expanded) R.string.collapse_action else R.string.expand_action
-                        ),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.graphicsLayer { rotationZ = chevronRotation }
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    VerticalDivider(
-                        modifier = Modifier.height(30.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    StyledSwitch(
-                        checked = predictiveSimulationEnabled,
-                        onCheckedChange = onToggleSimulation
-                    )
-                }
-            }
-
-            AnimatedVisibility(
-                visible = expanded,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut()
-            ) {
-                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-                    PredictiveSimulationSubToggleRow(
+            item(key = "behavior") {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    SettingsSwitchItem(
                         title = stringResource(R.string.predictive_trend_momentum),
                         checked = trendMomentumEnabled,
-                        enabled = predictiveSimulationEnabled,
-                        onCheckedChange = onToggleTrendMomentum,
-                        modifier = Modifier.padding(vertical = 4.dp)
+                        onCheckedChange = { viewModel.setPredictionTrendMomentumEnabled(it) },
+                        position = CardPosition.TOP,
+                        enabled = predictiveSimulationEnabled
                     )
-                    if (journalEnabled) {
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.42f))
-                        Text(
-                            text = stringResource(R.string.predictive_model_tuning),
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(top = 14.dp, bottom = 2.dp)
-                        )
-                        PredictiveSimulationParameterRow(
-                            title = stringResource(R.string.predictive_carb_ratio),
-                            valueLabel = stringResource(R.string.predictive_carb_ratio_value, carbRatioGramsPerUnit),
-                            value = carbRatioGramsPerUnit,
-                            valueRange = 3f..30f,
-                            enabled = predictiveSimulationEnabled,
-                            onValueChange = onCarbRatioChange
-                        )
-                        PredictiveSimulationParameterRow(
-                            title = stringResource(R.string.predictive_insulin_sensitivity),
-                            valueLabel = sensitivityValue,
-                            value = insulinSensitivityDisplay,
-                            valueRange = sensitivityRange,
-                            enabled = predictiveSimulationEnabled,
-                            onValueChange = { displayValue ->
-                                onInsulinSensitivityChange(
-                                    if (isMmol) tk.glucodata.ui.util.GlucoseFormatter.mmolToMg(displayValue) else displayValue
-                                )
-                            }
-                        )
-                        PredictiveSimulationParameterRow(
-                            title = stringResource(R.string.predictive_carb_absorption),
-                            valueLabel = stringResource(R.string.predictive_absorption_value, carbAbsorptionGramsPerHour),
-                            value = carbAbsorptionGramsPerHour,
-                            valueRange = 10f..90f,
-                            enabled = predictiveSimulationEnabled,
-                            onValueChange = onCarbAbsorptionChange
-                        )
-                    }
+                    SettingsSwitchItem(
+                        title = stringResource(R.string.predictive_notification_chart),
+                        subtitle = stringResource(R.string.predictive_notification_chart_summary),
+                        checked = notificationChartPredictionEnabled,
+                        onCheckedChange = { viewModel.setPredictiveSimulationNotificationChartEnabled(it) },
+                        position = CardPosition.BOTTOM,
+                        enabled = predictiveSimulationEnabled
+                    )
+                }
+            }
+
+            item(key = "horizon") {
+                PredictiveSimulationSettingsCard(enabled = predictiveSimulationEnabled) {
                     PredictiveSimulationParameterRow(
                         title = stringResource(R.string.predictive_forecast_horizon),
                         valueLabel = stringResource(R.string.predictive_horizon_value, horizonMinutes),
                         value = horizonMinutes.toFloat(),
                         valueRange = 30f..360f,
                         enabled = predictiveSimulationEnabled,
-                        onValueChange = { onHorizonChange(it.roundToInt()) }
+                        onValueChange = { viewModel.setPredictionHorizonMinutes(it.roundToInt()) }
+                    )
+                }
+            }
+
+            if (journalEnabled) {
+                item(key = "model") {
+                    SettingsItem(
+                        title = stringResource(R.string.predictive_model_tuning),
+                        subtitle = if (modelProfile.blocks.size == 1) {
+                            stringResource(R.string.predictive_model_profile_summary_single)
+                        } else {
+                            stringResource(
+                                R.string.predictive_model_profile_summary_count,
+                                modelProfile.blocks.size
+                            )
+                        },
+                        onClick = {
+                            navController.navigate("settings/predictive-simulation/model-profile")
+                        },
+                        icon = Icons.Default.Schedule,
+                        iconTint = MaterialTheme.colorScheme.secondary
                     )
                 }
             }
@@ -1378,7 +1131,26 @@ private fun PredictiveSimulationExpandableSettingsItem(
 }
 
 @Composable
-private fun PredictiveSimulationParameterRow(
+private fun PredictiveSimulationSettingsCard(
+    enabled: Boolean,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .alpha(if (enabled) 1f else 0.66f),
+        shape = cardShape(CardPosition.SINGLE),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            content = content
+        )
+    }
+}
+
+@Composable
+internal fun PredictiveSimulationParameterRow(
     title: String,
     valueLabel: String,
     value: Float,
@@ -1416,476 +1188,6 @@ private fun PredictiveSimulationParameterRow(
     }
 }
 
-@Composable
-private fun PredictiveSimulationSubToggleRow(
-    title: String,
-    checked: Boolean,
-    enabled: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .alpha(if (enabled) 1f else 0.5f)
-            .clickable(enabled = enabled) { onCheckedChange(!checked) }
-            .padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.weight(1f)
-        )
-        StyledSwitch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            enabled = enabled
-        )
-    }
-}
-
-@Composable
-fun NotificationSettingsSheet(
-    onDismiss: () -> Unit,
-    sheetState: SheetState,
-    context: android.content.Context,
-    viewModel: DashboardViewModel
-) {
-    val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
-    val notificationChartEnabled by viewModel.notificationChartEnabled.collectAsState()
-    
-    // Font Settings
-    var fontSize by remember { mutableFloatStateOf(prefs.getFloat("notification_font_size", 1.0f)) }
-    var fontType by remember { mutableIntStateOf(prefs.getInt("notification_font_family", 0)) } // 0=App, 1=System
-    var fontWeight by remember { mutableIntStateOf(prefs.getInt("notification_font_weight", 400)) }
-    
-    // Arrow Settings
-    var showArrow by remember { mutableStateOf(prefs.getBoolean("notification_show_arrow", true)) }
-    var arrowSize by remember { mutableFloatStateOf(prefs.getFloat("notification_arrow_size", 1.0f)) }
-    
-    // Visibility Toggles
-    var showStatus by remember { mutableStateOf(prefs.getBoolean("notification_show_status", true)) }
-    var hideStatusIcon by remember { mutableStateOf(prefs.getBoolean("notification_hide_status_icon", false)) }
-    var statusIconScale by remember { mutableFloatStateOf(prefs.getFloat("notification_status_icon_scale", 1.0f)) }
-    var collapsedChart by remember { mutableStateOf(prefs.getBoolean("notification_chart_collapsed", false)) }
-    var showTargetRange by remember { mutableStateOf(prefs.getBoolean("notification_chart_target_range", true)) }
-    
-    val scope = rememberCoroutineScope()
-    fun save() {
-        scope.launch {
-            prefs.edit()
-                 .putFloat("notification_font_size", fontSize)
-                 .putInt("notification_font_family", fontType)
-                 .putInt("notification_font_weight", fontWeight)
-                 .putBoolean("notification_show_arrow", showArrow)
-                 .putFloat("notification_arrow_size", arrowSize)
-                 .putBoolean("notification_show_status", showStatus)
-                 .putBoolean("notification_hide_status_icon", hideStatusIcon)
-                 .putFloat("notification_status_icon_scale", statusIconScale)
-                 .putBoolean("notification_chart_collapsed", collapsedChart)
-                 .putBoolean("notification_chart_target_range", showTargetRange)
-                 .apply()
-        }
-    }
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        dragHandle = { BottomSheetDefaults.DragHandle() },
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 32.dp)
-                .verticalScroll(rememberScrollState(50))
-        ) {
-            Text(
-                "Notification Settings",
-                style = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
-            )
-
-
-
-            // === FONT SECTION ===
-            SectionLabel("Font", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
-            
-            // Font Family Toggle
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(horizontal = 24.dp)) {
-                FilterChip(
-                    selected = fontType == 0,
-                    onClick = { fontType = 0; save() },
-                    label = { Text(stringResource(R.string.font_app_plex)) }
-//                    leadingIcon = { if(fontType == 0) Icon(Icons.Filled.Check, null) }
-                )
-                FilterChip(
-                    selected = fontType == 1,
-                    onClick = { fontType = 1; save() },
-                    label = { Text(stringResource(R.string.font_system_google_sans)) }
-//                    leadingIcon = { if(fontType == 1) Icon(Icons.Filled.Check, null) }
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-
-            // Font Weight - only on Android 12+ (API 31) where RemoteViews supports setFontVariationSettings
-            if (android.os.Build.VERSION.SDK_INT >= 31) {
-                Text(stringResource(R.string.font_weight_label), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 24.dp,  vertical = 0.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    // Simplified Options: Regular (400) and Medium (500)
-                    FilterChip(
-                        selected = fontWeight == 300,
-                        onClick = { fontWeight = 300; save() },
-                        label = { Text(stringResource(R.string.theme_light)) }
-//                        leadingIcon = { if(fontWeight == 300) Icon(Icons.Filled.Check, null) }
-                    )
-                    FilterChip(
-                        selected = fontWeight == 400,
-                        onClick = { fontWeight = 400; save() },
-                        label = { Text(stringResource(R.string.regular)) }
-//                        leadingIcon = { if(fontWeight == 400) Icon(Icons.Filled.Check, null) }
-                    )
-                    FilterChip(
-                        selected = fontWeight == 500,
-                        onClick = { fontWeight = 500; save() },
-                        label = { Text(stringResource(R.string.medium)) }
-//                        leadingIcon = { if(fontWeight == 500) Icon(Icons.Filled.Check, null) }
-                    )
-                }
-            }
-//            Spacer(Modifier.height(16.dp))
-
-//            SectionLabel("Size", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
-            Spacer(Modifier.height(4.dp))
-
-            SliderControl(
-                label = "Font Size: ${(fontSize * 100).toInt()}%",
-                value = fontSize,
-                onValueChange = { fontSize = it; save() },
-                range = 0.6f..1.5f
-            )
-            Spacer(Modifier.height(4.dp))
-
-            SliderControl(
-                label = "Status Bar Icon Size: ${(statusIconScale * 100).toInt()}%",
-                value = statusIconScale,
-                onValueChange = { statusIconScale = it; save() },
-                range = 0.0f..1.25f
-//                    steps = 50
-            )
-        }
-//        Spacer(Modifier.height(8.dp))
-           // === ARROW SECTION ===
-//            Spacer(Modifier.height(8.dp))
-//            SectionLabel("Trend Arrow", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
-            // === VISIBILITY SECTION ===
-//            Spacer(Modifier.height(16.dp))
-//            SectionLabel("Elements", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
-//            SettingsSwitchItem(
-//                title = "Show Status Text",
-//                subtitle = "Sensor connection status",
-//                checked = showStatus,
-//                onCheckedChange = { showStatus = it; save() },
-//                icon = null,
-//                position = CardPosition.TOP
-//            Column(
-//                    Modifier.fillMaxWidth().padding(horizontal = 24.dp,  vertical = 0.dp)
-//                ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp),
-                    modifier = Modifier.padding(horizontal = 24.dp)) {
-                SettingsSwitchItem(
-                    title = "Show Trend Arrow",
-                    checked = showArrow,
-                    onCheckedChange = { showArrow = it; save() },
-                    icon = null,
-                    position = CardPosition.TOP
-                )
-
-                if (showArrow) {
-                    Spacer(Modifier.height(4.dp))
-
-                    SliderControl(
-                        label = "Arrow Size: ${(arrowSize * 100).toInt()}%",
-                        value = arrowSize,
-                        onValueChange = { arrowSize = it; save() },
-                        range = 0.5f..1.5f
-                    )
-                    Spacer(Modifier.height(4.dp))
-
-                }
-                SettingsSwitchItem(
-                    title = "Show Chart (Expanded)",
-                    subtitle = "Chart when notification is expanded",
-                    checked = notificationChartEnabled,
-                    onCheckedChange = { viewModel.toggleNotificationChart(it) },
-                    icon = null,
-                    position = CardPosition.MIDDLE
-                )
-
-                SettingsSwitchItem(
-                    title = "Show Chart (Collapsed)",
-                    subtitle = "Compact chart in collapsed view",
-                    checked = collapsedChart,
-                    onCheckedChange = { collapsedChart = it; save() },
-                    icon = null,
-                    position = CardPosition.MIDDLE
-                )
-
-                SettingsSwitchItem(
-                    title = "Show Target Range",
-                    subtitle = "Highlight target glucose range on chart",
-                    checked = showTargetRange,
-                    onCheckedChange = { showTargetRange = it; save() },
-                    icon = null,
-                    position = CardPosition.BOTTOM
-                )
-                //            SettingsSwitchItem(
-//                title = "Hide Status Bar Icon",
-//                subtitle = "Use transparent icon (minimize clutter)",
-//                checked = hideStatusIcon,
-//                onCheckedChange = { hideStatusIcon = it; save() },
-//                icon = null,
-//                position = CardPosition.MIDDLE
-//            )
-                //            if (!hideStatusIcon) {
-
-//            }
-//            Spacer(Modifier.height(16.dp))
-
-            }
-        }
-    }
-
-
-@Composable
-fun AODSettingsSheet(onDismiss: () -> Unit, sheetState: SheetState, context: android.content.Context) {
-    val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
-    
-    var opacity by remember { mutableFloatStateOf(prefs.getFloat("aod_opacity", 1.0f)) }
-    var textScale by remember { mutableFloatStateOf(prefs.getFloat("aod_text_scale", 1.5f)) }
-    var chartScale by remember { mutableFloatStateOf(prefs.getFloat("aod_chart_scale", 1.5f)) }
-    var showChart by remember { mutableStateOf(prefs.getBoolean("aod_show_chart", true)) }
-    var showArrow by remember { mutableStateOf(prefs.getBoolean("aod_show_arrow", true)) }
-    var arrowScale by remember { mutableFloatStateOf(prefs.getFloat("aod_arrow_scale", 1.0f)) }
-    
-    // Position: Multi-select stored as Set<String>
-    var positions by remember { 
-        mutableStateOf(prefs.getStringSet("aod_positions", setOf("TOP")) ?: setOf("TOP")) 
-    }
-
-    // Alignment: Single select (LEFT, CENTER, RIGHT)
-    var alignment by remember { mutableStateOf(prefs.getString("aod_alignment", "CENTER") ?: "CENTER") }
-
-    // FONT VISUALS
-    var fontSource by remember { mutableStateOf(prefs.getString("aod_font_source", "APP") ?: "APP") }
-    var fontWeight by remember { mutableIntStateOf(prefs.getInt("aod_font_weight", 400)) }
-
-    // Auto-save logic scope
-    val scope = rememberCoroutineScope()
-    fun save() {
-        scope.launch {
-            prefs.edit()
-                 .putFloat("aod_opacity", opacity)
-                 .putFloat("aod_text_scale", textScale)
-                 .putFloat("aod_chart_scale", chartScale)
-                 .putBoolean("aod_show_chart", showChart)
-                 .putBoolean("aod_show_arrow", showArrow)
-                 .putFloat("aod_arrow_scale", arrowScale)
-                 .putStringSet("aod_positions", positions)
-                 .putString("aod_alignment", alignment)
-                 .putString("aod_font_source", fontSource)
-                 .putInt("aod_font_weight", fontWeight)
-                 .apply()
-        }
-    }
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        dragHandle = { BottomSheetDefaults.DragHandle() },
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 32.dp)
-                .verticalScroll(rememberScrollState())
-        ) {
-            Text(
-                "AOD Settings",
-                style = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
-            )
-
-            // Enable Button
-            SettingsItem(
-                title = "Enable Overlay service",
-                subtitle = "Opens Accessibility Settings",
-                icon = Icons.Default.SettingsAccessibility,
-                position = CardPosition.SINGLE,
-                onClick = {
-                    val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                },
-                modifier = Modifier.padding(horizontal = 16.dp)
-            )
-
-            // === VISUALS SECTION ===
-            Text(stringResource(R.string.visuals), style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
-
-            // FONT SOURCE
-            Text(stringResource(R.string.font_source), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                 FilterChip(
-                     selected = fontSource == "APP",
-                     onClick = { fontSource = "APP"; save() },
-                     label = { Text(stringResource(R.string.font_app_plex)) }
-                 )
-                 FilterChip(
-                     selected = fontSource == "SYSTEM",
-                     onClick = { fontSource = "SYSTEM"; save() },
-                     label = { Text(stringResource(R.string.font_system_google_sans)) }
-                 )
-            }
-
-            // FONT WEIGHT
-            Text(stringResource(R.string.font_weight_label), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                 FilterChip(
-                     selected = fontWeight == 300,
-                     onClick = { fontWeight = 300; save() },
-                     label = { Text(stringResource(R.string.theme_light)) }
-                 )
-                 FilterChip(
-                     selected = fontWeight == 400,
-                     onClick = { fontWeight = 400; save() },
-                     label = { Text(stringResource(R.string.regular)) }
-                 )
-                 FilterChip(
-                     selected = fontWeight == 500,
-                     onClick = { fontWeight = 500; save() },
-                     label = { Text(stringResource(R.string.medium)) }
-                 )
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            
-            Spacer(Modifier.height(16.dp))
-            SectionLabel("Layout", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
-
-            // Multi-Position Selection
-            Text(stringResource(R.string.active_positions_randomized), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                 listOf("TOP", "CENTER", "BOTTOM").forEach { pos ->
-                     FilterChip(
-                         selected = positions.contains(pos),
-                         onClick = { 
-                             val newSet = positions.toMutableSet()
-                             if (newSet.contains(pos)) {
-                                 if (newSet.size > 1) newSet.remove(pos) // Prevent empty set
-                             } else {
-                                 newSet.add(pos)
-                             }
-                             positions = newSet
-                             save()
-                         },
-                         label = { Text(pos) },
-                         leadingIcon = if (positions.contains(pos)) {
-                             { Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }
-                         } else null
-                     )
-                 }
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // Alignment Selection
-            Text(stringResource(R.string.text_alignment), style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                 listOf("LEFT", "CENTER", "RIGHT").forEach { align ->
-                     FilterChip(
-                         selected = alignment == align,
-                         onClick = { alignment = align; save() },
-                         label = { Text(align) },
-                         leadingIcon = null // Radio behavior essentially
-                     )
-                 }
-            }
-            
-            Spacer(Modifier.height(24.dp))
-            SectionLabel("Appearance", topPadding = 0.dp, modifier = Modifier.padding(horizontal = 24.dp))
-
-            // Toggles Group
-            SettingsSwitchItem(
-                title = "Show Chart",
-                checked = showChart,
-                onCheckedChange = { showChart = it; save() },
-                icon = null,
-                position = CardPosition.TOP
-            )
-            SettingsSwitchItem(
-                title = "Show Trend Arrow",
-                checked = showArrow,
-                onCheckedChange = { showArrow = it; save() },
-                icon = null,
-                position = CardPosition.BOTTOM
-            )
-
-            // Opacity
-            SliderControl(
-                label = "Opacity: ${(opacity * 100).toInt()}%",
-                value = opacity,
-                onValueChange = { opacity = it; save() },
-                range = 0.1f..1.0f
-            )
-
-            // Text Scale
-            SliderControl(
-                label = "Text Size: ${(textScale * 100).toInt()}%",
-                value = textScale,
-                onValueChange = { textScale = it; save() },
-                range = 0.5f..3.0f
-            )
-
-            // Chart Scale
-            if (showChart) {
-                SliderControl(
-                    label = "Chart Size: ${(chartScale * 100).toInt()}%",
-                    value = chartScale,
-                    onValueChange = { chartScale = it; save() },
-                    range = 0.5f..2.0f
-                )
-            }
-
-            // Arrow Scale
-            if (showArrow) {
-                SliderControl(
-                    label = "Arrow Size: ${(arrowScale * 100).toInt()}%",
-                    value = arrowScale,
-                    onValueChange = { arrowScale = it; save() },
-                    range = 0.5f..2.0f
-                )
-            }
-        }
-    }
-}
-
 // Components moved to tk.glucodata.ui.components.SettingsComponents.kt
 
 // ============================================================================
@@ -1906,7 +1208,7 @@ private fun UnitPickerDialog(isMmol: Boolean, onSelect: (Int) -> Unit, onDismiss
                     style = MaterialTheme.typography.headlineSmall,
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
                 )
-                listOf(stringResource(R.string.unit_mg) to 0, stringResource(R.string.unit_mmol) to 1).forEach { (label, value) ->
+                listOf(stringResource(R.string.unit_mg) to 2, stringResource(R.string.unit_mmol) to 1).forEach { (label, value) ->
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -1915,7 +1217,7 @@ private fun UnitPickerDialog(isMmol: Boolean, onSelect: (Int) -> Unit, onDismiss
                             .padding(horizontal = 24.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        RadioButton(selected = (if (isMmol) 1 else 0) == value, onClick = null)
+                        RadioButton(selected = (if (isMmol) 1 else 2) == value, onClick = null)
                         Spacer(Modifier.width(16.dp))
                         Text(label, style = MaterialTheme.typography.bodyLarge)
                     }
@@ -1972,7 +1274,62 @@ private fun ThemePickerDialog(current: ThemeMode, onSelect: (ThemeMode) -> Unit,
 }
 
 @Composable
-private fun PreviewWindowPickerDialog(
+private fun SensorHandoverActionPickerDialog(
+    currentAction: Int,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val options = listOf(
+        stringResource(R.string.sensor_handover_action_deactivate) to SensorHandoverRuntime.OLD_ACTION_DEACTIVATE,
+        stringResource(R.string.sensor_handover_action_remove) to SensorHandoverRuntime.OLD_ACTION_REMOVE
+    )
+    BasicAlertDialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = MaterialTheme.shapes.extraLarge,
+            tonalElevation = 6.dp,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh
+        ) {
+            Column(modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)) {
+                Text(
+                    text = stringResource(R.string.sensor_handover_old_action_title),
+                    style = MaterialTheme.typography.headlineSmall,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+                )
+                Text(
+                    text = stringResource(R.string.sensor_handover_old_action_desc),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
+                )
+                options.forEach { (label, value) ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 56.dp)
+                            .clickable { onSelect(value) }
+                            .padding(horizontal = 24.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(selected = currentAction == value, onClick = null)
+                        Spacer(Modifier.width(16.dp))
+                        Text(label, style = MaterialTheme.typography.bodyLarge)
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun PreviewWindowPickerDialog(
     currentMode: Int,
     onSelect: (Int) -> Unit,
     onDismiss: () -> Unit
@@ -2036,12 +1393,14 @@ private fun LanguagePickerDialog(onDismiss: () -> Unit) {
         "Chinese" to "zh",
         "German" to "de",
         "French" to "fr",
+        "Hungarian" to "hu",
         "Italian" to "it",
         "Dutch" to "nl",
         "Polish" to "pl",
         "Portuguese" to "pt",
         "Russian" to "ru",
         "Swedish" to "sv",
+        "Somali" to "so",
         "Turkish" to "tr",
         "Ukrainian" to "uk",
         "Mongolian" to "mn",
@@ -2118,3 +1477,26 @@ private fun ConfirmActionDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) } }
     )
 }
+
+/**
+ * True when a currently active sensor is genuinely a Libre 2 / Libre 3.
+ *
+ * Deliberately does NOT reuse the native Libre check used for NFC readiness:
+ * native `isLibre2()`/`isLibre3()` are defined by *exclusion* (anything that is
+ * not AccuChek/Sibionics/Dexcom is reported as Libre), so Kotlin-driver sensors
+ * such as Ottai — which have no native family flag but are mirrored into the
+ * native glucose stream — come back as "Libre". Here we require a positive
+ * LIBRE2/LIBRE3 kind and additionally drop any sensor claimed by a managed
+ * Kotlin BLE driver.
+ */
+private fun hasActiveLibreSensorForLibreView(): Boolean = runCatching {
+    Natives.activeSensors()?.filterNotNull().orEmpty().any { sensorId ->
+        // Owned by a Kotlin BLE driver (Ottai, MQ, iCan, AiDex, Anytime, Sibionics) -> not Libre.
+        val managed = runCatching { ManagedSensorRuntime.resolveDriver(sensorId) }.getOrNull()
+        if (managed != null) return@any false
+        val kind = runCatching {
+            SensorSourceResolver.resolveSensorKind(sensorId, SensorSourceResolver.SENSOR_KIND_UNKNOWN)
+        }.getOrDefault(SensorSourceResolver.SENSOR_KIND_UNKNOWN)
+        kind == SensorSourceResolver.SENSOR_KIND_LIBRE2 || kind == SensorSourceResolver.SENSOR_KIND_LIBRE3
+    }
+}.getOrDefault(false)

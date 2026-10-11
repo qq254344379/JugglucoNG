@@ -353,7 +353,10 @@ struct Tings {
   union {
     struct {
       BroadcastListeners<2> librelinkBroadcast;
-      BroadcastListeners<3> everSenseBroadcast;
+      // Was the EverSense broadcast, removed. The slot stays: this struct is
+      // mmap'd straight off disk, so dropping it would shift every field
+      // after it and misread existing settings files.
+      BroadcastListeners<3> unusedBroadcast3;
       BroadcastListeners<10> xdripBroadcast;
       BroadcastListeners<10> glucodataBroadcast;
     };
@@ -443,6 +446,13 @@ struct Tings {
     if (!meter)
       meter = self.newGlucoseMeter(deviceName);
     return meter;
+  }
+  // Settings files written before httpport was populated leave it zero. The
+  // desktop build has always read this field; on Android the port was hardcoded
+  // at the call sites instead, so an install upgrading into an editable port
+  // must not be told the server runs on port 0.
+  uint16_t effectivehttpport() const {
+    return httpport ? httpport : static_cast<uint16_t>(defaulthttpport);
   }
   void defaultshows() {
     showcalibrated = false;

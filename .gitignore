@@ -17,6 +17,8 @@ local.properties
 
 # Keystores (keep them private)
 *.jks
+*.keystore
+/.local/
 
 # Misc
 *.iml
@@ -40,6 +42,12 @@ lint/generated/
 # Kotlin
 *.kotlin_module
 
+# Compiled JVM artifacts
+*.class
+
+# Local agent scratch reports
+.claude-scratch-*_report.md
+
 # Crash logs
 hs_err_pid*
 
@@ -49,3 +57,12 @@ hs_err_pid*
 out/
 tmp/
 Common/printmappingout.txt
+
+# Android Studio "Generate Signed APK" wizard output (Destination Folder)
+/Common/mobileGoogle/
+/Common/mobile/
+/Common/wear/
+/update-manifest.json
+
+__pycache__/
+*.pyc

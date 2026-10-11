@@ -10,25 +10,12 @@ import tk.glucodata.data.journal.journalFoodTailDurationMinutes
 import tk.glucodata.data.journal.journalFoodTailEquivalentCarbs
 import tk.glucodata.ui.GlucosePoint
 import tk.glucodata.ui.util.GlucoseFormatter
+import java.util.TimeZone
 import kotlin.math.exp
 import kotlin.math.sqrt
 
-data class GlucosePredictionPoint(
-    val timestamp: Long,
-    val value: Float,
-    val confidence: Float
-)
-
-enum class GlucosePredictionSeriesKind {
-    RAW,
-    AUTO,
-    CALIBRATED
-}
-
-data class GlucosePredictionSeries(
-    val kind: GlucosePredictionSeriesKind,
-    val points: List<GlucosePredictionPoint>
-)
+// GlucosePredictionPoint / GlucosePredictionSeries[Kind] now live beside the
+// kernel in src/main so the watch can name them too.
 
 data class PredictiveSimulationSettings(
     val enabled: Boolean,
@@ -38,8 +25,19 @@ data class PredictiveSimulationSettings(
     val carbRatioGramsPerUnit: Float = 10f,
     val insulinSensitivityMgDlPerUnit: Float = 54f,
     val carbAbsorptionGramsPerHour: Float = 35f,
-    val foodMacrosEnabled: Boolean = false
-)
+    val foodMacrosEnabled: Boolean = false,
+    val modelProfile: PredictionModelProfile? = null,
+    val profileTimeZone: TimeZone = TimeZone.getDefault()
+) {
+    fun modelParametersAt(timestamp: Long): PredictionModelParameters {
+        return modelProfile?.parametersAt(timestamp, profileTimeZone)
+            ?: PredictionModelParameters(
+                carbRatioGramsPerUnit = carbRatioGramsPerUnit,
+                insulinSensitivityMgDlPerUnit = insulinSensitivityMgDlPerUnit,
+                carbAbsorptionGramsPerHour = carbAbsorptionGramsPerHour
+            )
+    }
+}
 
 fun buildGlucosePrediction(
     history: List<GlucosePoint>,
@@ -57,88 +55,43 @@ fun buildGlucosePrediction(
     if (baselineTime <= 0L) return emptyList()
 
     val isMmol = GlucoseFormatter.isMmol(unit)
-    val sensitivity = GlucoseFormatter.displayFromMgDl(settings.insulinSensitivityMgDlPerUnit, isMmol)
-    val safeCarbRatio = settings.carbRatioGramsPerUnit.coerceAtLeast(1f)
-    val safeAbsorption = settings.carbAbsorptionGramsPerHour.coerceAtLeast(5f)
-    val stepMinutes = settings.stepMinutes.coerceIn(3, 15)
     val horizonMinutes = settings.horizonMinutes.coerceIn(30, 360)
-    val trendSlopePerMinute = if (settings.trendMomentumEnabled) {
-        recentTrendSlopePerMinute(history, baselineTime).let { slope ->
-            val maxSlope = if (isMmol) 0.16f else 3f
-            slope.coerceIn(-maxSlope, maxSlope)
-        }
-    } else {
-        0f
-    }
-    val targetCenter = ((targetLow + targetHigh) * 0.5f).takeIf { it.isFinite() && it > 0f }
-        ?: baseline.value
     val relevantEntries = journalEntries.filter { entry ->
         entry.timestamp in (baselineTime - 36L * 60L * 60L * 1000L)..(baselineTime + horizonMinutes * 60_000L)
     }
 
-    fun projectedDeltaAt(timestamp: Long): Float {
-        val minutesFuture = ((timestamp - baselineTime) / 60_000f).coerceAtLeast(0f)
-        val trend = trendSlopePerMinute * minutesFuture * exp(-minutesFuture / 70f)
-        val settling = (targetCenter - baseline.value) * (1f - exp(-minutesFuture / 240f)) * 0.18f
-        val journalDelta = relevantEntries.sumOf { entry ->
-            entry.projectedDisplayDelta(
-                atMillis = timestamp,
-                baselineMillis = baselineTime,
-                sensitivityDisplay = sensitivity,
-                carbRatioGramsPerUnit = safeCarbRatio,
-                carbAbsorptionGramsPerHour = safeAbsorption,
-                foodMacrosEnabled = settings.foodMacrosEnabled,
-                insulinPresetsById = insulinPresetsById
-            ).toDouble()
-        }.toFloat()
-        return trend + settling + journalDelta
-    }
+    fun journalDeltaAt(timestamp: Long): Float = relevantEntries.sumOf { entry ->
+        val profile = settings.modelParametersAt(entry.timestamp)
+        entry.projectedDisplayDelta(
+            atMillis = timestamp,
+            baselineMillis = baselineTime,
+            sensitivityDisplay = GlucoseFormatter.displayFromMgDl(
+                profile.insulinSensitivityMgDlPerUnit,
+                isMmol
+            ),
+            carbRatioGramsPerUnit = profile.carbRatioGramsPerUnit.coerceAtLeast(1f),
+            carbAbsorptionGramsPerHour = profile.carbAbsorptionGramsPerHour.coerceIn(
+                PredictionModelProfile.CARB_ABSORPTION_MIN,
+                PredictionModelProfile.CARB_ABSORPTION_MAX
+            ),
+            foodMacrosEnabled = settings.foodMacrosEnabled,
+            insulinPresetsById = insulinPresetsById
+        ).toDouble()
+    }.toFloat()
 
-    val lowClamp = if (isMmol) 1.0f else 18f
-    val highClamp = if (isMmol) 30f else 540f
-    return buildList {
-        add(GlucosePredictionPoint(baselineTime, baseline.value, confidence = 1f))
-        var minute = stepMinutes
-        while (minute <= horizonMinutes) {
-            val timestamp = baselineTime + minute * 60_000L
-            val progress = minute.toFloat() / horizonMinutes.toFloat()
-            val confidence = (0.88f - 0.62f * sqrt(progress)).coerceIn(0.18f, 0.88f)
-            val value = (baseline.value + projectedDeltaAt(timestamp)).coerceIn(lowClamp, highClamp)
-            add(
-                GlucosePredictionPoint(
-                    timestamp = timestamp,
-                    value = value,
-                    confidence = confidence
-                )
-            )
-            minute += stepMinutes
-        }
-    }
-}
-
-private fun recentTrendSlopePerMinute(history: List<GlucosePoint>, baselineTime: Long): Float {
-    val recent = history
-        .asReversed()
-        .asSequence()
-        .filter { it.timestamp <= baselineTime && baselineTime - it.timestamp <= 45L * 60L * 1000L }
-        .filter { it.value.isFinite() && it.value > 0.1f }
-        .take(10)
-        .toList()
-        .asReversed()
-    if (recent.size < 2) return 0f
-
-    val firstTime = recent.first().timestamp
-    val xMean = recent.map { (it.timestamp - firstTime) / 60_000f }.average().toFloat()
-    val yMean = recent.map { it.value }.average().toFloat()
-    var numerator = 0f
-    var denominator = 0f
-    recent.forEach { point ->
-        val x = (point.timestamp - firstTime) / 60_000f
-        val dx = x - xMean
-        numerator += dx * (point.value - yMean)
-        denominator += dx * dx
-    }
-    return if (denominator > 0.001f) numerator / denominator else 0f
+    // The forward simulation is shared with the watch; only the treatment
+    // model above is phone-specific, because only the phone holds the rich
+    // journal it reads.
+    return GlucosePredictionKernel.simulate(
+        history = history.map { GlucosePredictionKernel.Sample(it.timestamp, it.value) },
+        isMmol = isMmol,
+        trendMomentumEnabled = settings.trendMomentumEnabled,
+        horizonMinutes = settings.horizonMinutes,
+        stepMinutes = settings.stepMinutes,
+        targetLow = targetLow,
+        targetHigh = targetHigh,
+        journalDeltaAt = ::journalDeltaAt
+    )
 }
 
 private fun JournalEntry.projectedDisplayDelta(
@@ -177,9 +130,11 @@ private fun JournalEntry.projectedDisplayDelta(
         JournalEntryType.INSULIN -> {
             val units = amount?.takeIf { it > 0f } ?: return 0f
             val preset = insulinPresetId?.let(insulinPresetsById::get) ?: return 0f
-            if (preset.isArchived || !preset.countsTowardIob) return 0f
-            val futureAction = cumulativeCurveFraction(preset.curvePoints, timestamp, atMillis)
-            val baselineAction = cumulativeCurveFraction(preset.curvePoints, timestamp, baselineMillis)
+            if (!preset.countsTowardIob) return 0f
+            val snapshot = tk.glucodata.data.journal.parseJournalCurve(insulinCurveJsonSnapshot)
+            val points = if (snapshot.size >= 2) snapshot else preset.curvePoints
+            val futureAction = cumulativeCurveFraction(points, timestamp, atMillis)
+            val baselineAction = cumulativeCurveFraction(points, timestamp, baselineMillis)
             -(units * sensitivityDisplay * (futureAction - baselineAction))
         }
         JournalEntryType.ACTIVITY -> {

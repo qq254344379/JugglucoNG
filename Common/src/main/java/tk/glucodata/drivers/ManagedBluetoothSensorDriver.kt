@@ -4,6 +4,7 @@ import android.content.Context
 
 data class ManagedSensorCurrentSnapshot(
     val timeMillis: Long,
+    /** Glucose in the user's current display unit (mmol/L or mg/dL). */
     val glucoseValue: Float,
     val rawGlucoseValue: Float = Float.NaN,
     val calibratedGlucoseValue: Float = Float.NaN,
@@ -31,12 +32,28 @@ enum class ManagedSensorCalibrationSource {
     ANYTIME,
 }
 
-enum class ManagedSensorUiFamily {
-    GENERIC,
-    MQ,
-    AIDEX,
-    ICAN,
-    ANYTIME,
+enum class ManagedSensorUiFamily(
+    /**
+     * What the native info block stores for this family (three bits, 0 = unknown).
+     * Fixed here rather than taken from ordinal(), because the value is on disk
+     * and travels to other phones over Clone: reordering the enum must not
+     * relabel anyone's sensor.
+     */
+    val nativeCode: Int,
+) {
+    GENERIC(0),
+    MQ(1),
+    AIDEX(2),
+    ICAN(3),
+    ANYTIME(4),
+    OTTAI(5),
+    SIBIONICS(6),
+    NIGHTSCOUT(7);
+
+    companion object {
+        fun fromNativeCode(code: Int): ManagedSensorUiFamily =
+            entries.firstOrNull { it.nativeCode == code } ?: GENERIC
+    }
 }
 
 data class ManagedSensorUiSnapshot(
@@ -56,9 +73,19 @@ data class ManagedSensorUiSnapshot(
     val rssi: Int = 0,
     val dataptr: Long = 0L,
     val viewMode: Int = 0,
+    val autoResetDays: Int = 300,
+    val customAlgorithmEnabled: Boolean = false,
+    val customAlgorithmMode: Int = if (customAlgorithmEnabled) 2 else 0,
+    val algorithmSensitivity: Float = Float.NaN,
+    val automaticAlgorithmSensitivity: Float = Float.NaN,
+    val hasAlgorithmSensitivityOverride: Boolean = false,
     val supportsDisplayModes: Boolean = false,
     val supportsManualCalibration: Boolean = false,
     val supportsHardwareReset: Boolean = false,
+    val supportsClearCalibration: Boolean = false,
+    /** Vendor has an on-demand self-test that measures the raw electrode current. */
+    val supportsSelfTest: Boolean = false,
+    val sensorDetailTelemetry: String = "",
     val isVendorPaired: Boolean = false,
     val vendorCalibrations: List<ManagedSensorCalibrationRecord> = emptyList(),
     val isVendorConnected: Boolean = false,
@@ -111,6 +138,17 @@ interface ManagedBluetoothSensorDriver {
 
     fun softReconnect() {}
 
+    /** Requests a fresh optional battery telemetry read without reconnecting. */
+    fun requestBatteryRefresh(): Boolean = false
+
+    /**
+     * The system Bluetooth adapter became unavailable. Physical BLE drivers must
+     * discard only their current transport/session state here; this is not a
+     * sensor pause or terminal driver shutdown. Network-backed managed drivers
+     * intentionally keep the no-op default.
+     */
+    fun onBluetoothAdapterUnavailable() {}
+
     fun terminateManagedSensor(wipeData: Boolean = false) {}
 
     fun shouldUseSharedCurrentSensorHandoffOnTerminate(): Boolean = true
@@ -122,5 +160,11 @@ interface ManagedBluetoothSensorDriver {
     fun supportsDisplayModes(): Boolean = false
 
     fun supportsManualCalibration(): Boolean = false
+
+    /** True when this driver consumes calibration for the requested display mode. */
+    fun integratesUserCalibration(isRawMode: Boolean): Boolean = false
+
+    /** Calibration points or policy changed; stateful managed models may rebuild locally. */
+    fun onUserCalibrationRevisionChanged(revision: Long) {}
 
 }

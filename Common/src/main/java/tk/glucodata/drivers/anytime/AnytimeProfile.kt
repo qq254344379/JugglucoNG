@@ -1,6 +1,6 @@
 // AnytimeProfile.kt — Per-family lifecycle/cadence resolver.
 //
-// CT3 4/4H is the primary target (cadence ~1/min, 16-day rated). CT4 / CT3_PLUS
+// CT3 4/4H is the primary target (cadence 3 min, 14–16-day rated). CT4 / CT3_PLUS
 // have shorter or longer rated lives depending on chemistry. CT5 (no separate
 // transmitter) uses the same 3-minute tick scale in the official SDK
 // (`Anytime`, endNumber 7695 => 16 days) and adds an encrypted identity/data
@@ -10,17 +10,24 @@ package tk.glucodata.drivers.anytime
 
 data class AnytimeProfile(
     val family: AnytimeConstants.Family,
+    /** Minutes between consecutive glucose ids. One id == one tick, never 5 minutes for CT5. */
     val readingIntervalMinutes: Int,
     val warmupMinutes: Int,
     val ratedLifetimeDays: Int,
     /** SDK `algorithm` int (selects per-chemistry pipeline inside libalgorithm-jni.so). */
     val algorithmId: Int,
-    /** Maximum 5-min-tick packet count before session naturally ends. */
+    /** Approximate maximum 3-minute record count before session naturally ends. */
     val endNumber: Int,
     /** Battery-low threshold (Volts) for the family. */
     val lowBatteryVolts: Float,
 ) {
     fun ratedLifetimeMs(): Long = ratedLifetimeDays * 24L * 60L * 60L * 1000L
+
+    fun warmupMs(): Long = warmupMinutes * 60L * 1000L
+
+    /** Glucose ids covered by the warm-up window at this family's cadence. */
+    fun warmupRecords(): Int =
+        if (readingIntervalMinutes <= 0) 0 else warmupMinutes / readingIntervalMinutes
 }
 
 object AnytimeProfileResolver {
@@ -46,17 +53,31 @@ object AnytimeProfileResolver {
             AnytimeConstants.Family.CT5 -> 3
             else -> AnytimeConstants.DEFAULT_READING_INTERVAL_MINUTES
         }
-        val lowVolts = when (entry.family) {
-            AnytimeConstants.Family.CT2_5 -> AnytimeConstants.BATTERY_LOW_VOLTS_CT2_5
-            AnytimeConstants.Family.CT3_PLUS,
-            AnytimeConstants.Family.CT3_YUWELL,
-            AnytimeConstants.Family.CT3_ULTRASONIC -> AnytimeConstants.BATTERY_LOW_VOLTS_CT3_A
+        // CT5 warm-up is shorter than the shared default; see CT5_WARMUP_MINUTES.
+        // CT2 warm-up is initNumber × 3 min: SN06/SN12 = 180, all other prefixes 60.
+        // Confirmed live on SN08: first live push arrived right after Init, i.e. the
+        // warmup gates the first initNumber "unreliable" records, not the session.
+        val warmupMinutes = when {
+            entry.family == AnytimeConstants.Family.CT2 &&
+                (entry.prefix == "SN06" || entry.prefix == "SN12") -> 180
+            entry.family == AnytimeConstants.Family.CT2 -> 60
+            entry.family == AnytimeConstants.Family.CT5 -> AnytimeConstants.CT5_WARMUP_MINUTES
+            else -> AnytimeConstants.DEFAULT_WARMUP_MINUTES
+        }
+        val lowVolts = when {
+            entry.family == AnytimeConstants.Family.CT2_5 -> AnytimeConstants.BATTERY_LOW_VOLTS_CT2_5
+            entry.family == AnytimeConstants.Family.CT4 -> AnytimeConstants.BATTERY_LOW_VOLTS_CT4
+            entry.family == AnytimeConstants.Family.CT3_PLUS ||
+                entry.family == AnytimeConstants.Family.CT3_YUWELL ||
+                entry.family == AnytimeConstants.Family.CT3_ULTRASONIC -> AnytimeConstants.BATTERY_LOW_VOLTS_CT3_A
+            // CT2 battery is a percent in the record/check bytes, not volts;
+            // lowBatteryVolts is therefore unused for CT2 (see BATTERY_LOW_PERCENT_CT2).
             else -> AnytimeConstants.BATTERY_LOW_VOLTS_CT3
         }
         return AnytimeProfile(
             family = entry.family,
             readingIntervalMinutes = readingMinutes,
-            warmupMinutes = AnytimeConstants.DEFAULT_WARMUP_MINUTES,
+            warmupMinutes = warmupMinutes,
             ratedLifetimeDays = ((entry.endNumber.toLong() * readingMinutes) / (60L * 24L)).toInt().coerceAtLeast(7),
             algorithmId = entry.algorithm,
             endNumber = entry.endNumber,

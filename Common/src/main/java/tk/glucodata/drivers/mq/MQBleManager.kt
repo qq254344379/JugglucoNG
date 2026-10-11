@@ -30,9 +30,10 @@ import tk.glucodata.Applic
 import tk.glucodata.HistorySyncAccess
 import tk.glucodata.Log
 import tk.glucodata.Natives
+import tk.glucodata.NightscoutUploadWake
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.UiRefreshBus
-import tk.glucodata.drivers.VirtualGlucoseSensorBridge
+import tk.glucodata.drivers.ManagedSensorUiFamily
 
 @SuppressLint("MissingPermission")
 class MQBleManager(
@@ -77,7 +78,6 @@ class MQBleManager(
         private const val CLOUD_HISTORY_BACKFILL_LOOKBACK_MS = 20L * 24L * 60L * 60L * 1000L
         private const val CLOUD_HISTORY_BACKFILL_OVERLAP_MS = 15L * 60L * 1000L
         private const val CLOUD_HISTORY_BACKFILL_FUTURE_GRACE_MS = 5L * 60L * 1000L
-        private const val CLOUD_HISTORY_NEAR_DUPLICATE_MS = 90L * 1000L
     }
 
     enum class Phase { IDLE, CONNECTING, DISCOVERING, STREAMING }
@@ -92,12 +92,18 @@ class MQBleManager(
 
     private val handlerThread = HandlerThread("MQ-$serial").also { it.start() }
     private val handler = Handler(handlerThread.looper)
+    private val cloudWork = MQCloudWorkQueue(
+        name = "MQ-cloud-$serial",
+        dispatchResult = { result -> handler.post { result() } },
+        onError = { error -> Log.stack(TAG, "MQ cloud worker", error) },
+    )
 
     private var nusService: BluetoothGattService? = null
     private var charTxNotify: BluetoothGattCharacteristic? = null
     private var charRxWrite: BluetoothGattCharacteristic? = null
 
     private val profile = MQProfileResolver.resolve()
+    @Volatile private var observedProtocol02 = false
 
     // Per-sensor config snapshot (populated in restoreFromPersistence).
     @Volatile private var protocolType: Int = MQConstants.SERVER_DEFAULT_PROTOCOL_TYPE
@@ -129,7 +135,7 @@ class MQBleManager(
     @Volatile private var lastProtocolFrameAtMs: Long = 0L
     @Volatile private var lastRawCurrent: Double = 0.0
     @Volatile private var lastProcessed: Double = 0.0
-    @Volatile private var lastBatteryPercent: Int = -1
+    @Volatile private var lastBatteryRaw: Int = -1
     @Volatile private var lastGlucoseAtMs: Long = 0L
     @Volatile private var lastGlucoseMgdlTimes10: Int = 0
     @Volatile private var vendorModelNameInternal: String = MQConstants.DEFAULT_DISPLAY_NAME
@@ -147,6 +153,8 @@ class MQBleManager(
     @Volatile private var cloudHistoryBackfillInFlight: Boolean = false
     @Volatile private var cloudHistoryBackfillAttemptedAtMs: Long = 0L
     @Volatile private var lastCloudHistoryBackfillTailMs: Long = 0L
+    private var cloudHistoryAnchor: MQCloudHistoryTiming.Anchor? = null
+    private var deferredCloudHistory: Pair<String, List<MQBootstrapHistoryPoint>>? = null
     @Volatile private var lastAnnouncedCloudSnapshotId: String = ""
     @Volatile private var lastCloudReportedPacketIndex: Int = -1
     private val pendingBgBurstRecords = LinkedHashMap<Int, PendingBgRecord>()
@@ -167,7 +175,7 @@ class MQBleManager(
         charTxNotify = null
         charRxWrite = null
         nusService = null
-        runCatching { close() }
+        runCatching { closeGattTransport() }
             .onFailure { Log.stack(TAG, "serviceDiscoveryWatchdog(close)", it) }
         scheduleReconnect("MQ service discovery watchdog", 250L)
     }
@@ -284,7 +292,7 @@ class MQBleManager(
         kValue = MQRegistry.loadKValue(context, id)
         bValue = MQRegistry.loadBValue(context, id)
         localResetPending = MQRegistry.loadLocalResetPending(context, id)
-        if (!hasValidSlopeSeed(kValue.toDouble()) && kValue != 0f) {
+        if (!hasValidSlopeSeed(MQAlgorithm.decimalParameter(kValue)) && kValue != 0f) {
             Log.w(TAG, "Discarding invalid persisted MQ K seed=$kValue for $id")
             kValue = 0f
             bValue = 0f
@@ -296,14 +304,11 @@ class MQBleManager(
         lastProcessed = MQRegistry.loadLastProcessed(context, id).toDouble().coerceAtLeast(0.0)
         lastPacketIndex = MQRegistry.loadLastPacketIndex(context, id)
         lastCloudReportedPacketIndex = MQRegistry.loadLastCloudReportedPacketIndex(context, id)
-        lastObservedPacketIndex = lastPacketIndex
+        lastObservedPacketIndex = maxOf(lastObservedPacketIndex, lastPacketIndex)
         crcXorOut = if (protocolType == 2) 0x0100 else 0x0000
         ensureNativeDataptr(id)
         hydrateKnownDeviceAddress(context, id)
         if (hasUsableSlopeSeed()) {
-            if (localResetPending) {
-                clearLocalResetPending("restored-valid-k")
-            }
             lastBootstrapFailure = MQBootstrapFailure.NONE
             lastBootstrapMessage = ""
         }
@@ -450,21 +455,28 @@ class MQBleManager(
         runCatching { Natives.ensureSensorShell(canonical, startSec) }
             .onFailure { Log.stack(TAG, "ensureNativeDataptr(ensureSensorShell)", it) }
         val nativeName = resolveExistingNativeSensorName(canonical) ?: canonical
+        // The shell is Libre 2 to native by elimination; say what it really is, so a
+        // phone receiving it over Clone can too.
+        runCatching { Natives.setSensorManagedFamily(nativeName, ManagedSensorUiFamily.MQ.nativeCode) }
+            .onFailure { Log.stack(TAG, "ensureNativeDataptr(setSensorManagedFamily)", it) }
         if (dataptr == 0L) {
             dataptr = runCatching { Natives.getdataptr(nativeName) }.getOrDefault(0L)
         }
         applyNativeSensorMetadata(nativeName)
     }
 
-    private fun mirrorReadingIntoNative(sampleMs: Long, glucoseMgdl: Int) {
-        if (sampleMs <= 0L || glucoseMgdl <= 0 || SerialNumber.isBlank()) {
+    private fun mirrorReadingIntoNative(sampleMs: Long, result: MQAlgorithm.Result) {
+        if (sampleMs <= 0L || result.mgdl <= 0 || SerialNumber.isBlank()) {
             return
         }
         val nativeName = nativeCreationSensorName(SerialNumber)
         runCatching {
             ensureNativeDataptr(SerialNumber)
-            // Native direct-stream storage multiplies the float by 10 internally.
-            Natives.addGlucoseStream(sampleMs / 1000L, glucoseMgdl / 10f, nativeName)
+            val stored = MQNativeGlucoseMirror.write(sampleMs, result, nativeName, Natives::addGlucoseStream)
+            if (stored) {
+                NightscoutUploadWake.afterLiveNativeWrite("mq", sampleMs)
+                markLocalReadingAccepted(sampleMs)
+            }
             applyNativeSensorMetadata(nativeName)
             Natives.wakebackup()
         }.onFailure { Log.stack(TAG, "mirrorReadingIntoNative", it) }
@@ -555,27 +567,25 @@ class MQBleManager(
         if (normalizedQr == null && bleId == null) return false
         bootstrapFetchInFlight = true
         lastBootstrapAttemptAtMs = System.currentTimeMillis()
-        return try {
-            val result = MQBootstrapClient.fetchBestEffort(
-                context = context,
-                bleId = bleId,
-                qrCode = normalizedQr,
-                authToken = MQRegistry.loadAuthToken(context),
-                credentials = credentials,
-                allowContinueWearRestore = !localResetPending,
-            )
-            applyBootstrapFetchResult(
-                context = context,
-                sensorId = id,
-                result = result,
-                reason = "manual",
-            )
-        } catch (t: Throwable) {
-            Log.stack(TAG, "refreshVendorBootstrap(manual)", t)
-            false
-        } finally {
-            bootstrapFetchInFlight = false
+        val allowRestore = !localResetPending && lastObservedPacketIndex < 0
+        cloudWork.post { task ->
+            try {
+                val result = MQBootstrapClient.fetchBestEffort(
+                    context = context,
+                    bleId = bleId,
+                    qrCode = normalizedQr,
+                    authToken = MQRegistry.loadAuthToken(context),
+                    credentials = credentials,
+                    allowContinueWearRestore = allowRestore,
+                )
+                task.deliver { applyBootstrapFetchResult(context, id, result, "manual") }
+            } catch (t: Exception) {
+                Log.stack(TAG, "refreshVendorBootstrap(manual)", t)
+            } finally {
+                task.deliver { bootstrapFetchInFlight = false }
+            }
         }
+        return true
     }
 
     override val vendorFirmwareVersion: String get() = vendorFirmwareVersionInternal
@@ -583,7 +593,7 @@ class MQBleManager(
     override val batteryMillivolts: Int
         get() = 0
     override val batteryPercent: Int
-        get() = lastBatteryPercent
+        get() = -1 // The wire byte is not a measured percentage; no validated conversion is available.
 
     override fun getCurrentSnapshot(maxAgeMillis: Long): MQCurrentSnapshot? {
         if (lastGlucoseAtMs == 0L) return null
@@ -614,7 +624,7 @@ class MQBleManager(
         flushPendingBgBurst("soft-disconnect")
         clearLinkWatchdogs()
         phase = Phase.IDLE
-        runCatching { close() }
+        runCatching { closeGattTransport() }
             .onFailure { Log.stack(TAG, "softDisconnect(close)", it) }
         mActiveBluetoothDevice = null
         UiRefreshBus.requestStatusRefresh()
@@ -629,12 +639,22 @@ class MQBleManager(
             runCatching { Natives.unfinishSensor(dataptr) }
                 .onFailure { Log.stack(TAG, "softReconnect(unfinishSensor)", it) }
         }
-        runCatching { close() }
+        runCatching { closeGattTransport() }
             .onFailure { Log.stack(TAG, "softReconnect(close)", it) }
         phase = Phase.IDLE
         handler.postDelayed({
             if (!stop) connectDevice(0)
         }, 250L)
+        UiRefreshBus.requestStatusRefresh()
+    }
+
+    override fun onBluetoothAdapterUnavailable() {
+        cancelReconnect()
+        flushPendingBgBurst("bluetooth-off")
+        clearLinkWatchdogs()
+        phase = Phase.IDLE
+        mActiveBluetoothDevice = null
+        constatstatusstr = Applic.getContext().getString(tk.glucodata.R.string.status_bluetooth_off)
         UiRefreshBus.requestStatusRefresh()
     }
 
@@ -645,23 +665,19 @@ class MQBleManager(
         flushPendingBgBurst("terminate")
         clearLinkWatchdogs()
         phase = Phase.IDLE
-        val sensorPtr = resolveNativeSensorPtr(SerialNumber)
-        runCatching { mBluetoothGatt?.disconnect() }
-            .onFailure { Log.stack(TAG, "terminateManagedSensor(disconnect)", it) }
-        if (sensorPtr != 0L) {
-            runCatching { Natives.finishfromSensorptr(sensorPtr) }
-                .onFailure { Log.stack(TAG, "terminateManagedSensor(finishfromSensorptr)", it) }
+        close()
+        val nativeName = resolveExistingNativeSensorName(SerialNumber)
+        if (nativeName != null) {
+            check(MQNativeSensorRemoval.removeAndConfirm(
+                SerialNumber, nativeName, Natives::removeSensorById, Natives::activeSensors,
+            )) { "MQ native sensor removal was not confirmed for $SerialNumber" }
         }
-        dataptr = 0L
-        runCatching { close() }
-            .onFailure { Log.stack(TAG, "terminateManagedSensor(close)", it) }
+        // SensorBluetooth.free() releases dataptr after both native and managed records are removed.
     }
 
     override fun resetSensor(): Boolean {
-        val frame = when {
-            protocolType == 2 || crcXorOut == 0x0100 -> MagicAck.reset00.copyOf()
-            else -> MQParser.buildConfirmReset(0)
-        }
+        val resetGatt = mBluetoothGatt
+        val frame = MQResetCommand.build(protocolType, observedProtocol02)
         if (!writeFrameNow(frame, "confirmReset")) {
             Log.w(TAG, "MQ reset rejected: GATT write path not ready")
             return false
@@ -669,7 +685,7 @@ class MQBleManager(
         Applic.app?.let { maybeEndCloudSessionAsync(it, "reset") }
         markLocalResetPending()
         handler.postDelayed({
-            if (!stop) {
+            if (!stop && mBluetoothGatt === resetGatt) {
                 runCatching { mBluetoothGatt?.disconnect() }
             }
         }, RESET_RECONNECT_DELAY_MS)
@@ -693,6 +709,33 @@ class MQBleManager(
     // ---- BLE lifecycle ----
 
     override fun getService(): UUID = MQConstants.NUS_SERVICE
+
+    override fun reconnect(now: Long): Boolean {
+        if (stop) return true
+        // The shared othersworking() path passes a glucose-age-adjusted time. Use wall time
+        // and actual protocol activity: warmup packets carry no usable glucose yet.
+        val actualNow = System.currentTimeMillis()
+        if ((phase == Phase.CONNECTING || phase == Phase.DISCOVERING) &&
+            MQLinkPolicy.hasRecentActivity(actualNow, connectTime, 0L, 60_000L, 60_000L)
+        ) return true
+        if (phase == Phase.STREAMING && mBluetoothGatt != null && MQLinkPolicy.hasRecentActivity(
+                actualNow, connectTime, lastProtocolFrameAtMs, firstFrameTimeoutMs(), protocolFrameTimeoutMs(),
+            )
+        ) return true
+        phase = Phase.IDLE
+        if (mBluetoothGatt != null) {
+            Log.w(TAG, "MQ generic reconnect after protocol silence")
+            noteLossOfSignal(actualNow)
+            flushPendingBgBurst("stale-generic-reconnect")
+            clearLinkWatchdogs()
+            mActiveBluetoothDevice = null
+            charTxNotify = null
+            charRxWrite = null
+            nusService = null
+            closeGattTransport()
+        }
+        return connectDevice(0)
+    }
 
     @Synchronized
     override fun connectDevice(delayMillis: Long): Boolean {
@@ -738,7 +781,7 @@ class MQBleManager(
             if (!gatt.discoverServices()) {
                 Log.e(TAG, "discoverServices() returned false ($reason)")
                 phase = Phase.IDLE
-                runCatching { close() }
+                runCatching { closeGattTransport() }
                     .onFailure { Log.stack(TAG, "discoverServices(close:$reason)", it) }
                 scheduleReconnect("discoverServices() returned false ($reason)", 250L)
                 false
@@ -748,7 +791,7 @@ class MQBleManager(
         } catch (t: Throwable) {
             Log.stack(TAG, "discoverServices($reason)", t)
             phase = Phase.IDLE
-            runCatching { close() }
+            runCatching { closeGattTransport() }
                 .onFailure { Log.stack(TAG, "discoverServices(close:$reason)", it) }
             scheduleReconnect("discoverServices() threw ($reason)", 250L)
             false
@@ -756,6 +799,9 @@ class MQBleManager(
     }
 
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+        if (gatt !== mBluetoothGatt) return
+        noteFirstGattCallback("onConnectionStateChange", gatt)
+        super.onConnectionStateChange(gatt, status, newState)
         if (stop) return
         when (newState) {
             BluetoothProfile.STATE_CONNECTED -> {
@@ -779,7 +825,8 @@ class MQBleManager(
                 handler.postDelayed(serviceDiscoveryWatchdog, SERVICE_DISCOVERY_TIMEOUT_MS)
             }
             BluetoothProfile.STATE_DISCONNECTED -> {
-                Log.i(TAG, "Disconnected (status=$status)")
+                val now = System.currentTimeMillis()
+                Log.i(TAG, "Disconnected (status=$status phase=$phase connectedMs=${now - connectTime} lastFrameAgeMs=${lastProtocolFrameAtMs.takeIf { it > 0L }?.let { now - it }} lastPacket=$lastPacketIndex)")
                 flushPendingBgBurst("disconnect")
                 phase = Phase.IDLE
                 charTxNotify = null
@@ -791,7 +838,8 @@ class MQBleManager(
                 serviceDiscoveryRetryCount = 0
                 try { gatt.close() } catch (_: Throwable) {}
                 mBluetoothGatt = null
-                handler.removeCallbacksAndMessages(null)
+                clearLinkWatchdogs()
+                cancelReconnect()
                 if (!stop) {
                     scheduleReconnect("GATT disconnected (status=$status)")
                 }
@@ -805,6 +853,7 @@ class MQBleManager(
     }
 
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+        if (stop || gatt !== mBluetoothGatt) return
         handler.removeCallbacks(serviceDiscoveryWatchdog)
         handler.removeCallbacks(serviceDiscoveryRetryRunnable)
         if (serviceDiscoveryHandled) {
@@ -845,7 +894,7 @@ class MQBleManager(
 
     @Deprecated("Deprecated in Java")
     override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-        if (characteristic.uuid != MQConstants.NUS_TX_NOTIFY) return
+        if (stop || gatt !== mBluetoothGatt || characteristic.uuid != MQConstants.NUS_TX_NOTIFY) return
         val data = characteristic.value ?: return
         val frame = MQParser.parse(data)
         if (frame == null) {
@@ -853,6 +902,11 @@ class MQBleManager(
             return
         }
         lastProtocolFrameAtMs = System.currentTimeMillis()
+        noteLiveFrameWithoutReading(lastProtocolFrameAtMs)
+        if (!observedProtocol02 && MQResetCommand.isProtocol02Marker(frame)) {
+            observedProtocol02 = true
+            Log.i(TAG, "MQ Protocol02 confirmed by session marker; using captured reset command")
+        }
         handler.removeCallbacks(firstFrameWatchdog)
         armProtocolFrameWatchdog()
         learnCrcVariant(frame)
@@ -938,8 +992,6 @@ class MQBleManager(
         val bgData00: ByteArray = byteArrayOf(0x5A, -0x5B, 0x02, 0x01, 0x00, 0x49, 0x7F)
         // confirmWithoutInit (cmd=0x03, payload=0x00) — observed (Modbus^0x0100 form).
         val withoutInit00: ByteArray = byteArrayOf(0x5A, -0x5B, 0x03, 0x01, 0x00, 0x50, -0x51)
-        // confirmReset (cmd=0x11, payload=0x00) — fixed Protocol02 bytes from the official app.
-        val reset00: ByteArray = byteArrayOf(0x5A, -0x5B, 0x11, 0x01, 0x00, -0x56, 0x07)
     }
 
     private data class AckCandidate(
@@ -982,6 +1034,10 @@ class MQBleManager(
     }
 
     private fun onBeginWork() {
+        if (lastPacketIndex >= 0 || Applic.app?.let { MQRegistry.loadSnapshotId(it, SerialNumber) } != null) {
+            Log.i(TAG, "MQ BEGIN_WORK supersedes restored session")
+            markLocalResetPending()
+        }
         val now = System.currentTimeMillis()
         if (sensorStartAtMs == 0L) {
             sensorStartAtMs = now
@@ -1065,15 +1121,17 @@ class MQBleManager(
         MQRegistry.saveLastPacketIndex(context, id, lastPacketIndex)
     }
 
-    private fun clearLocalResetPending(reason: String) {
-        if (!localResetPending) return
-        localResetPending = false
-        val context = Applic.app ?: return
-        MQRegistry.saveLocalResetPending(context, SerialNumber, false)
-        Log.i(TAG, "Cleared local MQ reset pending ($reason)")
-    }
-
     private fun markLocalResetPending() {
+        cloudWork.invalidate()
+        bootstrapFetchInFlight = false
+        cloudHistoryBackfillInFlight = false
+        cloudSessionSyncInFlight = false
+        lastBootstrapAttemptAtMs = 0L
+        cloudHistoryBackfillAttemptedAtMs = 0L
+        cloudSessionAttemptedAtMs = 0L
+        lastCloudHistoryBackfillTailMs = 0L
+        lastAnnouncedCloudSnapshotId = ""
+        lastCloudReportedPacketIndex = -1
         localResetPending = true
         val context = Applic.app
         val id = SerialNumber ?: return
@@ -1092,6 +1150,8 @@ class MQBleManager(
 
     private fun clearVolatileSessionState() {
         clearPendingBgBurst()
+        cloudHistoryAnchor = null
+        deferredCloudHistory = null
         sensorStartAtMs = 0L
         sensorstartmsec = 0L
         warmupStartedAtMs = 0L
@@ -1124,34 +1184,40 @@ class MQBleManager(
         value > MQConstants.ALGO_MIN_VALID_K
 
     private fun hasBootstrapSlopeSeed(): Boolean =
-        hasValidSlopeSeed(sensitivitySeed.toDouble())
+        hasValidSlopeSeed(MQAlgorithm.decimalParameter(sensitivitySeed))
 
     private fun hasUsableSlopeSeed(): Boolean =
-        hasValidSlopeSeed(kValue.toDouble())
+        hasValidSlopeSeed(MQAlgorithm.decimalParameter(kValue))
 
     private fun needsVendorBootstrap(): Boolean =
         !hasUsableSlopeSeed() && !hasBootstrapSlopeSeed()
 
     private fun resolveBootstrapBleId(context: Context, sensorId: String): String? =
-        mActiveDeviceAddress?.takeIf { it.isNotBlank() }
-            ?: MQRegistry.findRecord(context, sensorId)?.address?.takeIf { it.isNotBlank() }
+        MQVendorIdentity.bleId(MQRegistry.findRecord(context, sensorId)?.displayName)
+            ?: MQVendorIdentity.bleId(mActiveBluetoothDevice?.name)
 
-    private fun importBootstrapHistory(history: List<MQBootstrapHistoryPoint>, sensorId: String) {
-        if (history.isEmpty()) return
-        val imported = VirtualGlucoseSensorBridge.importHistory(
-            sensorSerial = sensorId,
-            readings = history.map { point ->
-                VirtualGlucoseSensorBridge.Reading(
-                    timestampMs = point.timestampMs,
-                    glucoseMgdl = point.glucoseMgdl,
-                )
-            },
-            logLabel = "MQ snapshot",
-            nearDuplicateWindowMs = CLOUD_HISTORY_NEAR_DUPLICATE_MS,
+    private fun importBootstrapHistory(history: List<MQBootstrapHistoryPoint>, sensorId: String): Int {
+        if (history.isEmpty() || localResetPending) return 0
+        val prepared = MQCloudHistoryTiming.prepare(
+            history, cloudHistoryAnchor, System.currentTimeMillis(), profile.readingIntervalMinutes,
         )
-        if (imported > 0) {
-            Log.i(TAG, "Imported $imported MQ snapshot history points into local history")
+        if (prepared.deferred) {
+            Applic.app?.let { MQRegistry.loadSnapshotId(it, sensorId) }?.let {
+                deferredCloudHistory = it to history
+            }
+            Log.i(TAG, "MQ history deferred until a live packet can verify its timeline: points=${history.size}")
+            return 0
         }
+        if (prepared.estimated) {
+            Log.w(TAG, "MQ history timestamps estimated from live packet=${cloudHistoryAnchor?.packetIndex}: points=${prepared.history.size}")
+        }
+        val imported = MQBootstrapHistory.import(sensorId, prepared.history)
+        if (imported > 0) {
+            lastCloudHistoryBackfillTailMs = maxOf(lastCloudHistoryBackfillTailMs,
+                prepared.history.maxOf { it.timestampMs })
+        }
+        Log.i(TAG, "MQ history import: received=${history.size} eligible=${prepared.history.size} imported=$imported")
+        return imported
     }
 
     private fun maybeFetchCloudHistoryBackfillAsync(
@@ -1162,9 +1228,16 @@ class MQBleManager(
         val sensorId = SerialNumber ?: return
         val snapshotId = snapshotIdOverride?.trim().orEmpty()
             .ifEmpty { MQRegistry.loadSnapshotId(context, sensorId)?.trim().orEmpty() }
-            .takeIf { it.isNotEmpty() } ?: return
+            .takeIf { it.isNotEmpty() }
+        if (snapshotId == null) {
+            if (reason != "bg-data") Log.i(TAG, "MQ cloud history unavailable ($reason): no saved snapshot")
+            return
+        }
         val accountState = MQRegistry.loadAccountState(context)
-        if (accountState.authToken.isNullOrBlank() && accountState.credentials == null) return
+        if (accountState.authToken.isNullOrBlank() && accountState.credentials == null) {
+            if (reason != "bg-data") Log.i(TAG, "MQ cloud history unavailable ($reason): no saved authentication")
+            return
+        }
         val now = System.currentTimeMillis()
         if (cloudHistoryBackfillInFlight ||
             now - cloudHistoryBackfillAttemptedAtMs < CLOUD_HISTORY_BACKFILL_RETRY_MS
@@ -1173,53 +1246,55 @@ class MQBleManager(
         }
         cloudHistoryBackfillInFlight = true
         cloudHistoryBackfillAttemptedAtMs = now
-        handler.post {
+        val previousBackfillTailMs = lastCloudHistoryBackfillTailMs
+        val startAtMs = sensorStartAtMs
+        cloudWork.post { task ->
             try {
                 val token = ensureCloudSyncToken(context, accountState) ?: return@post
-                val previousBackfillTailMs = lastCloudHistoryBackfillTailMs
                 val latestRoomMs = HistorySyncAccess.getLatestTimestampForSensor(sensorId)
                 val persistedStartMs = MQRegistry.loadSensorStartAt(context, sensorId)
                 val startMs = when {
                     previousBackfillTailMs > 0L -> (previousBackfillTailMs - CLOUD_HISTORY_BACKFILL_OVERLAP_MS).coerceAtLeast(1L)
-                    sensorStartAtMs > 0L -> sensorStartAtMs
+                    startAtMs > 0L -> startAtMs
                     persistedStartMs > 0L -> persistedStartMs
                     latestRoomMs > 0L -> (latestRoomMs - CLOUD_HISTORY_BACKFILL_OVERLAP_MS).coerceAtLeast(1L)
                     else -> (now - CLOUD_HISTORY_BACKFILL_LOOKBACK_MS).coerceAtLeast(1L)
                 }
-                val result = MQCloudClient.fetchSnapshotTimeBucketHistory(
+                val result = MQCloudRecovery.history(rangeLookup = { MQCloudClient.fetchSnapshotTimeBucketHistory(
                     context = context,
                     authToken = token,
                     snapshotId = snapshotId,
                     startTimeMs = startMs,
                     endTimeMs = now + CLOUD_HISTORY_BACKFILL_FUTURE_GRACE_MS,
-                )
-                when {
-                    result.failure == MQBootstrapFailure.AUTH_EXPIRED -> {
-                        MQRegistry.clearAuthToken(context)
-                        Log.w(TAG, "MQ cloud history auth expired ($reason)")
-                    }
-                    result.history.isNotEmpty() -> {
-                        importBootstrapHistory(result.history, sensorId)
-                        lastCloudHistoryBackfillTailMs = maxOf(
-                            lastCloudHistoryBackfillTailMs,
-                            result.history.maxOf { it.timestampMs },
-                        )
-                        Log.i(
-                            TAG,
-                            "MQ cloud history backfill synced ($reason): snapshot=$snapshotId points=${result.history.size}",
-                        )
-                    }
-                    result.failure != MQBootstrapFailure.NONE -> {
-                        Log.w(TAG, "MQ cloud history backfill failed ($reason): ${result.message}")
-                    }
-                    else -> {
-                        Log.i(TAG, "MQ cloud history backfill empty ($reason): snapshot=$snapshotId")
+                ) }, snapshotLookup = {
+                    Log.i(TAG, "MQ range history unavailable; trying snapshot detail ($reason): snapshot=$snapshotId range=$startMs..$now")
+                    MQCloudClient.fetchSnapshotDetailHistory(context, token, snapshotId)
+                })
+                task.deliver {
+                    when {
+                        result.failure == MQBootstrapFailure.AUTH_EXPIRED -> {
+                            MQRegistry.clearAuthToken(context)
+                            Log.w(TAG, "MQ cloud history auth expired ($reason)")
+                        }
+                        result.history.isNotEmpty() -> {
+                            val imported = importBootstrapHistory(result.history, sensorId)
+                            Log.i(
+                                TAG,
+                                "MQ cloud history backfill ($reason): snapshot=$snapshotId received=${result.history.size} imported=$imported",
+                            )
+                        }
+                        result.failure != MQBootstrapFailure.NONE -> {
+                            Log.w(TAG, "MQ cloud history backfill failed ($reason): ${result.message}")
+                        }
+                        else -> {
+                            Log.i(TAG, "MQ cloud history backfill empty ($reason): snapshot=$snapshotId")
+                        }
                     }
                 }
             } catch (t: Throwable) {
                 Log.stack(TAG, "maybeFetchCloudHistoryBackfillAsync($reason)", t)
             } finally {
-                cloudHistoryBackfillInFlight = false
+                task.deliver { cloudHistoryBackfillInFlight = false }
             }
         }
     }
@@ -1234,10 +1309,25 @@ class MQBleManager(
         lastBootstrapFailure = result.failure
         lastBootstrapMessage = result.message.orEmpty()
         if (result.config != null) {
-            MQRegistry.applyBootstrapConfig(context, sensorId, result.config)
+            val config = if (localResetPending || lastObservedPacketIndex >= 0) {
+                MQSessionRestorePolicy.withoutSession(result.config)
+            } else result.config
+            MQRegistry.applyBootstrapConfig(context, sensorId, config)
             restoreFromPersistence(context)
+            if (reason == "manual" && config.restoredKValue == null &&
+                config.sensitivity?.let { hasValidSlopeSeed(it.toDouble()) } == true
+            ) {
+                // Explicitly requesting vendor setup must replace an earlier locally solved slope.
+                // Otherwise a correct QR lookup leaves the old, wrongly scaled K in use indefinitely.
+                kValue = 0f
+                bValue = 0f
+                lastProcessed = 0.0
+                pendingReferenceBgTimes10Mmol = 0.0
+                persistAlgorithmState()
+                Log.i(TAG, "MQ explicit vendor bootstrap: next sample will initialize from refreshed sensitivity")
+            }
             importBootstrapHistory(result.history, sensorId)
-            maybeFetchCloudHistoryBackfillAsync(context, "bootstrap-$reason", result.config.snapshotId)
+            maybeFetchCloudHistoryBackfillAsync(context, "bootstrap-$reason", config.snapshotId)
             if (hasUsableSlopeSeed()) {
                 lastBootstrapFailure = MQBootstrapFailure.NONE
                 lastBootstrapMessage = ""
@@ -1245,7 +1335,7 @@ class MQBleManager(
             UiRefreshBus.requestStatusRefresh()
             Log.i(
                 TAG,
-                "Applied MQ bootstrap ($reason): sensitivity=$sensitivitySeed k=$kValue b=$bValue packet=$lastPacketIndex algo=$algorithmVersion packages=$packages multiplier=$multiplier",
+                "Applied MQ bootstrap ($reason): sensitivity=$sensitivitySeed transmitter10=$transmitter10 protocol=$protocolType k=$kValue b=$bValue packet=$lastPacketIndex algo=$algorithmVersion packages=$packages multiplier=$multiplier history=${result.history.size}",
             )
             return true
         }
@@ -1280,8 +1370,8 @@ class MQBleManager(
         val accountState = MQRegistry.loadAccountState(context)
         val account = accountState.phone.trim().takeIf { it.isNotEmpty() } ?: return
         val bleId = resolveBootstrapBleId(context, sensorId)
-            ?.let { MQConstants.canonicalSensorId(it) }
-            ?.takeIf { it.isNotEmpty() }
+            ?: return
+        val mac = MQVendorIdentity.mac(MQRegistry.findRecord(context, sensorId)?.address ?: mActiveDeviceAddress)
             ?: return
         val snapshotId = MQRegistry.loadSnapshotId(context, sensorId)?.trim().orEmpty()
         if (snapshotId.isNotEmpty()) {
@@ -1292,7 +1382,7 @@ class MQBleManager(
         if (cloudSessionSyncInFlight || now - cloudSessionAttemptedAtMs < CLOUD_SESSION_RETRY_MS) return
         cloudSessionSyncInFlight = true
         cloudSessionAttemptedAtMs = now
-        handler.post {
+        cloudWork.post { task ->
             try {
                 val token = ensureCloudSyncToken(context, accountState) ?: return@post
                 if (snapshotId.isNotEmpty()) {
@@ -1303,17 +1393,23 @@ class MQBleManager(
                         bleId = bleId,
                         qrCode = qrCode,
                     )
-                    when {
-                        result.success -> {
-                            lastAnnouncedCloudSnapshotId = snapshotId
-                            Log.i(TAG, "MQ cloud continue-wear synced ($reason): snapshot=$snapshotId")
-                        }
-                        result.failure == MQBootstrapFailure.AUTH_EXPIRED -> {
-                            MQRegistry.clearAuthToken(context)
-                            Log.w(TAG, "MQ cloud session sync auth expired ($reason)")
-                        }
-                        else -> {
-                            Log.w(TAG, "MQ cloud session sync failed ($reason): ${result.message}")
+                    task.deliver {
+                        when {
+                            result.alreadyMonitoring -> {
+                                lastAnnouncedCloudSnapshotId = snapshotId
+                                Log.i(TAG, "MQ cloud account already monitoring; stopping redundant continue-wear retries ($reason)")
+                            }
+                            result.success -> {
+                                lastAnnouncedCloudSnapshotId = snapshotId
+                                Log.i(TAG, "MQ cloud continue-wear synced ($reason): snapshot=$snapshotId")
+                            }
+                            result.failure == MQBootstrapFailure.AUTH_EXPIRED -> {
+                                MQRegistry.clearAuthToken(context)
+                                Log.w(TAG, "MQ cloud session sync auth expired ($reason)")
+                            }
+                            else -> {
+                                Log.w(TAG, "MQ cloud session sync failed ($reason): ${result.message}")
+                            }
                         }
                     }
                 } else {
@@ -1321,32 +1417,34 @@ class MQBleManager(
                         context = context,
                         authToken = token,
                         bleId = bleId,
-                        mac = bleId,
+                        mac = mac,
                         account = account,
                         qrCode = qrCode,
                     )
-                    when {
-                        result.success && !result.snapshotId.isNullOrBlank() -> {
-                            MQRegistry.saveSnapshotId(context, sensorId, result.snapshotId)
-                            MQRegistry.saveLastCloudReportedPacketIndex(context, sensorId, -1)
-                            lastAnnouncedCloudSnapshotId = result.snapshotId
-                            lastCloudReportedPacketIndex = -1
-                            maybeFetchCloudHistoryBackfillAsync(context, "session-start-$reason", result.snapshotId)
-                            Log.i(TAG, "MQ cloud start-wear created snapshot=${result.snapshotId} ($reason)")
-                        }
-                        result.failure == MQBootstrapFailure.AUTH_EXPIRED -> {
-                            MQRegistry.clearAuthToken(context)
-                            Log.w(TAG, "MQ cloud session sync auth expired ($reason)")
-                        }
-                        else -> {
-                            Log.w(TAG, "MQ cloud session sync failed ($reason): ${result.message}")
+                    task.deliver {
+                        when {
+                            result.success && !result.snapshotId.isNullOrBlank() -> {
+                                MQRegistry.saveSnapshotId(context, sensorId, result.snapshotId)
+                                MQRegistry.saveLastCloudReportedPacketIndex(context, sensorId, -1)
+                                lastAnnouncedCloudSnapshotId = result.snapshotId
+                                lastCloudReportedPacketIndex = -1
+                                maybeFetchCloudHistoryBackfillAsync(context, "session-start-$reason", result.snapshotId)
+                                Log.i(TAG, "MQ cloud start-wear created snapshot=${result.snapshotId} ($reason)")
+                            }
+                            result.failure == MQBootstrapFailure.AUTH_EXPIRED -> {
+                                MQRegistry.clearAuthToken(context)
+                                Log.w(TAG, "MQ cloud session sync auth expired ($reason)")
+                            }
+                            else -> {
+                                Log.w(TAG, "MQ cloud session sync failed ($reason): ${result.message}")
+                            }
                         }
                     }
                 }
             } catch (t: Throwable) {
                 Log.stack(TAG, "maybeEnsureCloudSessionAsync($reason)", t)
             } finally {
-                cloudSessionSyncInFlight = false
+                task.deliver { cloudSessionSyncInFlight = false }
             }
         }
     }
@@ -1363,7 +1461,7 @@ class MQBleManager(
         val sensorId = SerialNumber ?: return
         val snapshotId = MQRegistry.loadSnapshotId(context, sensorId)?.trim().orEmpty().takeIf { it.isNotEmpty() } ?: return
         val accountState = MQRegistry.loadAccountState(context)
-        handler.post {
+        cloudWork.post { _ ->
             try {
                 val token = ensureCloudSyncToken(context, accountState) ?: return@post
                 val bgValueMmol = referenceBgTimes10Mmol / 10.0
@@ -1414,7 +1512,7 @@ class MQBleManager(
         if (rec.packetIndex <= lastCloudReportedPacketIndex) return
         val accountState = MQRegistry.loadAccountState(context)
         val calculateData = buildVendorCalculateData(rec, result)
-        handler.post {
+        cloudWork.post { task ->
             try {
                 if (rec.packetIndex <= lastCloudReportedPacketIndex) return@post
                 val token = ensureCloudSyncToken(context, accountState) ?: return@post
@@ -1424,15 +1522,17 @@ class MQBleManager(
                     snapshotId = snapshotId,
                     calculateDataHex = listOf(calculateData),
                 )
-                if (upload.success) {
-                    lastCloudReportedPacketIndex = rec.packetIndex
-                    MQRegistry.saveLastCloudReportedPacketIndex(context, sensorId, rec.packetIndex)
-                    Log.i(TAG, "MQ cloud report synced: snapshot=$snapshotId packet=${rec.packetIndex}")
-                } else if (upload.failure == MQBootstrapFailure.AUTH_EXPIRED) {
-                    MQRegistry.clearAuthToken(context)
-                    Log.w(TAG, "MQ cloud report auth expired")
-                } else {
-                    Log.w(TAG, "MQ cloud report failed: ${upload.message}")
+                task.deliver {
+                    if (upload.success) {
+                        lastCloudReportedPacketIndex = rec.packetIndex
+                        MQRegistry.saveLastCloudReportedPacketIndex(context, sensorId, rec.packetIndex)
+                        Log.i(TAG, "MQ cloud report synced: snapshot=$snapshotId packet=${rec.packetIndex}")
+                    } else if (upload.failure == MQBootstrapFailure.AUTH_EXPIRED) {
+                        MQRegistry.clearAuthToken(context)
+                        Log.w(TAG, "MQ cloud report auth expired")
+                    } else {
+                        Log.w(TAG, "MQ cloud report failed: ${upload.message}")
+                    }
                 }
             } catch (t: Throwable) {
                 Log.stack(TAG, "maybeUploadLiveReportAsync", t)
@@ -1457,7 +1557,7 @@ class MQBleManager(
             append("40")
             append(leU16(rec.packetIndex))
             append(leU16(rec.sampleCurrent))
-            append(u8(rec.batteryPercent))
+            append(u8(rec.batteryRaw))
             append(leU16(result.reviseCurrent2.toInt()))
             append(leU16(result.glucoseTimes10Mmol))
             append('0')
@@ -1469,18 +1569,15 @@ class MQBleManager(
         val sensorId = SerialNumber ?: return
         val snapshotId = MQRegistry.loadSnapshotId(context, sensorId)?.trim().orEmpty().takeIf { it.isNotEmpty() } ?: return
         val accountState = MQRegistry.loadAccountState(context)
-        handler.post {
+        cloudWork.postCleanup {
             try {
-                val token = ensureCloudSyncToken(context, accountState) ?: return@post
+                val token = ensureCloudSyncToken(context, accountState) ?: return@postCleanup
                 val result = MQCloudClient.endWearSession(
                     context = context,
                     authToken = token,
                     snapshotId = snapshotId,
                 )
                 if (result.success) {
-                    if (lastAnnouncedCloudSnapshotId == snapshotId) {
-                        lastAnnouncedCloudSnapshotId = ""
-                    }
                     Log.i(TAG, "MQ cloud end-wear synced ($reason): snapshot=$snapshotId")
                 } else if (result.failure == MQBootstrapFailure.AUTH_EXPIRED) {
                     MQRegistry.clearAuthToken(context)
@@ -1505,7 +1602,8 @@ class MQBleManager(
         if (qrCode == null && bleId == null) return
         bootstrapFetchInFlight = true
         lastBootstrapAttemptAtMs = now
-        handler.post {
+        val allowRestore = !localResetPending && lastObservedPacketIndex < 0
+        cloudWork.post { task ->
             try {
                 val result = MQBootstrapClient.fetchBestEffort(
                     context = context,
@@ -1513,13 +1611,13 @@ class MQBleManager(
                     qrCode = qrCode,
                     authToken = MQRegistry.loadAuthToken(context),
                     credentials = MQRegistry.loadAuthCredentials(context),
-                    allowContinueWearRestore = !localResetPending,
+                    allowContinueWearRestore = allowRestore,
                 )
-                applyBootstrapFetchResult(context, id, result, reason)
+                task.deliver { applyBootstrapFetchResult(context, id, result, reason) }
             } catch (t: Throwable) {
                 Log.stack(TAG, "maybeRefreshBootstrapAsync($reason)", t)
             } finally {
-                bootstrapFetchInFlight = false
+                task.deliver { bootstrapFetchInFlight = false }
             }
         }
     }
@@ -1536,25 +1634,21 @@ class MQBleManager(
 
     private fun synthesizeReferenceFromSensitivity(
         rec: MQBgRecord,
-        initTimeMinutes: Double,
         previousProcessed: Double,
     ): Double? {
-        val seed = sensitivitySeed.toDouble()
+        val seed = MQAlgorithm.decimalParameter(sensitivitySeed)
         if (!hasValidSlopeSeed(seed) || rec.packetIndex < MQConstants.ALGO_WARMUP_PACKET_THRESHOLD.toInt()) {
             return null
         }
-        val seeded = MQAlgorithm.calculateResult(
+        val seeded = MQBootstrapSeed.initialReference(
             algorithmVersion = algorithmVersion,
-            initTimeMinutes = initTimeMinutes,
-            packetIndex = rec.packetIndex.toDouble(),
-            sampleCurrent = rec.sampleCurrent.toDouble(),
-            previousReviseCurrent2 = previousProcessed,
-            kValue = seed,
-            referenceBgTimes10Mmol = 0.0,
-            bValue = 2.0,
-            packages = packages.toDouble(),
-            multiplier = multiplier.toDouble(),
-        )
+            packetIndex = rec.packetIndex,
+            sampleCurrent = rec.sampleCurrent,
+            previousProcessed = previousProcessed,
+            sensitivity = seed,
+            packages = packages,
+            multiplier = MQAlgorithm.decimalParameter(multiplier),
+        ) ?: return null
         val syntheticReference = seeded.glucoseTimes10Mmol.toDouble()
         if (syntheticReference <= 0.0) {
             return null
@@ -1579,13 +1673,12 @@ class MQBleManager(
         val previousProcessed = lastProcessed
         val manualReference = pendingReferenceBgTimes10Mmol.takeIf { it > 0.0 && rec.packetIndex > 8 } ?: 0.0
         var reference = manualReference
-        var seedK = kValue.toDouble()
-        var seedB = bValue.toDouble()
+        var seedK = MQAlgorithm.decimalParameter(kValue)
+        var seedB = MQAlgorithm.decimalParameter(bValue)
 
         if (!hasValidSlopeSeed(seedK) && reference <= 0.0) {
             reference = synthesizeReferenceFromSensitivity(
                 rec = rec,
-                initTimeMinutes = initTimeMinutes,
                 previousProcessed = previousProcessed,
             ) ?: return null
             seedK = 0.0
@@ -1605,7 +1698,7 @@ class MQBleManager(
             referenceBgTimes10Mmol = reference,
             bValue = seedB,
             packages = packages.toDouble(),
-            multiplier = multiplier.toDouble(),
+            multiplier = MQAlgorithm.decimalParameter(multiplier),
         )
         lastProcessed = result.reviseCurrent2
         if (hasValidSlopeSeed(result.kValue)) {
@@ -1627,9 +1720,6 @@ class MQBleManager(
                     solvedB = result.bValue,
                 )
             }
-        }
-        if (result.glucoseTimes10Mmol > 0 && hasValidSlopeSeed(result.kValue)) {
-            clearLocalResetPending("live-calculated-k")
         }
         Log.d(
             TAG,
@@ -1664,14 +1754,14 @@ class MQBleManager(
             marker = MQConstants.BG_RECORD_MARKER,
             packetIndex = packetIndex,
             sampleCurrent = sampleCurrent,
-            batteryPercent = lastBatteryPercent.coerceAtLeast(0),
+            batteryRaw = lastBatteryRaw.coerceAtLeast(0),
             recordBytes = byteArrayOf(
                 MQConstants.BG_RECORD_MARKER.toByte(),
                 (packetIndex and 0xFF).toByte(),
                 ((packetIndex shr 8) and 0xFF).toByte(),
                 (sampleCurrent and 0xFF).toByte(),
                 ((sampleCurrent shr 8) and 0xFF).toByte(),
-                lastBatteryPercent.coerceAtLeast(0).toByte(),
+                lastBatteryRaw.coerceAtLeast(0).toByte(),
             ),
         )
         val result = calculateVendorGlucose(rec, sampleMs) ?: return false
@@ -1681,7 +1771,7 @@ class MQBleManager(
             lastGlucoseAtMs = sampleMs
             lastGlucoseMgdlTimes10 = result.mgdlTimes10
         }
-        mirrorReadingIntoNative(sampleMs, result.mgdlTimes10 / 10)
+        mirrorReadingIntoNative(sampleMs, result)
         emitGlucose(result, sampleMs)
         armNoDataWatchdog()
         Log.i(TAG, "Applied local MQ calibration immediately from packet=${rec.packetIndex}")
@@ -1700,13 +1790,18 @@ class MQBleManager(
             maybeRefreshBootstrapAsync(it, "bg-data")
         }
         val nowMs = System.currentTimeMillis()
-        if (sensorStartAtMs == 0L) {
-            sensorStartAtMs = nowMs
-            sensorstartmsec = nowMs
-            warmupStartedAtMs = nowMs
+        val newestPacket = records.filter { it.marker == MQConstants.BG_RECORD_MARKER }.maxOfOrNull { it.packetIndex }
+        val reconciledStart = newestPacket?.let {
+            MQSessionTiming.reconcileStartMs(sensorStartAtMs, nowMs, it, profile.readingIntervalMinutes)
+        } ?: sensorStartAtMs
+        if (reconciledStart != sensorStartAtMs) {
+            sensorStartAtMs = reconciledStart
+            sensorstartmsec = reconciledStart
+            warmupStartedAtMs = reconciledStart
+            Log.i(TAG, "MQ start estimated from running packet=$newestPacket: $reconciledStart (not connection time)")
             Applic.app?.let {
-                persistSensorStart(it, nowMs)
-                persistWarmupStart(it, nowMs)
+                persistSensorStart(it, sensorStartAtMs)
+                persistWarmupStart(it, warmupStartedAtMs)
             }
         }
         ensureNativeDataptr(SerialNumber)
@@ -1734,6 +1829,19 @@ class MQBleManager(
             .sortedBy { it.record.packetIndex }
         clearPendingBgBurst()
         val newest = burst.maxByOrNull { it.record.packetIndex } ?: return
+        if (newest.record.marker == MQConstants.BG_RECORD_MARKER &&
+            newest.record.packetIndex in 1 until 15000 &&
+            newest.record.packetIndex >= lastPacketIndex
+        ) {
+            cloudHistoryAnchor = MQCloudHistoryTiming.Anchor(newest.record.packetIndex, newest.receivedAtMs)
+            val deferred = deferredCloudHistory
+            deferredCloudHistory = null
+            val context = Applic.app
+            val sensorId = SerialNumber
+            if (deferred != null && context != null && sensorId != null &&
+                MQRegistry.loadSnapshotId(context, sensorId) == deferred.first
+            ) importBootstrapHistory(deferred.second, sensorId)
+        }
         Log.i(
             TAG,
             "Flushing MQ BG burst ($reason): records=${burst.size} packet=${burst.first().record.packetIndex}..${newest.record.packetIndex}"
@@ -1754,6 +1862,10 @@ class MQBleManager(
         val intervalMs = profile.readingIntervalMinutes * 60L * 1000L
         val previousLastPacketIndex = lastPacketIndex
         var highestProcessedPacketIndex = lastPacketIndex
+        val firstNewPacket = records.firstOrNull { it.record.packetIndex > previousLastPacketIndex }?.record?.packetIndex
+        if (previousLastPacketIndex >= 0 && firstNewPacket != null && firstNewPacket > previousLastPacketIndex + 1) {
+            Log.w(TAG, "MQ replay gap: last=$previousLastPacketIndex firstReceived=$firstNewPacket; missing records were not in this burst")
+        }
         for (pending in records) {
             val rec = pending.record
             if (previousLastPacketIndex >= 0 && rec.packetIndex <= previousLastPacketIndex) {
@@ -1763,7 +1875,7 @@ class MQBleManager(
             packetCount++
             lastObservedPacketIndex = maxOf(lastObservedPacketIndex, rec.packetIndex)
             lastRawCurrent = rec.sampleCurrent.toDouble()
-            lastBatteryPercent = rec.batteryPercent
+            lastBatteryRaw = rec.batteryRaw
 
             val rb = rec.recordBytes
             val recHex = rb.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
@@ -1772,11 +1884,11 @@ class MQBleManager(
             lastRecordReceivedAtMs = maxOf(lastRecordReceivedAtMs, sampleMs)
             Log.i(
                 TAG,
-                "BG record #${rec.indexInPacket}: [$recHex]  marker=0x%02X  packet=%d  current=%d  battery=%d%%".format(
+                "BG record #${rec.indexInPacket}: [$recHex]  marker=0x%02X  packet=%d  current=%d  batteryRaw=%d".format(
                     rec.marker,
                     rec.packetIndex,
                     rec.sampleCurrent,
-                    rec.batteryPercent,
+                    rec.batteryRaw,
                 )
             )
             if (rec.marker != MQConstants.BG_RECORD_MARKER) {
@@ -1800,7 +1912,7 @@ class MQBleManager(
                 lastGlucoseMgdlTimes10 = result.mgdlTimes10
             }
             highestProcessedPacketIndex = maxOf(highestProcessedPacketIndex, rec.packetIndex)
-            mirrorReadingIntoNative(sampleMs, result.mgdlTimes10 / 10)
+            mirrorReadingIntoNative(sampleMs, result)
             emitGlucose(result, sampleMs)
             Applic.app?.let { maybeUploadLiveReportAsync(it, rec, result) }
         }
@@ -1835,6 +1947,7 @@ class MQBleManager(
     }
 
     private fun writeFrameNow(bytes: ByteArray, tag: String): Boolean {
+        if (stop || phase != Phase.STREAMING) return false
         val gatt = mBluetoothGatt ?: return false
         val ch = charRxWrite ?: return false
         return try {
@@ -1888,7 +2001,9 @@ class MQBleManager(
                 )
                 if (attempt < 3) {
                     val delay = 150L * attempt
-                    handler.postDelayed({ attemptWrite(bytes, tag, attempt + 1) }, delay)
+                    handler.postDelayed({
+                        if (!stop && mBluetoothGatt === gatt) attemptWrite(bytes, tag, attempt + 1)
+                    }, delay)
                 }
             } else {
                 Log.d(TAG, "wrote $tag [$hex] (attempt=$attempt writeType=${ch.writeType})")
@@ -1902,6 +2017,7 @@ class MQBleManager(
         flushPendingBgBurst("close")
         phase = Phase.IDLE
         clearLinkWatchdogs()
+        cloudWork.close()
         try { handlerThread.quitSafely() } catch (_: Throwable) {}
         super.close()
     }

@@ -547,12 +547,16 @@ LOGGER("timeleft=%d\n",timeleft);
         int gid=gl.getId();
         decltype(auto) reshist=res->history();
 extern bool saveSputnik_PG2(const jniHistory &hist,time_t nutime,int nuid,const nfcdata  *nfcptr, SensorGlucoseData &save) ;
-        saveSputnik_PG2(reshist,newnu,gid, data, *hist); 
+        saveSputnik_PG2(reshist,newnu,gid, data, *hist);
+extern int saveScanTrend(const nfcdata *nfcptr,time_t nutime,int nuid, SensorGlucoseData &save) ;
+        /*The patch also holds the 16 one-minute samples before the scan; recover the ones
+          the BLE stream missed instead of leaving them in trends.dat.*/
+        saveScanTrend(data,newnu,gid, *hist);
         sensor *senso=sensors->getsensor(sensorindex);
         if(newnu<(nutime-60*3)) {
 //            lastscan=nullptr;
             LOGGER("senso->finished was %d, set to 1. %s: newnu=%zd nutime=%zd\n",senso->finished,serial.data(),newnu,nutime);
-            senso->finished=1;
+            senso->markFinished();
             extern void    setstreaming(SensorGlucoseData *hist);
             setstreaming(hist);
             void setusedsensors() ;
@@ -1630,5 +1634,4 @@ void closedynlib(void) {
 extern "C" JNIEXPORT void  JNICALL   fromjava(closedynlib)(JNIEnv *env, jclass _cl) {
      closedynlib() ;
     }
-
 

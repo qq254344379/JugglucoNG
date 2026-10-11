@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Build
 import tk.glucodata.Applic
 import tk.glucodata.Log
+import tk.glucodata.Notify
 
 /**
  * Manages snooze state for alerts.
@@ -48,8 +49,14 @@ object SnoozeManager {
             .putBoolean(keyPreemptive(alertType), preemptive)
             .apply()
         
-        // Schedule wake-up alarm
-        scheduleSnoozeExpiry(alertType, snoozeUntil)
+        if (!preemptive) {
+            AlertStateTracker.onAlertSnoozed(alertType)
+        }
+        AlertRuntimeManager.onAlertSnoozed(alertType)
+        Notify.cancelRetrySession(alertType.id, "snoozed")
+        // Acknowledged: a quiet window's silenced episode must not break through now.
+        QuietWindow.clearSilencedEpisode(alertType.id)
+        scheduleSnoozeExpirySafely(alertType, snoozeUntil)
         
         Log.i(LOG_ID, "Snoozed ${alertType.name} for $durationMinutes minutes (preemptive=$preemptive)")
     }
@@ -143,6 +150,14 @@ object SnoozeManager {
     
     private fun keySnoozeUntil(type: AlertType) = "snooze_until_${type.id}"
     private fun keyPreemptive(type: AlertType) = "snooze_preemptive_${type.id}"
+
+    private fun scheduleSnoozeExpirySafely(alertType: AlertType, expiryTime: Long) {
+        try {
+            scheduleSnoozeExpiry(alertType, expiryTime)
+        } catch (t: Throwable) {
+            Log.stack(LOG_ID, "scheduleSnoozeExpiry ${alertType.name}", t)
+        }
+    }
     
     private fun scheduleSnoozeExpiry(alertType: AlertType, expiryTime: Long) {
         val intent = Intent(ACTION_SNOOZE_EXPIRED).apply {

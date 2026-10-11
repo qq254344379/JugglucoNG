@@ -1,8 +1,17 @@
 package tk.glucodata.ui.stats
 
+import android.content.ContextWrapper
 import android.util.Log
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.LifecycleStartEffect
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -10,8 +19,11 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChangedBy
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -23,6 +35,10 @@ import tk.glucodata.UiRefreshBus
 import tk.glucodata.data.HistoryRepository
 import tk.glucodata.data.calibration.CalibrationManager
 import tk.glucodata.drivers.ManagedSensorRuntime
+import tk.glucodata.drivers.ManagedSensorViewModeStore
+import tk.glucodata.drivers.anytime.AnytimeRegistry
+import tk.glucodata.drivers.aidex.AiDexTemperatureStore
+import tk.glucodata.drivers.ottai.OttaiRegistry
 import tk.glucodata.ui.GlucosePoint
 import tk.glucodata.ui.DisplayValueResolver
 import tk.glucodata.ui.util.GlucoseFormatter
@@ -30,33 +46,52 @@ import java.time.Instant
 import java.time.ZoneId
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.sign
 import kotlin.math.sqrt
 
+/**
+ * The one statistics view model for the whole activity.
+ *
+ * A plain `viewModel()` inside a `composable("stats") { … }` scopes to that destination's
+ * [androidx.navigation.NavBackStackEntry]. Bottom navigation here pops the destination it
+ * leaves — `popUpTo(startDestination) { saveState = true }` — and popping clears that
+ * entry's `ViewModelStore`; `saveState` preserves a `SavedStateHandle`, not view models.
+ * So every single visit to the Statistics tab was building a new view model from nothing:
+ * a fresh Room subscription, another native backfill check, and every statistic
+ * recomputed against an empty cache. The dashboard strip was getting a second instance of
+ * its own for the same reason, doing the same work twice over.
+ *
+ * Scoping to the activity means one instance, built once, kept warm.
+ */
+@Composable
+internal fun rememberStatsViewModel(): StatsViewModel {
+    val context = LocalContext.current
+    val owner = remember(context) {
+        generateSequence(context) { (it as? ContextWrapper)?.baseContext }
+            .filterIsInstance<ViewModelStoreOwner>()
+            .firstOrNull()
+    }
+    val model = viewModel<StatsViewModel>(
+        viewModelStoreOwner = owner ?: checkNotNull(LocalViewModelStoreOwner.current)
+    )
+    val consumer = remember(model) { Any() }
+    LifecycleStartEffect(model, consumer) {
+        model.acquireUiObservation(consumer)
+        onStopOrDispose { model.releaseUiObservation(consumer) }
+    }
+    return model
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
 class StatsViewModel : ViewModel() {
     private val tag = "StatsViewModel"
     private val historyRepository = HistoryRepository()
 
-    private data class StatsHistorySignature(
-        val size: Int,
-        val firstTimestamp: Long,
-        val lastTimestamp: Long,
-        val contentHash: Long
-    )
-
-    private data class StatsHistoryEdgeSignature(
-        val size: Int,
-        val firstTimestamp: Long,
-        val middleTimestamp: Long,
-        val lastTimestamp: Long,
-        val firstValueBits: Int,
-        val middleValueBits: Int,
-        val lastValueBits: Int
-    )
-
     private data class StatsDisplayHistoryCacheKey(
         val historySignature: StatsHistorySignature,
         val viewMode: Int,
+        val sensorModesHash: Long,
         val unit: GlucoseUnit,
         val calibrationRevision: Long,
         val activeSerial: String?
@@ -65,6 +100,7 @@ class StatsViewModel : ViewModel() {
     private data class StatsRangeProjectionCacheKey(
         val historySignature: StatsHistorySignature,
         val viewMode: Int,
+        val sensorModesHash: Long,
         val unit: GlucoseUnit,
         val calibrationRevision: Long,
         val activeSerial: String?,
@@ -81,10 +117,27 @@ class StatsViewModel : ViewModel() {
         val summary: StatsSummary
     )
 
-    private val _selectedRange = MutableStateFlow<StatsTimeRange?>(StatsTimeRange.DAY_1)
+    private data class CachedRenderedState(
+        val serial: String,
+        val state: StatsUiState
+    )
+
+    private val restoredSelection: StatsRangeSelection? = StatsRangeStore.load(Applic.app)
+    private val _selectedRange = MutableStateFlow<StatsTimeRange?>(
+        when (restoredSelection) {
+            is StatsRangeSelection.Preset -> restoredSelection.range
+            is StatsRangeSelection.Custom -> null
+            null -> DEFAULT_STATS_RANGE
+        }
+    )
     val selectedRange: StateFlow<StatsTimeRange?> = _selectedRange.asStateFlow()
-    private val _customRange = MutableStateFlow<StatsDateRange?>(null)
+    private val _customRange = MutableStateFlow(
+        (restoredSelection as? StatsRangeSelection.Custom)?.range
+    )
     private val _availableRange = MutableStateFlow<StatsDateRange?>(null)
+    // A restored custom range may reach outside the data that exists today; it gets
+    // clamped once the available range is known.
+    private var pendingRestoredCustomClamp = restoredSelection is StatsRangeSelection.Custom
 
     private val _unit = MutableStateFlow(GlucoseUnit.MGDL)
     private val _targets = MutableStateFlow(StatsTargets())
@@ -95,19 +148,66 @@ class StatsViewModel : ViewModel() {
     private val _historyPoints = MutableStateFlow<List<GlucosePoint>>(emptyList())
     private val _temperaturePoints = MutableStateFlow<List<TemperaturePoint>>(emptyList())
 
+    private val uiObservation: StatsUiObservationSession = StatsUiObservationSession(
+        parentScope = viewModelScope,
+        onStart = {
+            observeUiRefreshBus()
+            refreshFromNative()
+        },
+        onStop = {
+            // Keep displayed history and projection caches for an immediate return.
+            historyJob = null
+            availableRangeJob = null
+        },
+    )
+
+    internal fun acquireUiObservation(consumer: Any) = uiObservation.acquire(consumer)
+    internal fun releaseUiObservation(consumer: Any) = uiObservation.release(consumer)
+
     private var historyJob: Job? = null
     private var activeSerial: String? = null
     private var historyWindowStartMs: Long = Long.MAX_VALUE
     private var cachedTemperatureSerial: String? = null
     private var cachedTemperaturePoints: List<TemperaturePoint> = emptyList()
+    private var cachedTemperatureHistoryStartMs: Long = Long.MAX_VALUE
+    private var cachedTemperatureHistoryEndMs: Long = Long.MIN_VALUE
     private var lastTemperatureRefreshMs: Long = 0L
+    private var availableRangeJob: Job? = null
     @Volatile private var statsDisplayHistoryCacheKey: StatsDisplayHistoryCacheKey? = null
     @Volatile private var statsDisplayHistoryCacheValue: List<GlucosePoint> = emptyList()
-    @Volatile private var statsRangeProjectionCacheKey: StatsRangeProjectionCacheKey? = null
-    @Volatile private var statsRangeProjectionCacheValue = StatsRangeProjection(
-        filteredHistory = emptyList(),
-        summary = StatsSummary()
-    )
+    /**
+     * One slot per consumer. The statistics screen and the dashboard strip ask for
+     * different windows of the same history, so a single shared slot would have been
+     * invalidated by whichever of them recomposed last.
+     */
+    private class ProjectionCache {
+        @Volatile var key: StatsRangeProjectionCacheKey? = null
+        @Volatile var value = StatsRangeProjection(
+            filteredHistory = emptyList(),
+            summary = StatsSummary()
+        )
+    }
+
+    private val screenProjectionCache = ProjectionCache()
+    private val pinnedProjectionCache = ProjectionCache()
+
+    /**
+     * The window the dashboard strip is summarising. Its own, so that cycling the pill on
+     * the dashboard no longer overwrites — and persists — whichever range the user had
+     * chosen on the statistics screen.
+     */
+    private val _pinnedWindow = MutableStateFlow<PinnedWindow?>(null)
+
+    /**
+     * Which deferred parts anything has actually read. Shared across summaries and across
+     * threads, so it is a concurrent set rather than a plain one.
+     */
+    private val demandedParts: MutableSet<StatsPart> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** True from the moment a range is chosen until the state for it has been built. */
+    private val _isSwitchingRange = MutableStateFlow(false)
+    val isSwitchingRange: StateFlow<Boolean> = _isSwitchingRange.asStateFlow()
 
     private val baseState = combine(
         _selectedRange,
@@ -148,41 +248,109 @@ class StatsViewModel : ViewModel() {
             calibrationRevision = base.calibrationRevision,
             isLoading = base.isLoading,
             hasSensor = base.hasSensor,
+            activeSerial = activeSerial,
             historyPoints = history,
             temperaturePoints = temperature
         )
-    }.map { input ->
+    }.mapLatest { input ->
         withContext(Dispatchers.Default) {
-            buildUiState(input)
-        }
+            buildUiState(input).also { state ->
+                // Everything already known to be on screen is resolved here, on this
+                // thread, before the state is handed to the UI.
+                (state.summary.parts as? LazyStatsParts)?.warmDemanded()
+                rememberRenderedState(input.activeSerial, state)
+            }
+        }.also { _isSwitchingRange.value = false }
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = StatsUiState()
+        initialValue = resolveInitialUiState()
+    )
+
+    /**
+     * Numbers for the dashboard strip, over the strip's own window.
+     *
+     * Deliberately a second flow rather than a second reader of [uiState]: the strip must
+     * not drag the statistics screen's range around with it — cycling the window pill used
+     * to overwrite and persist whatever range the user had chosen on the statistics screen
+     * — and the screen's full projection is far more work than three chips need. Both go
+     * through [resolveRangeProjection], so where the windows agree the numbers agree.
+     */
+    internal val pinnedState: StateFlow<StatsPinnedState> = combine(
+        baseState,
+        _historyPoints,
+        _pinnedWindow
+    ) { base, history, window ->
+        PinnedInput(
+            unit = base.unit,
+            targets = base.targets,
+            viewMode = base.viewMode,
+            calibrationRevision = base.calibrationRevision,
+            history = history,
+            window = window
+        )
+    }.mapLatest { input ->
+        withContext(Dispatchers.Default) { buildPinnedState(input) }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = StatsPinnedState()
     )
 
     init {
-        observeUiRefreshBus()
-        refreshFromNative()
+        if (pendingRestoredCustomClamp) {
+            clampRestoredCustomRangeWhenAvailable()
+        }
+    }
+
+    internal fun setPinnedWindow(window: PinnedWindow?) {
+        if (_pinnedWindow.value == window) return
+        _pinnedWindow.value = window
+        resubscribeToRequestedWindow()
     }
 
     fun setTimeRange(range: StatsTimeRange) {
+        pendingRestoredCustomClamp = false
         if (_selectedRange.value == range && _customRange.value == null) return
+        // The screen says so straight away. Recomputing is quick now, but "quick" is not
+        // "instant", and a control that goes dead for a moment with no acknowledgement
+        // reads as a control that did not register the tap.
+        _isSwitchingRange.value = true
         _selectedRange.value = range
         _customRange.value = null
+        StatsRangeStore.savePreset(Applic.app, range)
         resubscribeToRequestedWindow()
     }
 
     fun setCustomRange(startMillis: Long, endMillis: Long) {
+        pendingRestoredCustomClamp = false
         val normalizedRange = normalizeCustomRange(startMillis, endMillis)
         if (_customRange.value == normalizedRange && _selectedRange.value == null) return
+        _isSwitchingRange.value = true
         _selectedRange.value = null
         _customRange.value = normalizedRange
+        StatsRangeStore.saveCustom(Applic.app, normalizedRange)
         resubscribeToRequestedWindow()
     }
 
-    private fun observeUiRefreshBus() {
+    private fun clampRestoredCustomRangeWhenAvailable() {
         viewModelScope.launch {
+            val available = _availableRange.filterNotNull().first()
+            if (!pendingRestoredCustomClamp) return@launch
+            pendingRestoredCustomClamp = false
+            val restored = _customRange.value ?: return@launch
+            val clamped = clampStatsDateRangeToAvailable(restored, available)
+            if (clamped == null) {
+                _customRange.value = null
+                _selectedRange.value = DEFAULT_STATS_RANGE
+            } else if (clamped != restored) {
+                _customRange.value = clamped
+            }
+        }
+    }
+
+    private fun observeUiRefreshBus() {
+        uiObservation.scope?.launch {
             UiRefreshBus.events.collect { event ->
                 when (event) {
                     UiRefreshBus.Event.DataChanged -> refreshFromNative()
@@ -216,14 +384,22 @@ class StatsViewModel : ViewModel() {
             targets = _targets.value,
             isLoading = _isLoading.value,
             hasSensor = _hasSensor.value,
-            summary = calculateSummary(filteredHistory, _targets.value),
+            summary = calculateSummary(
+                history = filteredHistory,
+                targets = _targets.value,
+                unit = _unit.value,
+                activeRange = StatsDateRange(
+                    startMillis = cutoff,
+                    endMillis = System.currentTimeMillis()
+                )
+            ),
             temperaturePoints = filteredTemperature,
             readings = filteredHistory
         )
     }
 
     fun refreshFromNative() {
-        viewModelScope.launch {
+        uiObservation.scope?.launch {
             _calibrationRevision.value = CalibrationManager.getRevision()
             val unit = resolveUnit()
             _unit.value = unit
@@ -251,32 +427,55 @@ class StatsViewModel : ViewModel() {
                 _viewMode.value = 0
                 activeSerial = null
                 historyWindowStartMs = Long.MAX_VALUE
+                cachedTemperatureSerial = null
+                cachedTemperaturePoints = emptyList()
+                cachedTemperatureHistoryStartMs = Long.MAX_VALUE
+                cachedTemperatureHistoryEndMs = Long.MIN_VALUE
+                lastTemperatureRefreshMs = 0L
                 historyJob?.cancel()
+                availableRangeJob?.cancel()
                 return@launch
             }
 
             _hasSensor.value = true
             _viewMode.value = resolveViewModeForStats(serial)
-            subscribeToHistory(serial, resolveSubscriptionStartTime())
+            val requestedStartTime = resolveSubscriptionStartTime()
+            // Ordinary glucose updates arrive through the active Room flow.
+            val shouldSubscribe = serial != activeSerial ||
+                needsHistoryWindowExpansion(requestedStartTime) ||
+                historyJob?.isActive != true
+            if (shouldSubscribe) {
+                subscribeToHistory(serial, requestedStartTime)
+            } else {
+                refreshAvailableRangeAsync()
+            }
         }
     }
 
     private fun subscribeToHistory(serial: String, startTime: Long) {
+        val observationScope = uiObservation.scope ?: return
         historyJob?.cancel()
-        _isLoading.value = true
+        val previousSerial = activeSerial
+        val previousWindowStart = historyWindowStartMs
+        _isLoading.value = _historyPoints.value.isEmpty() ||
+            previousSerial != serial ||
+            startTime < previousWindowStart
         activeSerial = serial
         historyWindowStartMs = startTime
 
-        historyJob = viewModelScope.launch {
-            if (!isImportedHistoryOnlySerial(serial)) {
-                withContext(Dispatchers.IO) {
+        historyJob = observationScope.launch {
+            refreshAvailableRangeAsync()
+            // Native backfill can be slow on reopen; don't block already-persisted Room data.
+            launch(Dispatchers.IO) {
+                if (!isImportedHistoryOnlySerial(serial)) {
                     historyRepository.ensureBackfilled(serial, startTime)
                 }
+                _availableRange.value = loadAvailableRange()
             }
-            _availableRange.value = loadAvailableRange()
 
             historyRepository.getDisplayHistoryFlowForStats(serial, startTime)
-                .distinctUntilChangedBy(::historyEdgeSignature)
+                .conflate()
+                .distinctUntilChangedBy(::statsHistorySignature)
                 .collect { points ->
                     _historyPoints.value = points
                     _isLoading.value = false
@@ -298,7 +497,7 @@ class StatsViewModel : ViewModel() {
     }
 
     private fun refreshDisplayState() {
-        viewModelScope.launch {
+        uiObservation.scope?.launch {
             _calibrationRevision.value = CalibrationManager.getRevision()
             val unit = resolveUnit()
             _unit.value = unit
@@ -325,7 +524,7 @@ class StatsViewModel : ViewModel() {
 
             _hasSensor.value = true
             _viewMode.value = resolveViewModeForStats(serial)
-            _availableRange.value = loadAvailableRange()
+            refreshAvailableRangeAsync()
 
             if (serial != activeSerial || needsHistoryWindowExpansion(resolveSubscriptionStartTime())) {
                 subscribeToHistory(serial, resolveSubscriptionStartTime())
@@ -350,19 +549,28 @@ class StatsViewModel : ViewModel() {
         )
     }
 
-    private fun resolveViewMode(serial: String): Int {
+    private fun resolveViewModeOrNull(serial: String): Int? {
         ManagedSensorRuntime.resolveUiSnapshot(serial, serial)?.let { managedSnapshot ->
             return managedSnapshot.viewMode
         }
-        if (!SensorIdentity.hasNativeSensorBacking(serial)) {
-            return 0
+        if (SensorIdentity.hasNativeSensorBacking(serial)) {
+            val nativeMode = try {
+                val snapshot = Natives.getSensorUiSnapshot(serial)
+                if (snapshot != null && snapshot.size >= 2) snapshot[1].toInt() else null
+            } catch (_: Throwable) {
+                null
+            }
+            if (nativeMode != null) return nativeMode.coerceIn(0, 3)
         }
-        return try {
-            val snapshot = Natives.getSensorUiSnapshot(serial)
-            if (snapshot != null && snapshot.size >= 2) snapshot[1].toInt() else 0
-        } catch (_: Throwable) {
-            0
-        }
+        return SensorIdentity.resolveRoomQuerySensorIds(serial)
+            .asSequence()
+            .mapNotNull { candidate -> ManagedSensorViewModeStore.readOrNull(Applic.app, candidate) }
+            .firstOrNull()
+            ?: ManagedSensorViewModeStore.readOrNull(Applic.app, serial)
+    }
+
+    private fun resolveViewMode(serial: String): Int {
+        return resolveViewModeOrNull(serial) ?: 0
     }
 
     private fun resolveViewModeForStats(serial: String): Int {
@@ -374,10 +582,19 @@ class StatsViewModel : ViewModel() {
     }
 
     private fun resubscribeToRequestedWindow() {
+        if (uiObservation.scope == null) return
         val serial = activeSerial ?: resolveStatsSensorSerial() ?: return
         val requestedStartTime = resolveSubscriptionStartTime()
         if (serial != activeSerial || needsHistoryWindowExpansion(requestedStartTime)) {
             subscribeToHistory(serial, requestedStartTime)
+        }
+    }
+
+    private fun refreshAvailableRangeAsync() {
+        val observationScope = uiObservation.scope ?: return
+        availableRangeJob?.cancel()
+        availableRangeJob = observationScope.launch(Dispatchers.IO) {
+            _availableRange.value = loadAvailableRange()
         }
     }
 
@@ -391,15 +608,43 @@ class StatsViewModel : ViewModel() {
         }
     }
 
+    /**
+     * How far back the history subscription has to reach.
+     *
+     * Deliberately not narrowed to whoever happens to be on screen. Deferring the wide
+     * read until the statistics screen composed did make app start cheaper, but it moved
+     * the whole cost onto the moment you open that screen — cancelling the live
+     * subscription, re-reading the database and flipping the screen back into its loading
+     * state on every first visit. The prefetch is what makes the screen open instantly;
+     * it happens in the background while the dashboard is up, and that is the right
+     * trade.
+     */
     private fun resolveSubscriptionStartTime(): Long {
+        val screenStart = resolveScreenSubscriptionStartTime()
+        val pinnedStart = _pinnedWindow.value?.resolveRange()?.startMillis
+        return if (pinnedStart != null) minOf(screenStart, pinnedStart) else screenStart
+    }
+
+    private fun resolveScreenSubscriptionStartTime(): Long {
         val customRange = _customRange.value
         return when {
-            customRange != null -> customRange.startMillis
+            customRange != null -> {
+                val spanDays = customRange.daySpan.toLong()
+                if (spanDays in 1..COMPARISON_MAX_RANGE_DAYS) {
+                    (customRange.startMillis - (spanDays * DAY_MS)).coerceAtLeast(0L)
+                } else {
+                    customRange.startMillis
+                }
+            }
             _selectedRange.value == StatsTimeRange.DAY_ALL -> 0L
             else -> {
                 val quickRangeDays = (_selectedRange.value ?: DEFAULT_STATS_RANGE).days.toLong()
                 val endMillis = _availableRange.value?.endMillis ?: System.currentTimeMillis()
-                (endMillis - (quickRangeDays * DAY_MS) + 1L).coerceAtLeast(0L)
+                // Load one extra period so the screen can say how this window compares to
+                // the one before it. Only for short windows — doubling a 90-day pull of
+                // 1-minute data costs far more than the comparison chip is worth.
+                val periods = if (quickRangeDays <= COMPARISON_MAX_RANGE_DAYS) 2L else 1L
+                (endMillis - (quickRangeDays * periods * DAY_MS) + 1L).coerceAtLeast(0L)
             }
         }
     }
@@ -467,33 +712,37 @@ class StatsViewModel : ViewModel() {
         history: List<GlucosePoint>,
         viewMode: Int,
         unit: GlucoseUnit,
-        historySignature: StatsHistorySignature = historySignature(history)
+        historySignature: StatsHistorySignature = statsHistorySignature(history),
+        useCache: Boolean = true
     ): List<GlucosePoint> {
         if (history.isEmpty()) return emptyList()
 
+        val sensorViewModes = resolveHistoricalSensorViewModes(history, viewMode)
+        val sensorModesHash = sensorViewModesHash(sensorViewModes)
         val calibrationRevision = CalibrationManager.getRevision()
         val cacheKey = StatsDisplayHistoryCacheKey(
             historySignature = historySignature,
             viewMode = viewMode,
+            sensorModesHash = sensorModesHash,
             unit = unit,
             calibrationRevision = calibrationRevision,
             activeSerial = activeSerial
         )
-        if (statsDisplayHistoryCacheKey == cacheKey) {
+        if (useCache && statsDisplayHistoryCacheKey == cacheKey) {
             return statsDisplayHistoryCacheValue
         }
 
-        val isRawMode = viewMode == 1 || viewMode == 3
         val isMmol = unit == GlucoseUnit.MMOL
-        val overwriteSensorValues = CalibrationManager.shouldOverwriteSensorValues()
         val hideInitialWhenCalibrated = CalibrationManager.shouldHideInitialWhenCalibrated()
         val sensorSerial = activeSerial ?: history.firstOrNull()?.sensorSerial
         val calibratedDisplayValues = arrayOfNulls<Float>(history.size)
 
-        if (!overwriteSensorValues) {
+        run {
             history.withIndex()
                 .groupBy { indexedPoint -> indexedPoint.value.sensorSerial ?: sensorSerial }
                 .forEach { (pointSensorSerial, indexedPoints) ->
+                    val pointViewMode = sensorViewModes[pointSensorSerial] ?: viewMode
+                    val isRawMode = pointViewMode == 1 || pointViewMode == 3
                     if (pointSensorSerial == null || !CalibrationManager.hasActiveCalibration(isRawMode, pointSensorSerial)) {
                         return@forEach
                     }
@@ -518,17 +767,50 @@ class StatsViewModel : ViewModel() {
                         }
                     }
                 }
+
+            // A reading whose displayed value was recorded overrides the series
+            // recomputed above: the statistic has to describe what was on screen,
+            // not what today's calibration would have made of it. The record only
+            // overrides the lane it was shown on — a raw-line record says nothing
+            // about the auto line (see recordAppliesToLane), or a past raw-mode
+            // stretch would poison the auto statistics with raw numbers.
+            //
+            // Converted, because the two sides are not in the same unit.
+            // [calibratedDisplayValues] holds display units — it is filled from
+            // `getCalibratedSeries` over samples that were themselves converted
+            // with `displayFromMgDl`. A recorded main value is mg/dL, matching how
+            // readings are stored. Assigning it straight in put 292 where 16.2
+            // belonged, `DisplayValueResolver` rejected the implausible result,
+            // and `mapIndexedNotNull` below dropped the point — so every reading
+            // that had a record silently vanished from the statistics and only
+            // the unsealed last hour survived. Harmless while the record was
+            // sparse enough to almost never fire; total once coverage was fixed.
+            history.forEachIndexed { index, point ->
+                val pointSensorSerial = point.sensorSerial ?: sensorSerial
+                val pointViewMode = sensorViewModes[pointSensorSerial] ?: viewMode
+                val isRawMode = pointViewMode == 1 || pointViewMode == 3
+                point.sealedDisplayValue
+                    ?.takeIf { it.isFinite() && it > 0f }
+                    ?.takeIf {
+                        tk.glucodata.chart.HistoryChartModelBuilder.recordAppliesToLane(
+                            point.sealedDisplayViewMode ?: -1,
+                            isRawMode
+                        )
+                    }
+                    ?.let { calibratedDisplayValues[index] = GlucoseFormatter.displayFromMgDl(it, isMmol) }
+            }
         }
 
         val resolved = history.mapIndexedNotNull { index, point ->
+            val pointSensorSerial = point.sensorSerial ?: sensorSerial
+            val pointViewMode = sensorViewModes[pointSensorSerial] ?: viewMode
             val displayAutoValue = GlucoseFormatter.displayFromMgDl(point.value, isMmol)
             val displayRawValue = GlucoseFormatter.displayFromMgDl(point.rawValue, isMmol)
             val calibratedDisplayValue = calibratedDisplayValues[index]
-
             val primaryValueMgDl = resolvePrimaryStatsValueMgDl(
                 displayAutoValue = displayAutoValue,
                 displayRawValue = displayRawValue,
-                viewMode = viewMode,
+                viewMode = pointViewMode,
                 unit = unit,
                 calibratedDisplayValue = calibratedDisplayValue,
                 hideInitialWhenCalibrated = calibratedDisplayValue != null && hideInitialWhenCalibrated
@@ -539,9 +821,55 @@ class StatsViewModel : ViewModel() {
                 point.copy(value = primaryValueMgDl, rawValue = primaryValueMgDl)
             }
         }
-        statsDisplayHistoryCacheKey = cacheKey
-        statsDisplayHistoryCacheValue = resolved
+        if (useCache) {
+            statsDisplayHistoryCacheKey = cacheKey
+            statsDisplayHistoryCacheValue = resolved
+        }
         return resolved
+    }
+
+    private fun resolveHistoricalSensorViewModes(
+        history: List<GlucosePoint>,
+        activeViewMode: Int
+    ): Map<String?, Int> {
+        val sensorIds = LinkedHashSet<String?>()
+        history.forEach { point -> sensorIds.add(point.sensorSerial ?: activeSerial) }
+        return sensorIds.associateWith { sensorId ->
+            resolveHistoricalSensorViewMode(sensorId, activeViewMode)
+        }
+    }
+
+    private fun resolveHistoricalSensorViewMode(sensorId: String?, activeViewMode: Int): Int {
+        if (sensorId.isNullOrBlank()) return activeViewMode.coerceIn(0, 3)
+        val isImported = isImportedHistoryOnlySerial(sensorId) ||
+            sensorId == "imported" || sensorId == "unknown"
+        val hasRawCalibration = CalibrationManager.hasCalibrationPointsForMode(
+            isRawMode = true,
+            sensorIdOverride = sensorId
+        )
+        val hasAutoCalibration = CalibrationManager.hasCalibrationPointsForMode(
+            isRawMode = false,
+            sensorIdOverride = sensorId
+        )
+        return HistoricalSensorModePolicy.resolve(
+            activeViewMode = activeViewMode,
+            isImported = isImported,
+            resolvedStoredMode = if (isImported) null else resolveViewModeOrNull(sensorId),
+            hasRawCalibration = hasRawCalibration,
+            hasAutoCalibration = hasAutoCalibration,
+            matchesActiveSensor = !activeSerial.isNullOrBlank() && SensorIdentity.matches(sensorId, activeSerial)
+        )
+    }
+
+    private fun sensorViewModesHash(sensorViewModes: Map<String?, Int>): Long {
+        var hash = 1125899906842597L
+        sensorViewModes.entries
+            .sortedBy { it.key.orEmpty() }
+            .forEach { (sensorId, mode) ->
+                hash = 31L * hash + (sensorId?.hashCode()?.toLong() ?: 0L)
+                hash = 31L * hash + mode.toLong()
+            }
+        return hash
     }
 
     private fun resolveRangeProjection(
@@ -549,7 +877,10 @@ class StatsViewModel : ViewModel() {
         viewMode: Int,
         unit: GlucoseUnit,
         targets: StatsTargets,
-        activeRange: StatsDateRange?
+        activeRange: StatsDateRange?,
+        cache: ProjectionCache = screenProjectionCache,
+        useDisplayCache: Boolean = true,
+        withComparison: Boolean = true
     ): StatsRangeProjection {
         if (history.isEmpty()) {
             return StatsRangeProjection(
@@ -566,10 +897,12 @@ class StatsViewModel : ViewModel() {
             )
         }
 
-        val historySignature = historySignature(rawHistory)
+        val historySignature = statsHistorySignature(rawHistory)
+        val sensorModesHash = sensorViewModesHash(resolveHistoricalSensorViewModes(rawHistory, viewMode))
         val cacheKey = StatsRangeProjectionCacheKey(
             historySignature = historySignature,
             viewMode = viewMode,
+            sensorModesHash = sensorModesHash,
             unit = unit,
             calibrationRevision = CalibrationManager.getRevision(),
             activeSerial = activeSerial,
@@ -580,26 +913,80 @@ class StatsViewModel : ViewModel() {
             veryLowMgDl = targets.veryLowMgDl,
             veryHighMgDl = targets.veryHighMgDl
         )
-        if (statsRangeProjectionCacheKey == cacheKey) {
-            return statsRangeProjectionCacheValue
+        if (cache.key == cacheKey) {
+            return cache.value
         }
 
         val displayHistory = resolveStatsDisplayHistory(
             history = rawHistory,
             viewMode = viewMode,
             unit = unit,
-            historySignature = historySignature
+            historySignature = historySignature,
+            useCache = useDisplayCache
         )
         val filteredHistory = displayHistory.filter { point ->
             isStatsValueValid(point.value)
         }
         val projection = StatsRangeProjection(
             filteredHistory = filteredHistory,
-            summary = calculateSummary(filteredHistory, targets)
+            summary = calculateSummary(
+                history = filteredHistory,
+                targets = targets,
+                unit = unit,
+                activeRange = activeRange,
+                previousScalars = if (withComparison) {
+                    resolvePreviousPeriodScalars(
+                        history = history,
+                        viewMode = viewMode,
+                        unit = unit,
+                        targets = targets,
+                        activeRange = activeRange,
+                        currentReadingCount = filteredHistory.size
+                    )
+                } else {
+                    null
+                }
+            )
         )
-        statsRangeProjectionCacheKey = cacheKey
-        statsRangeProjectionCacheValue = projection
+        cache.key = cacheKey
+        cache.value = projection
         return projection
+    }
+
+    /**
+     * Scalars for the equally long window immediately before the active one.
+     *
+     * Returns null unless that window is loaded and holds enough readings to compare
+     * honestly — a "+18 points" chip computed against two days of data is worse than
+     * no chip at all.
+     */
+    private fun resolvePreviousPeriodScalars(
+        history: List<GlucosePoint>,
+        viewMode: Int,
+        unit: GlucoseUnit,
+        targets: StatsTargets,
+        activeRange: StatsDateRange?,
+        currentReadingCount: Int
+    ): PeriodScalars? {
+        if (activeRange == null || currentReadingCount < MIN_COMPARISON_READINGS) return null
+        val spanMillis = activeRange.endMillis - activeRange.startMillis
+        if (spanMillis <= 0L || activeRange.daySpan > COMPARISON_MAX_RANGE_DAYS) return null
+
+        val previousRange = StatsDateRange(
+            startMillis = (activeRange.startMillis - spanMillis - 1L).coerceAtLeast(0L),
+            endMillis = activeRange.startMillis - 1L
+        )
+        val rawPrevious = filterHistoryForRange(history, previousRange)
+        if (rawPrevious.size < currentReadingCount * MIN_COMPARISON_COVERAGE) return null
+
+        val values = resolveStatsDisplayHistory(
+            history = rawPrevious,
+            viewMode = viewMode,
+            unit = unit,
+            useCache = false
+        ).mapNotNull { point -> point.value.takeIf { isStatsValueValid(it) } }
+        if (values.size < currentReadingCount * MIN_COMPARISON_COVERAGE) return null
+        return StatsAnalytics.periodScalars(values, targets)
     }
 
     private fun filterHistoryForRange(
@@ -667,51 +1054,18 @@ class StatsViewModel : ViewModel() {
         return toMgDl(primaryDisplayValue, unit)
     }
 
-    private fun historySignature(points: List<GlucosePoint>): StatsHistorySignature {
-        if (points.isEmpty()) {
-            return StatsHistorySignature(
-                size = 0,
-                firstTimestamp = 0L,
-                lastTimestamp = 0L,
-                contentHash = 0L
-            )
-        }
-
-        var hash = 1125899906842597L
-        points.forEach { point ->
-            hash = 31L * hash + point.timestamp
-            hash = 31L * hash + java.lang.Float.floatToRawIntBits(point.value).toLong()
-            hash = 31L * hash + java.lang.Float.floatToRawIntBits(point.rawValue).toLong()
-            hash = 31L * hash + (point.sensorSerial?.hashCode()?.toLong() ?: 0L)
-        }
-
-        return StatsHistorySignature(
-            size = points.size,
-            firstTimestamp = points.first().timestamp,
-            lastTimestamp = points.last().timestamp,
-            contentHash = hash
-        )
-    }
-
-    private fun historyEdgeSignature(points: List<GlucosePoint>): StatsHistoryEdgeSignature {
-        if (points.isEmpty()) {
-            return StatsHistoryEdgeSignature(0, 0L, 0L, 0L, 0, 0, 0)
-        }
-        val middle = points[points.lastIndex / 2]
-        return StatsHistoryEdgeSignature(
-            size = points.size,
-            firstTimestamp = points.first().timestamp,
-            middleTimestamp = middle.timestamp,
-            lastTimestamp = points.last().timestamp,
-            firstValueBits = java.lang.Float.floatToRawIntBits(points.first().value),
-            middleValueBits = java.lang.Float.floatToRawIntBits(middle.value),
-            lastValueBits = java.lang.Float.floatToRawIntBits(points.last().value)
-        )
-    }
-
     private fun maybeRefreshTemperaturePoints(serial: String, history: List<GlucosePoint>): List<TemperaturePoint> {
         val now = System.currentTimeMillis()
+        val historyStartMs = history.firstOrNull()?.timestamp ?: Long.MAX_VALUE
+        val historyEndMs = history.lastOrNull()?.timestamp ?: Long.MIN_VALUE
+        val historyWindowExpanded = historyStartMs < cachedTemperatureHistoryStartMs
+        // A new reading means a new temperature sample too — without this the card is
+        // stuck on whatever it read up to 15 minutes ago and looks like it never grows.
+        val newerReadingArrived = historyEndMs > cachedTemperatureHistoryEndMs
         val shouldRefresh = serial != cachedTemperatureSerial ||
+            historyWindowExpanded ||
+            newerReadingArrived ||
+            (cachedTemperaturePoints.isEmpty() && history.isNotEmpty()) ||
             now - lastTemperatureRefreshMs > TEMPERATURE_REFRESH_INTERVAL_MS
 
         if (!shouldRefresh) {
@@ -721,6 +1075,8 @@ class StatsViewModel : ViewModel() {
         val refreshed = readTemperaturePoints(serial, history)
         cachedTemperatureSerial = serial
         cachedTemperaturePoints = refreshed
+        cachedTemperatureHistoryStartMs = historyStartMs
+        cachedTemperatureHistoryEndMs = historyEndMs
         lastTemperatureRefreshMs = now
         return refreshed
     }
@@ -761,6 +1117,15 @@ class StatsViewModel : ViewModel() {
     }
 
     private fun readTemperaturePoints(serial: String, history: List<GlucosePoint>): List<TemperaturePoint> {
+        readAnytimeTemperaturePoints(serial, history).takeIf { it.isNotEmpty() }?.let {
+            return it
+        }
+        readOttaiTemperaturePoints(serial, history).takeIf { it.isNotEmpty() }?.let {
+            return it
+        }
+        readAiDexTemperaturePoints(serial, history).takeIf { it.isNotEmpty() }?.let {
+            return it
+        }
         return try {
             val tempRaw = Natives.getTemperatureDataByName(serial)
             if (tempRaw == null || tempRaw.isEmpty()) return emptyList()
@@ -789,7 +1154,191 @@ class StatsViewModel : ViewModel() {
         }
     }
 
+    private fun readAnytimeTemperaturePoints(serial: String, history: List<GlucosePoint>): List<TemperaturePoint> {
+        return try {
+            val context = Applic.app ?: return emptyList()
+            val sensorIds = resolveAnytimeTemperatureSensorIds(context, serial)
+            val records = sensorIds
+                .asSequence()
+                .map { AnytimeRegistry.loadTemperatureHistory(context, it) }
+                .firstOrNull { it.isNotEmpty() }
+                .orEmpty()
+            if (records.isEmpty()) return emptyList()
+
+            val firstTs = history.firstOrNull()?.timestamp ?: Long.MIN_VALUE
+            val lastTs = history.lastOrNull()?.timestamp ?: Long.MAX_VALUE
+            records.asSequence()
+                .filter { it.timestampMs > 0L }
+                .filter { history.isEmpty() || it.timestampMs in firstTs..lastTs }
+                .filter { it.temperatureC.isFinite() && it.temperatureC > -20f && it.temperatureC < 80f }
+                .distinctBy { it.timestampMs }
+                .sortedBy { it.timestampMs }
+                .map {
+                    TemperaturePoint(
+                        timestamp = it.timestampMs,
+                        temperatureCelsius = it.temperatureC
+                    )
+                }
+                .toList()
+        } catch (e: Throwable) {
+            Log.e(tag, "readAnytimeTemperaturePoints failed", e)
+            emptyList()
+        }
+    }
+
+    private fun readOttaiTemperaturePoints(serial: String, history: List<GlucosePoint>): List<TemperaturePoint> {
+        return try {
+            val context = Applic.app ?: return emptyList()
+            val records = resolveOttaiTemperatureSensorIds(context, serial)
+                .asSequence()
+                .map { OttaiRegistry.loadTemperatureHistory(context, it) }
+                .firstOrNull { it.isNotEmpty() }
+                .orEmpty()
+            if (records.isEmpty()) return emptyList()
+
+            val firstTs = history.firstOrNull()?.timestamp ?: Long.MIN_VALUE
+            val lastTs = history.lastOrNull()?.timestamp ?: Long.MAX_VALUE
+            records.asSequence()
+                .filter { it.timestampMs > 0L }
+                .filter { history.isEmpty() || it.timestampMs in firstTs..lastTs }
+                .filter { it.temperatureC.isFinite() && it.temperatureC > -20f && it.temperatureC < 80f }
+                .distinctBy { it.timestampMs }
+                .sortedBy { it.timestampMs }
+                .map {
+                    TemperaturePoint(
+                        timestamp = it.timestampMs,
+                        temperatureCelsius = it.temperatureC
+                    )
+                }
+                .toList()
+        } catch (e: Throwable) {
+            Log.e(tag, "readOttaiTemperaturePoints failed", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * AiDex skin temperature comes from the F003 `i2` channel mirrored into
+     * [AiDexTemperatureStore] by the driver (live + 0x24 history). Display-only.
+     */
+    private fun readAiDexTemperaturePoints(serial: String, history: List<GlucosePoint>): List<TemperaturePoint> {
+        return try {
+            val context = Applic.app ?: return emptyList()
+            val records = resolveAiDexTemperatureSensorIds(serial)
+                .asSequence()
+                .map { AiDexTemperatureStore.loadTemperatureHistory(context, it) }
+                .firstOrNull { it.isNotEmpty() }
+                .orEmpty()
+            if (records.isEmpty()) return emptyList()
+
+            val firstTs = history.firstOrNull()?.timestamp ?: Long.MIN_VALUE
+            val lastTs = history.lastOrNull()?.timestamp ?: Long.MAX_VALUE
+            records.asSequence()
+                .filter { it.timestampMs > 0L }
+                .filter { history.isEmpty() || it.timestampMs in firstTs..lastTs }
+                .filter { it.temperatureC.isFinite() && it.temperatureC > -20f && it.temperatureC < 80f }
+                .distinctBy { it.timestampMs }
+                .sortedBy { it.timestampMs }
+                .map {
+                    TemperaturePoint(
+                        timestamp = it.timestampMs,
+                        temperatureCelsius = it.temperatureC
+                    )
+                }
+                .toList()
+        } catch (e: Throwable) {
+            Log.e(tag, "readAiDexTemperaturePoints failed", e)
+            emptyList()
+        }
+    }
+
+    private fun resolveAiDexTemperatureSensorIds(serial: String): List<String> {
+        val candidates = LinkedHashSet<String>()
+        fun add(value: String?) {
+            value
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(candidates::add)
+        }
+
+        add(serial)
+        add(SensorIdentity.resolveAppSensorId(serial))
+        add(SensorIdentity.resolveNativeSensorName(serial))
+        add(runCatching { Natives.resolveFullSensorName(serial) }.getOrNull())
+        candidates.toList().forEach { candidate ->
+            add(AiDexTemperatureStore.canonicalId(candidate))
+        }
+
+        return candidates.toList()
+    }
+
+    private fun resolveOttaiTemperatureSensorIds(        context: android.content.Context,
+        serial: String
+    ): List<String> {
+        val candidates = LinkedHashSet<String>()
+        fun add(value: String?) {
+            value
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(candidates::add)
+        }
+
+        add(serial)
+        add(SensorIdentity.resolveAppSensorId(serial))
+        add(SensorIdentity.resolveNativeSensorName(serial))
+        add(runCatching { Natives.resolveFullSensorName(serial) }.getOrNull())
+
+        candidates.toList().forEach { candidate ->
+            add(OttaiRegistry.resolveCanonicalSensorId(context, candidate))
+        }
+
+        val known = OttaiRegistry.persistedRecords(context)
+        known.firstOrNull { record -> candidates.any { record.matchesId(it) } }?.let { add(it.sensorId) }
+
+        return candidates.toList()
+    }
+
+    private fun resolveAnytimeTemperatureSensorIds(
+        context: android.content.Context,
+        serial: String
+    ): List<String> {
+        val candidates = LinkedHashSet<String>()
+        fun add(value: String?) {
+            value
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(candidates::add)
+        }
+
+        add(serial)
+        add(SensorIdentity.resolveAppSensorId(serial))
+        add(SensorIdentity.resolveNativeSensorName(serial))
+        add(runCatching { Natives.resolveFullSensorName(serial) }.getOrNull())
+
+        candidates.toList().forEach { candidate ->
+            add(AnytimeRegistry.resolveCanonicalSensorId(context, candidate))
+        }
+
+        val known = AnytimeRegistry.persistedRecords(context)
+        known.firstOrNull { record ->
+            candidates.any { candidate ->
+                record.matchesId(candidate) ||
+                    record.sensorId.endsWith(candidate, ignoreCase = true) ||
+                    candidate.endsWith(record.sensorId, ignoreCase = true)
+            }
+        }?.let { add(it.sensorId) }
+
+        return candidates.toList()
+    }
+
     private fun buildUiState(input: UiInput): StatsUiState {
+        if (input.hasSensor && input.isLoading && input.historyPoints.isEmpty()) {
+            val cacheSerial = input.activeSerial ?: resolveStatsSensorSerial()
+            cachedStateFor(cacheSerial, input.range, input.customRange)?.let { cached ->
+                return cached.copy(isLoading = true)
+            }
+        }
+
         val activeRange = resolveActiveRange(
             quickRange = input.range,
             customRange = input.customRange,
@@ -820,12 +1369,72 @@ class StatsViewModel : ViewModel() {
         )
     }
 
+    private fun buildPinnedState(input: PinnedInput): StatsPinnedState {
+        val window = input.window ?: return StatsPinnedState(unit = input.unit, targets = input.targets)
+        val projection = resolveRangeProjection(
+            history = input.history,
+            viewMode = input.viewMode,
+            unit = input.unit,
+            targets = input.targets,
+            activeRange = window.resolveRange(),
+            cache = pinnedProjectionCache,
+            // The strip's window is a day or so of readings; recomputing the display
+            // projection is cheaper than letting two windows fight over one cache slot.
+            useDisplayCache = false,
+            // Nothing on the strip shows a comparison, and loading the preceding period
+            // to compute one would double the very cost this pipeline exists to avoid.
+            withComparison = false
+        )
+        return StatsPinnedState(
+            summary = projection.summary,
+            targets = input.targets,
+            unit = input.unit
+        )
+    }
+
+    private fun resolveInitialUiState(): StatsUiState {
+        return cachedStateFor(resolveStatsSensorSerial(), _selectedRange.value, _customRange.value)
+            ?.copy(isLoading = true)
+            ?: StatsUiState(selectedRange = _selectedRange.value)
+    }
+
+    private fun cachedStateFor(
+        serial: String?,
+        range: StatsTimeRange?,
+        customRange: StatsDateRange?
+    ): StatsUiState? {
+        val normalizedSerial = serial?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val cached = lastRenderedState ?: return null
+        return cached.state
+            .takeIf {
+                it.summary.readingCount > 0 &&
+                    SensorIdentity.matches(cached.serial, normalizedSerial) &&
+                    it.selectedRange == range &&
+                    (customRange == null || it.activeRange == customRange)
+            }
+    }
+
+    private fun rememberRenderedState(serial: String?, state: StatsUiState) {
+        val normalizedSerial = serial?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        if (!state.hasSensor || state.summary.readingCount <= 0) return
+        lastRenderedState = CachedRenderedState(
+            serial = normalizedSerial,
+            state = state.copy(isLoading = false)
+        )
+    }
+
     private fun isStatsValueValid(valueMgDl: Float): Boolean {
         return valueMgDl.isFinite() &&
             valueMgDl in MIN_STATS_GLUCOSE_MGDL..MAX_STATS_GLUCOSE_MGDL
     }
 
-    private fun calculateSummary(history: List<GlucosePoint>, targets: StatsTargets): StatsSummary {
+    private fun calculateSummary(
+        history: List<GlucosePoint>,
+        targets: StatsTargets,
+        unit: GlucoseUnit,
+        activeRange: StatsDateRange?,
+        previousScalars: PeriodScalars? = null
+    ): StatsSummary {
         if (history.isEmpty()) {
             return StatsSummary()
         }
@@ -840,8 +1449,8 @@ class StatsViewModel : ViewModel() {
         } else {
             sortedValues[count / 2]
         }
-        val p25 = percentile(sortedValues, 0.25f)
-        val p75 = percentile(sortedValues, 0.75f)
+        val p25 = StatsAnalytics.percentile(sortedValues, 0.25f)
+        val p75 = StatsAnalytics.percentile(sortedValues, 0.75f)
 
         val min = sortedValues.first()
         val max = sortedValues.last()
@@ -855,7 +1464,7 @@ class StatsViewModel : ViewModel() {
         val gmi = (3.31f + (0.02392f * avg)).coerceAtLeast(0f)
 
         // Use a sensor-neutral, noise-robust series for variability scores.
-        val variabilityHistory = toVariabilitySeries(history)
+        val variabilityHistory = StatsAnalytics.toVariabilitySeries(history)
         val variabilityValues = variabilityHistory.map { it.value }
         val variabilityAvg = if (variabilityValues.isNotEmpty()) {
             variabilityValues.average().toFloat()
@@ -898,20 +1507,10 @@ class StatsViewModel : ViewModel() {
             veryHighPercent = percent(veryHighCount)
         )
 
-        val agp = calculateAgpByHour(history)
-        val daily = calculateDailyStats(history, targetLow, targetHigh)
-        val gvi = calculateGvi(
-            history = variabilityHistory,
-            averageMgDl = variabilityAvg,
-            stdDevMgDl = variabilityStdDev
-        )
-        val psg = calculatePsg(
-            history = variabilityHistory,
-            averageMgDl = avg,
-            cvPercent = variabilityCv,
-            targets = targets
-        )
-        val insights = buildInsights(tir = tir, cv = cv, gmi = gmi, dailyStats = daily, agp = agp)
+        // Only what the header, ring and scalar tiles need is worked out here. Everything
+        // below is a full pass over the window and goes into the deferred half.
+        val chronological = StatsAnalytics.sortedByTimestampIfNeeded(history)
+        val coverage = StatsAnalytics.sensorCoverage(chronological, activeRange)
 
         return StatsSummary(
             readingCount = count,
@@ -922,17 +1521,196 @@ class StatsViewModel : ViewModel() {
             stdDevMgDl = stdDev,
             cvPercent = cv,
             gmiPercent = gmi,
-            gvi = gvi,
-            psg = psg,
             minMgDl = min,
             maxMgDl = max,
             firstTimestamp = history.first().timestamp,
             lastTimestamp = history.last().timestamp,
             tir = tir,
-            agpByHour = agp,
-            dailyStats = daily,
-            insights = insights
+            tightRangePercent = StatsAnalytics.tightRangePercent(values, targets),
+            coverage = coverage,
+            parts = LazyStatsParts(
+                demanded = demandedParts,
+                history = history,
+                chronological = chronological,
+                variabilityHistory = variabilityHistory,
+                values = values,
+                targets = targets,
+                unit = unit,
+                tir = tir,
+                coverage = coverage,
+                avg = avg,
+                cv = cv,
+                variabilityAvg = variabilityAvg,
+                variabilityStdDev = variabilityStdDev,
+                variabilityCv = variabilityCv,
+                targetLow = targetLow,
+                targetHigh = targetHigh,
+                previousScalars = previousScalars,
+                agpOf = ::calculateAgpByHour,
+                dailyOf = ::calculateDailyStats,
+                insightsOf = ::buildInsights
+            )
         )
+    }
+
+    /**
+     * Resolves each expensive part on first read, once, and never again for that summary.
+     *
+     * `by lazy` rather than a hand-rolled cache because the dependencies between these are
+     * real — the insights need the episodes, which need the coverage — and lazy chaining
+     * expresses that without anyone having to remember the order.
+     */
+    private enum class StatsPart {
+        GVI, PSG, MAGE, MODD, DAWN, STREAK, GRI, RISK, EPISODES, LOW_EPISODES, HIGH_EPISODES,
+        DAY_PARTS, WEEKDAYS, DAYS, COMPARISON, AGP, HOURLY, DAILY, INSIGHTS
+    }
+
+    private class LazyStatsParts(
+        private val demanded: MutableSet<StatsPart>,
+        private val history: List<GlucosePoint>,
+        private val chronological: List<GlucosePoint>,
+        private val variabilityHistory: List<GlucosePoint>,
+        private val values: List<Float>,
+        private val targets: StatsTargets,
+        private val unit: GlucoseUnit,
+        private val tir: TimeInRangeBreakdown,
+        private val coverage: SensorCoverage,
+        private val avg: Float,
+        private val cv: Float,
+        private val variabilityAvg: Float,
+        private val variabilityStdDev: Float,
+        private val variabilityCv: Float,
+        private val targetLow: Float,
+        private val targetHigh: Float,
+        private val previousScalars: PeriodScalars?,
+        private val agpOf: (List<GlucosePoint>) -> List<AgpHourBin>,
+        private val dailyOf: (List<GlucosePoint>, Float, Float) -> List<DailyStats>,
+        private val insightsOf: (List<StatsFinding>, GlucoseUnit) -> List<StatsInsight>
+    ) : StatsSummaryParts {
+
+        private val gviValue = lazy {
+            StatsAnalytics.calculateGvi(
+                history = variabilityHistory,
+                averageMgDl = variabilityAvg,
+                stdDevMgDl = variabilityStdDev
+            )
+        }
+        private val psgValue = lazy {
+            StatsAnalytics.calculatePsg(
+                history = variabilityHistory,
+                averageMgDl = avg,
+                cvPercent = variabilityCv,
+                targets = targets
+            )
+        }
+        private val mageValue = lazy { StatsAnalytics.mage(chronological) }
+        private val moddValue = lazy { StatsAnalytics.modd(chronological) }
+        private val dawnValue = lazy { StatsAnalytics.dawnRise(chronological) }
+        private val streakValue = lazy { StatsAnalytics.bestInRangeStreak(daysValue.value) }
+        private val griValue = lazy { StatsAnalytics.glycemiaRiskIndex(values, targets) }
+        private val riskValue = lazy { StatsAnalytics.riskIndices(values) }
+        private val episodesValue = lazy { StatsAnalytics.detectEpisodes(chronological, targets) }
+        private val windowDays: Float get() = coverage.windowDays.coerceAtLeast(1f)
+        private val lowEpisodesValue = lazy {
+            StatsAnalytics.summarizeEpisodes(episodesValue.value, EpisodeKind.LOW, windowDays)
+        }
+        private val highEpisodesValue = lazy {
+            StatsAnalytics.summarizeEpisodes(episodesValue.value, EpisodeKind.HIGH, windowDays)
+        }
+        private val dayPartsValue = lazy { StatsAnalytics.dayPartStats(chronological, targets) }
+        private val weekdaysValue = lazy { StatsAnalytics.weekdayStats(chronological, targets) }
+        private val daysValue = lazy { StatsAnalytics.dayBreakdowns(chronological, targets) }
+        private val comparisonValue = lazy {
+            previousScalars?.let { previous ->
+                StatsAnalytics.compare(StatsAnalytics.periodScalars(values, targets), previous)
+            }
+        }
+        private val agpValue = lazy { agpOf(history) }
+        private val hourlyValue = lazy { StatsAnalytics.hourlyStats(chronological, targets) }
+        private val dailyValue = lazy { dailyOf(history, targetLow, targetHigh) }
+        private val insightsValue = lazy {
+            insightsOf(
+                StatsAnalytics.findings(
+                    FindingInput(
+                        tir = tir,
+                        averageMgDl = avg,
+                        cvPercent = cv,
+                        coverage = coverage,
+                        lowEpisodes = lowEpisodesValue.value,
+                        highEpisodes = highEpisodesValue.value,
+                        dayParts = dayPartsValue.value,
+                        days = daysValue.value,
+                        comparison = comparisonValue.value
+                    )
+                ),
+                unit
+            )
+        }
+
+        private fun <T> read(part: StatsPart, value: Lazy<T>): T {
+            // Noting what was actually asked for is what keeps the *next* summary off the
+            // main thread: a part is computed there once, the first time a card scrolls
+            // into view, and from then on the view model knows to work it out in the
+            // background before the state is handed over.
+            demanded += part
+            return value.value
+        }
+
+        override val gvi: GviScore get() = read(StatsPart.GVI, gviValue)
+        override val psg: PsgScore get() = read(StatsPart.PSG, psgValue)
+        override val mageMgDl: Float get() = read(StatsPart.MAGE, mageValue)
+        override val moddMgDl: Float get() = read(StatsPart.MODD, moddValue)
+        override val dawnRiseMgDl: Float get() = read(StatsPart.DAWN, dawnValue)
+        override val bestStreakDays: Int get() = read(StatsPart.STREAK, streakValue)
+        override val gri: GlycemiaRiskIndex get() = read(StatsPart.GRI, griValue)
+        override val risk: RiskIndices get() = read(StatsPart.RISK, riskValue)
+        override val episodes: List<GlucoseEpisode> get() = read(StatsPart.EPISODES, episodesValue)
+        override val lowEpisodes: EpisodeSummary get() = read(StatsPart.LOW_EPISODES, lowEpisodesValue)
+        override val highEpisodes: EpisodeSummary get() = read(StatsPart.HIGH_EPISODES, highEpisodesValue)
+        override val dayParts: List<DayPartStats> get() = read(StatsPart.DAY_PARTS, dayPartsValue)
+        override val weekdays: List<WeekdayStats> get() = read(StatsPart.WEEKDAYS, weekdaysValue)
+        override val days: List<DayBreakdown> get() = read(StatsPart.DAYS, daysValue)
+        override val comparison: StatsComparison? get() = read(StatsPart.COMPARISON, comparisonValue)
+        override val agpByHour: List<AgpHourBin> get() = read(StatsPart.AGP, agpValue)
+        override val hourlyStats: List<HourlyGlucoseStats> get() = read(StatsPart.HOURLY, hourlyValue)
+        override val dailyStats: List<DailyStats> get() = read(StatsPart.DAILY, dailyValue)
+        override val insights: List<StatsInsight> get() = read(StatsPart.INSIGHTS, insightsValue)
+
+        /**
+         * Resolves what the previous composition actually read, while still off the main
+         * thread, and hands the record back empty so this composition can restate it.
+         *
+         * Taking and clearing in one go is what stops the set growing: a metric behind the
+         * fold, or a card scrolled past, is not composed, so it is not read, so it drops
+         * straight back out and is never computed again until it is put back on screen.
+         */
+        fun warmDemanded() {
+            val toWarm = demanded.toSet()
+            demanded.clear()
+            toWarm.forEach { part ->
+                when (part) {
+                    StatsPart.GVI -> gviValue.value
+                    StatsPart.PSG -> psgValue.value
+                    StatsPart.MAGE -> mageValue.value
+                    StatsPart.MODD -> moddValue.value
+                    StatsPart.DAWN -> dawnValue.value
+                    StatsPart.STREAK -> streakValue.value
+                    StatsPart.GRI -> griValue.value
+                    StatsPart.RISK -> riskValue.value
+                    StatsPart.EPISODES -> episodesValue.value
+                    StatsPart.LOW_EPISODES -> lowEpisodesValue.value
+                    StatsPart.HIGH_EPISODES -> highEpisodesValue.value
+                    StatsPart.DAY_PARTS -> dayPartsValue.value
+                    StatsPart.WEEKDAYS -> weekdaysValue.value
+                    StatsPart.DAYS -> daysValue.value
+                    StatsPart.COMPARISON -> comparisonValue.value
+                    StatsPart.AGP -> agpValue.value
+                    StatsPart.HOURLY -> hourlyValue.value
+                    StatsPart.DAILY -> dailyValue.value
+                    StatsPart.INSIGHTS -> insightsValue.value
+                }
+            }
+        }
     }
 
     private fun calculateAgpByHour(history: List<GlucosePoint>): List<AgpHourBin> {
@@ -952,11 +1730,11 @@ class StatsViewModel : ViewModel() {
                 val sorted = values.sorted()
                 AgpHourBin(
                     hour = hour,
-                    p10MgDl = percentile(sorted, 0.10f),
-                    p25MgDl = percentile(sorted, 0.25f),
-                    medianMgDl = percentile(sorted, 0.50f),
-                    p75MgDl = percentile(sorted, 0.75f),
-                    p90MgDl = percentile(sorted, 0.90f),
+                    p10MgDl = StatsAnalytics.percentile(sorted, 0.10f),
+                    p25MgDl = StatsAnalytics.percentile(sorted, 0.25f),
+                    medianMgDl = StatsAnalytics.percentile(sorted, 0.50f),
+                    p75MgDl = StatsAnalytics.percentile(sorted, 0.75f),
+                    p90MgDl = StatsAnalytics.percentile(sorted, 0.90f),
                     sampleCount = sorted.size
                 )
             }
@@ -986,320 +1764,150 @@ class StatsViewModel : ViewModel() {
             }
     }
 
-    private fun calculateGvi(
-        history: List<GlucosePoint>,
-        averageMgDl: Float,
-        stdDevMgDl: Float
-    ): GviScore {
-        if (history.size < 2) return GviScore()
+    private fun buildInsights(findings: List<StatsFinding>, unit: GlucoseUnit): List<StatsInsight> {
+        val context = Applic.app
+        val isMmol = unit == GlucoseUnit.MMOL
 
-        val sorted = sortedByTimestampIfNeeded(history)
-        var totalDelta = 0f
-        var rateOfChangeAccum = 0f
-        var rateOfChangeSamples = 0
+        fun glucose(valueMgDl: Float): String =
+            GlucoseFormatter.formatFromMgDl(valueMgDl = valueMgDl, isMmol = isMmol)
 
-        for (index in 1..sorted.lastIndex) {
-            val previous = sorted[index - 1]
-            val current = sorted[index]
-            val delta = abs(current.value - previous.value)
-            val elapsedMinutes = (current.timestamp - previous.timestamp).toFloat() / 60_000f
-            totalDelta += delta
-            if (elapsedMinutes > 0f && elapsedMinutes < 30f) {
-                rateOfChangeAccum += delta / elapsedMinutes
-                rateOfChangeSamples++
+        fun hour(value: Int): String =
+            String.format(Locale.getDefault(), "%02d:00", value.coerceIn(0, 24))
+
+        fun duration(minutes: Int): String {
+            val hours = minutes / 60
+            val rest = minutes % 60
+            return when {
+                hours == 0 -> context.getString(R.string.stats_duration_minutes, rest)
+                rest == 0 -> context.getString(R.string.stats_duration_hours, hours)
+                else -> context.getString(R.string.stats_duration_hours_minutes, hours, rest)
             }
         }
 
-        val meanDelta = totalDelta / sorted.lastIndex.coerceAtLeast(1)
-        val cvFactor = if (averageMgDl > 0f) (stdDevMgDl / averageMgDl).coerceAtLeast(0f) else 0f
-        val rateOfChange = if (rateOfChangeSamples > 0) {
-            rateOfChangeAccum / rateOfChangeSamples
-        } else {
-            0f
-        }
+        return findings.mapNotNull { finding ->
+            when (finding.kind) {
+                FindingKind.SPARSE_COVERAGE -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_coverage),
+                    message = context.getString(
+                        R.string.stats_finding_coverage_desc,
+                        finding.primary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        // Normalize components so GVI doesn't collapse stability to 0% in common profiles.
-        val normalizedDelta = if (averageMgDl > 0f) {
-            (meanDelta / averageMgDl).coerceIn(0f, 1.2f)
-        } else {
-            0f
-        }
-        val normalizedRoc = (rateOfChange / 3.5f).coerceIn(0f, 1f)
+                FindingKind.LOWS_CLUSTER -> StatsInsight(
+                    title = context.getString(
+                        R.string.stats_finding_lows_cluster,
+                        hour(finding.hour),
+                        hour(finding.hour + 4)
+                    ),
+                    message = context.getString(
+                        R.string.stats_finding_lows_cluster_desc,
+                        finding.primary.roundToInt(),
+                        finding.secondary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        val gviValue = (
-            1f +
-                (cvFactor * 1.1f) +
-                (normalizedDelta * 0.9f) +
-                (normalizedRoc * 0.6f)
-            ).coerceIn(0.8f, 3f)
-        val stability = (((2.4f - gviValue) / 1.6f) * 100f).coerceIn(0f, 100f)
+                FindingKind.SEVERE_LOWS -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_severe_lows),
+                    message = context.getString(
+                        R.string.stats_finding_severe_lows_desc,
+                        finding.primary.roundToInt(),
+                        duration(finding.secondary.roundToInt())
+                    ),
+                    severity = finding.severity
+                )
 
-        val labelResId = when {
-            gviValue < 1.25f -> R.string.gvi_excellent
-            gviValue < 1.55f -> R.string.gvi_good
-            gviValue < 1.90f -> R.string.gvi_moderate
-            else -> R.string.gvi_poor
-        }
+                FindingKind.LONG_HIGHS -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_long_highs),
+                    message = context.getString(
+                        R.string.stats_finding_long_highs_desc,
+                        duration((finding.primary * 60f).roundToInt()),
+                        finding.secondary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        return GviScore(
-            value = gviValue,
-            labelResId = labelResId,
-            stability = stability,
-            rateOfChange = rateOfChange
-        )
-    }
+                FindingKind.DAYPART_HIGH, FindingKind.DAYPART_LOW -> {
+                    val part = finding.dayPart ?: return@mapNotNull null
+                    val titleRes = if (finding.kind == FindingKind.DAYPART_HIGH) {
+                        R.string.stats_finding_daypart_high
+                    } else {
+                        R.string.stats_finding_daypart_low
+                    }
+                    StatsInsight(
+                        title = context.getString(titleRes, context.getString(part.pluralLabelResId)),
+                        message = context.getString(
+                            R.string.stats_finding_daypart_desc,
+                            glucose(finding.primary),
+                            glucose(finding.secondary)
+                        ),
+                        severity = finding.severity
+                    )
+                }
 
-    private fun calculatePsg(
-        history: List<GlucosePoint>,
-        averageMgDl: Float,
-        cvPercent: Float,
-        targets: StatsTargets
-    ): PsgScore {
-        if (history.isEmpty()) return PsgScore()
+                FindingKind.TREND_UP -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_trend_up),
+                    message = context.getString(
+                        R.string.stats_finding_trend_up_desc,
+                        finding.primary.roundToInt(),
+                        finding.secondary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        val sorted = sortedByTimestampIfNeeded(history)
-        val halfSize = sorted.size / 2
-        val firstHalfAvg = if (halfSize > 0) {
-            sorted.take(halfSize).map { it.value }.average().toFloat()
-        } else {
-            averageMgDl
-        }
-        val secondHalfAvg = if (halfSize < sorted.size) {
-            sorted.drop(halfSize).map { it.value }.average().toFloat()
-        } else {
-            averageMgDl
-        }
+                FindingKind.TREND_DOWN -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_trend_down),
+                    message = context.getString(
+                        R.string.stats_finding_trend_down_desc,
+                        finding.primary.roundToInt(),
+                        finding.secondary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        val trend = if (secondHalfAvg > 0f) {
-            ((firstHalfAvg - secondHalfAvg) / secondHalfAvg).coerceIn(-1f, 1f)
-        } else {
-            0f
-        }
-        val confidence = ((sorted.size.coerceIn(0, MAX_PSG_CONFIDENCE_SAMPLES).toFloat() /
-            MAX_PSG_CONFIDENCE_SAMPLES.toFloat()) * (100f - cvPercent).coerceIn(0f, 100f))
-            .coerceIn(0f, 100f)
+                FindingKind.STEADY_STREAK -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_steady),
+                    message = context.getString(
+                        R.string.stats_finding_steady_desc,
+                        finding.primary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        val labelResId = when {
-            averageMgDl < targets.lowMgDl -> R.string.psg_low
-            averageMgDl > targets.highMgDl -> R.string.psg_elevated
-            cvPercent > 36f -> R.string.psg_unstable
-            else -> R.string.psg_stable
-        }
+                FindingKind.ROUGH_DAYS -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_rough_days),
+                    message = context.getString(
+                        R.string.stats_finding_rough_days_desc,
+                        finding.primary.roundToInt(),
+                        finding.secondary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-        return PsgScore(
-            baselineMgDl = averageMgDl,
-            labelResId = labelResId,
-            trend = trend,
-            confidence = confidence
-        )
-    }
+                FindingKind.VARIABILITY -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_variability),
+                    message = context.getString(
+                        R.string.stats_finding_variability_desc,
+                        finding.primary.roundToInt()
+                    ),
+                    severity = finding.severity
+                )
 
-    private fun toVariabilitySeries(history: List<GlucosePoint>): List<GlucosePoint> {
-        if (history.size <= 8) return sortedByTimestampIfNeeded(history)
-
-        val sorted = sortedByTimestampIfNeeded(history)
-        val bucketed = sorted
-            .groupBy { it.timestamp / VARIABILITY_BUCKET_MS }
-            .toSortedMap()
-            .map { (_, points) ->
-                val centerPoint = points[points.size / 2]
-                val median = percentile(points.map { it.value }.sorted(), 0.5f)
-                centerPoint.copy(value = median, rawValue = median)
-            }
-
-        if (bucketed.size <= 2) return bucketed
-
-        val stabilized = bucketed.toMutableList()
-
-        // Remove single-point spikes that are likely sensor noise.
-        for (index in 1 until stabilized.lastIndex) {
-            val previous = stabilized[index - 1].value
-            val current = stabilized[index].value
-            val next = stabilized[index + 1].value
-
-            val neighborhoodMid = (previous + next) / 2f
-            val spikeDistance = abs(current - neighborhoodMid)
-            val neighborDistance = abs(previous - next)
-
-            if (
-                spikeDistance >= NOISE_SPIKE_THRESHOLD_MGDL &&
-                neighborDistance <= NOISE_NEIGHBOR_DISTANCE_MGDL
-            ) {
-                stabilized[index] = stabilized[index].copy(
-                    value = neighborhoodMid,
-                    rawValue = neighborhoodMid
+                FindingKind.ON_TARGET -> StatsInsight(
+                    title = context.getString(R.string.stats_finding_on_target),
+                    message = context.getString(
+                        R.string.stats_finding_on_target_desc,
+                        finding.primary.roundToInt(),
+                        finding.secondary.roundToInt()
+                    ),
+                    severity = finding.severity
                 )
             }
-        }
-
-        // Cap physiologically implausible jump rates to reduce aged-sensor jitter impact.
-        for (index in 1 until stabilized.size) {
-            val previous = stabilized[index - 1]
-            val current = stabilized[index]
-            val elapsedMinutes = ((current.timestamp - previous.timestamp).toFloat() / 60_000f)
-                .coerceAtLeast(1f)
-            val maxDelta = MAX_PHYS_ROC_MGDL_PER_MIN * elapsedMinutes
-            val delta = current.value - previous.value
-
-            if (abs(delta) > maxDelta) {
-                val clippedValue = previous.value + (delta.sign * maxDelta)
-                stabilized[index] = current.copy(value = clippedValue, rawValue = clippedValue)
-            }
-        }
-
-        return stabilized
+        }.distinctBy { it.title }.take(MAX_INSIGHTS)
     }
 
-    private fun sortedByTimestampIfNeeded(history: List<GlucosePoint>): List<GlucosePoint> {
-        for (index in 1 until history.size) {
-            if (history[index].timestamp < history[index - 1].timestamp) {
-                return history.sortedBy { it.timestamp }
-            }
-        }
-        return history
-    }
-
-    private fun buildInsights(
-        tir: TimeInRangeBreakdown,
-        cv: Float,
-        gmi: Float,
-        dailyStats: List<DailyStats>,
-        agp: List<AgpHourBin>
-    ): List<StatsInsight> {
-        val context = Applic.app
-        val insights = mutableListOf<StatsInsight>()
-
-        when {
-            tir.inRangePercent >= 70f -> insights += StatsInsight(
-                title = context.getString(R.string.insight_excellent_control),
-                message = context.getString(
-                    R.string.insight_excellent_control_desc,
-                    tir.inRangePercent.toInt()
-                ),
-                severity = InsightSeverity.POSITIVE
-            )
-
-            tir.inRangePercent >= 55f -> insights += StatsInsight(
-                title = context.getString(R.string.insight_good_progress),
-                message = context.getString(
-                    R.string.insight_good_progress_desc,
-                    tir.inRangePercent.toInt()
-                ),
-                severity = InsightSeverity.ATTENTION
-            )
-
-            else -> insights += StatsInsight(
-                title = context.getString(R.string.insight_room_improvement),
-                message = context.getString(
-                    R.string.insight_room_improvement_desc,
-                    tir.inRangePercent.toInt()
-                ),
-                severity = InsightSeverity.CAUTION
-            )
-        }
-
-        when {
-            cv <= 36f -> insights += StatsInsight(
-                title = context.getString(R.string.insight_stable_glucose),
-                message = context.getString(
-                    R.string.insight_stable_glucose_desc,
-                    cv.toInt()
-                ),
-                severity = InsightSeverity.POSITIVE
-            )
-
-            cv <= 45f -> insights += StatsInsight(
-                title = context.getString(R.string.insight_variability_rising),
-                message = context.getString(
-                    R.string.insight_variability_rising_desc,
-                    String.format(Locale.getDefault(), "%.1f", cv)
-                ),
-                severity = InsightSeverity.ATTENTION
-            )
-
-            else -> insights += StatsInsight(
-                title = context.getString(R.string.insight_high_variability),
-                message = context.getString(
-                    R.string.insight_high_variability_desc,
-                    cv.toInt()
-                ),
-                severity = InsightSeverity.CAUTION
-            )
-        }
-
-        if (tir.veryLowPercent >= 1f) {
-            insights += StatsInsight(
-                title = context.getString(R.string.insight_hypoglycemia_exposure),
-                message = context.getString(
-                    R.string.insight_hypoglycemia_exposure_desc,
-                    String.format(Locale.getDefault(), "%.1f", tir.veryLowPercent)
-                ),
-                severity = InsightSeverity.CAUTION
-            )
-        }
-
-        if (tir.veryHighPercent >= 5f) {
-            insights += StatsInsight(
-                title = context.getString(R.string.insight_prolonged_hyperglycemia),
-                message = context.getString(
-                    R.string.insight_prolonged_hyperglycemia_desc,
-                    String.format(Locale.getDefault(), "%.1f", tir.veryHighPercent)
-                ),
-                severity = InsightSeverity.ATTENTION
-            )
-        }
-
-        val overnightMedian = agp
-            .filter { it.hour in 0..5 }
-            .mapNotNull { it.medianMgDl }
-            .average()
-            .toFloat()
-        val daytimeMedian = agp
-            .filter { it.hour in 10..18 }
-            .mapNotNull { it.medianMgDl }
-            .average()
-            .toFloat()
-
-        if (overnightMedian > 0f && daytimeMedian > 0f && overnightMedian - daytimeMedian > 20f) {
-            insights += StatsInsight(
-                title = context.getString(R.string.insight_overnight_drift),
-                message = context.getString(R.string.insight_overnight_drift_desc),
-                severity = InsightSeverity.ATTENTION
-            )
-        }
-
-        val unstableDays = dailyStats.count { it.inRangePercent < 50f }
-        if (unstableDays >= 3 && dailyStats.size >= 7) {
-            insights += StatsInsight(
-                title = context.getString(R.string.insight_unstable_days),
-                message = context.getString(R.string.insight_unstable_days_desc, unstableDays),
-                severity = InsightSeverity.CAUTION
-            )
-        }
-
-        if (gmi >= 7.5f && tir.inRangePercent < 60f) {
-            insights += StatsInsight(
-                title = context.getString(R.string.insight_a1c_estimate),
-                message = context.getString(R.string.insight_a1c_estimate_desc, gmi),
-                severity = InsightSeverity.ATTENTION
-            )
-        }
-
-        return insights.distinctBy { it.title }.take(MAX_INSIGHTS)
-    }
-
-    private fun percentile(sorted: List<Float>, percentile: Float): Float {
-        if (sorted.isEmpty()) return 0f
-        if (sorted.size == 1) return sorted.first()
-
-        val clamped = percentile.coerceIn(0f, 1f)
-        val position = clamped * (sorted.size - 1)
-        val lowerIndex = position.toInt()
-        val upperIndex = (lowerIndex + 1).coerceAtMost(sorted.lastIndex)
-        val weight = position - lowerIndex
-
-        return sorted[lowerIndex] + (sorted[upperIndex] - sorted[lowerIndex]) * weight
-    }
 
     private data class UiInput(
         val range: StatsTimeRange?,
@@ -1311,8 +1919,18 @@ class StatsViewModel : ViewModel() {
         val calibrationRevision: Long,
         val isLoading: Boolean,
         val hasSensor: Boolean,
+        val activeSerial: String?,
         val historyPoints: List<GlucosePoint>,
         val temperaturePoints: List<TemperaturePoint>
+    )
+
+    private data class PinnedInput(
+        val unit: GlucoseUnit,
+        val targets: StatsTargets,
+        val viewMode: Int,
+        val calibrationRevision: Long,
+        val history: List<GlucosePoint>,
+        val window: PinnedWindow?
     )
 
     private data class BaseInput(
@@ -1331,14 +1949,20 @@ class StatsViewModel : ViewModel() {
         private const val DAY_MS = 24L * 60L * 60L * 1000L
         private const val MAX_INSIGHTS = 5
         private const val TEMPERATURE_REFRESH_INTERVAL_MS = 15L * 60L * 1000L
-        private const val MAX_PSG_CONFIDENCE_SAMPLES = 288
-        private const val VARIABILITY_BUCKET_MS = 5L * 60L * 1000L
-        private const val NOISE_SPIKE_THRESHOLD_MGDL = 18f
-        private const val NOISE_NEIGHBOR_DISTANCE_MGDL = 9f
-        private const val MAX_PHYS_ROC_MGDL_PER_MIN = 3.5f
         private const val MIN_STATS_GLUCOSE_MGDL = 30f
         private const val MAX_STATS_GLUCOSE_MGDL = 500f
         private const val MAX_REPORT_DAYS = 365
-        private val DEFAULT_STATS_RANGE = StatsTimeRange.DAY_1
+
+        /** Longest window we pull a second copy of, to compare against the period before. */
+        private const val COMPARISON_MAX_RANGE_DAYS = 30
+
+        /** Below this, a period-over-period delta is noise dressed up as a trend. */
+        private const val MIN_COMPARISON_READINGS = 24
+
+        /** The previous window needs this share of the current window's readings to count. */
+        private const val MIN_COMPARISON_COVERAGE = 0.6f
+
+        private val DEFAULT_STATS_RANGE = StatsTimeRange.DAY_14
+        @Volatile private var lastRenderedState: CachedRenderedState? = null
     }
 }

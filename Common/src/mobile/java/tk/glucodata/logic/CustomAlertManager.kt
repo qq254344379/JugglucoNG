@@ -7,6 +7,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import tk.glucodata.Applic
 import tk.glucodata.CurrentDisplaySource
+import tk.glucodata.LiveReadingLanes
 import tk.glucodata.Notify
 import tk.glucodata.alerts.AlertEpisodeState
 import tk.glucodata.alerts.CustomAlertConfig
@@ -36,10 +37,23 @@ object CustomAlertManager {
     private var activeSession: ActiveSession? = null
 
     fun checkAndTrigger(context: Context, glucose: Float, rate: Float, timestamp: Long) {
+        checkAndTrigger(context, LiveReadingLanes.stock(glucose, Float.NaN), rate, timestamp, null, 0)
+    }
+
+    fun checkAndTrigger(
+        context: Context,
+        reading: LiveReadingLanes,
+        rate: Float,
+        timestamp: Long,
+        sensorId: String?,
+        sensorGen: Int
+    ) {
         val snapshot = CurrentDisplaySource.resolveIncomingReading(
-            liveNumericValue = glucose,
+            reading = reading,
             rate = rate,
-            targetTimeMillis = timestamp
+            targetTimeMillis = timestamp,
+            preferredSensorId = sensorId,
+            sensorGen = sensorGen
         ) ?: return
         @Suppress("NAME_SHADOWING") val glucose = snapshot.primaryValue
         @Suppress("NAME_SHADOWING") val rate = snapshot.rate
@@ -60,11 +74,10 @@ object CustomAlertManager {
         // sensor sample timestamp. A delayed/stale reading should not fire outside the
         // user's currently selected alert window just because the sample itself was older.
         val evaluationMs = System.currentTimeMillis()
-        val evaluationMinutes = ((evaluationMs / 60000L) % (24 * 60)).toInt()
 
         val activeWindowConfigs = allAlerts.filter { config ->
             if (!config.enabled) return@filter false
-            if (!config.isActiveTime(evaluationMinutes)) return@filter false
+            if (!config.isActiveAt(evaluationMs)) return@filter false
             true
         }
 
@@ -106,7 +119,7 @@ object CustomAlertManager {
 
         if (evaluationMs < candidate.snoozedUntil) {
             synchronized(sessionLock) {
-                conditionEpisodes.markPendingAfterSnooze(candidate.id)
+                conditionEpisodes.markPendingDelivery(candidate.id)
             }
             return
         }
@@ -134,7 +147,7 @@ object CustomAlertManager {
 
             val cooldownUntil = cooldownUntilMap[candidate.id] ?: 0L
             if (evaluationMs < cooldownUntil) {
-                conditionEpisodes.clearPending(candidate.id)
+                conditionEpisodes.markPendingDelivery(candidate.id)
                 return@synchronized
             }
 
@@ -294,8 +307,7 @@ object CustomAlertManager {
             }
 
             val now = System.currentTimeMillis()
-            val readingMinutes = ((now / 60000L) % (24 * 60)).toInt()
-            if (!refreshedConfig.enabled || !refreshedConfig.isActiveTime(readingMinutes) || now < refreshedConfig.snoozedUntil || dismissedMap.contains(alertId)) {
+            if (!refreshedConfig.enabled || !refreshedConfig.isActiveAt(now) || now < refreshedConfig.snoozedUntil || dismissedMap.contains(alertId)) {
                 clearActiveSessionLocked("retry-not-allowed:$alertId")
                 return
             }

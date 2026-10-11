@@ -1,12 +1,25 @@
 package tk.glucodata
 
+import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import tk.glucodata.drivers.icanhealth.ICanHealthConstants
 
 class SensorIdentityTests {
+    @Before
+    fun setUp() {
+        ManagedCurrentSensor.clear()
+    }
+
+    @After
+    fun tearDown() {
+        ManagedCurrentSensor.clear()
+    }
+
     @Test
     fun resolveAvailableMainSensor_prefersSelectedMainWhenStillActive() {
         assertEquals(
@@ -44,6 +57,34 @@ class SensorIdentityTests {
     }
 
     @Test
+    fun resolveAvailableMainSensor_keepsManagedWhenStillActive() {
+        ManagedCurrentSensor.set("X-2222268RXN")
+
+        assertEquals(
+            "X-2222268RXN",
+            SensorIdentity.resolveAvailableMainSensor(
+                selectedMain = null,
+                preferredSensorId = "F0FD4509C7C2",
+                activeSensors = arrayOf("F0FD4509C7C2", "X-2222268RXN")
+            )
+        )
+    }
+
+    @Test
+    fun resolveAvailableMainSensor_ignoresStaleManagedWhenActiveSensorExists() {
+        ManagedCurrentSensor.set("X-2222268RXN")
+
+        assertEquals(
+            "F0FD4509C7C2",
+            SensorIdentity.resolveAvailableMainSensor(
+                selectedMain = null,
+                preferredSensorId = null,
+                activeSensors = arrayOf("F0FD4509C7C2")
+            )
+        )
+    }
+
+    @Test
     fun resolveAvailableMainSensor_keepsPreferredWhenNoActiveSensorsRemain() {
         assertEquals(
             "historical-sensor",
@@ -64,6 +105,42 @@ class SensorIdentityTests {
                 activeSensors = emptyArray()
             )
         )
+    }
+
+    @Test
+    fun placeholderIdentity_neverBecomesASensorOrMainSelection() {
+        ManagedCurrentSensor.set("?")
+
+        assertNull(SensorIdentity.resolveAppSensorId("?"))
+        assertNull(
+            SensorIdentity.resolveAvailableMainSensor(
+                selectedMain = "?",
+                preferredSensorId = null,
+                activeSensors = arrayOf("?")
+            )
+        )
+        assertEquals(
+            "real-sensor",
+            SensorIdentity.resolveAvailableMainSensor(
+                selectedMain = "?",
+                preferredSensorId = null,
+                activeSensors = arrayOf("?", "real-sensor")
+            )
+        )
+    }
+
+    @Test
+    fun usableIdentity_acceptsVendorFormatsButRejectsPlaceholdersAndControls() {
+        listOf(
+            "SIBI:0683013AQT9",
+            "ICN-8760080A2604",
+            "X-222227JR7C",
+            "P225043JMV",
+            "46HU804EBJ4",
+        ).forEach { assertTrue(SensorIdentity.isUsableSensorId(it)) }
+
+        assertFalse(SensorIdentity.isUsableSensorId("?"))
+        assertFalse(SensorIdentity.isUsableSensorId("bad\u001Didentity"))
     }
 
     @Test
@@ -118,4 +195,39 @@ class SensorIdentityTests {
             SensorIdentity.resolveRoomStorageSensorId("8760080A00070000")
         )
     }
+    // --- matches() memoization (regex/registry work off the per-reading path) ---
+
+    @Test
+    fun matches_isStableAcrossRepeatedCalls() {
+        // Distinct ids that do not resolve to each other: the answer must stay false
+        // whether it came from the cache or from a fresh resolution.
+        assertFalse(SensorIdentity.matches("sensor-alpha", "sensor-beta"))
+        assertFalse(SensorIdentity.matches("sensor-alpha", "sensor-beta"))
+        SensorIdentity.invalidateCaches()
+        assertFalse(SensorIdentity.matches("sensor-alpha", "sensor-beta"))
+    }
+
+    @Test
+    fun matches_trivialEqualityStillShortCircuits() {
+        // Must not depend on the cache, and must stay case-insensitive.
+        assertTrue(SensorIdentity.matches("SENSOR-ALPHA", "sensor-alpha"))
+        SensorIdentity.invalidateCaches()
+        assertTrue(SensorIdentity.matches("SENSOR-ALPHA", "sensor-alpha"))
+    }
+
+    @Test
+    fun matches_survivesCacheInvalidation() {
+        assertTrue(SensorIdentity.matches("sensor-alpha", "sensor-alpha"))
+        assertFalse(SensorIdentity.matches("sensor-alpha", "sensor-gamma"))
+        SensorIdentity.invalidateCaches()
+        assertTrue(SensorIdentity.matches("sensor-alpha", "sensor-alpha"))
+        assertFalse(SensorIdentity.matches("sensor-alpha", "sensor-gamma"))
+    }
+
+    @Test
+    fun matches_blankExpectedStillMatchesAnything() {
+        assertTrue(SensorIdentity.matches("sensor-alpha", null))
+        assertTrue(SensorIdentity.matches("sensor-alpha", ""))
+    }
+
 }

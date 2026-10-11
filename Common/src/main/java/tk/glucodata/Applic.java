@@ -72,12 +72,13 @@ import androidx.core.content.ContextCompat;
 
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
-import tk.glucodata.nums.AllData;
 import tk.glucodata.nums.numio;
 import tk.glucodata.settings.Broadcasts;
 import java.util.concurrent.Executors;
@@ -115,7 +116,8 @@ public class Applic extends Application implements androidx.work.Configuration.P
         return Natives.getLabels();
     }
 
-    public tk.glucodata.nums.AllData numdata = null;
+    /** The numbers / ConnectIQ hub; the phone's, or a no-op. See NumberDataHub. */
+    public NumberDataHub numdata = NumberDataAccess.get();
     public GlucoseCurve curve = null;
     public static int unit = 0;
 
@@ -196,9 +198,6 @@ public class Applic extends Application implements androidx.work.Configuration.P
         mintimefilter.addAction(Intent.ACTION_TIME_TICK);
         mHandler = new Handler(Looper.getMainLooper());
         uiThreadId = Thread.currentThread().getId();
-        if (!isWearable) {
-            numdata = new AllData();
-        }
     }
 
 
@@ -324,9 +323,7 @@ public class Applic extends Application implements androidx.work.Configuration.P
     public void onTerminate() {
         super.onTerminate();
         if (!isWearable) {
-            if (numdata != null) {
-                numdata.onCleared();
-            }
+            numdata.onCleared();
         }
     }
 
@@ -417,6 +414,55 @@ public class Applic extends Application implements androidx.work.Configuration.P
                 == PackageManager.PERMISSION_GRANTED;
     }
 
+    /**
+     * On the watch Bluetooth is nearly always switched on by something that has
+     * no Activity: the phone's /bluetooth message, a sensor handoff, or
+     * WearSensorClaim re-arming direct mode while the process starts. Those
+     * paths cannot show the runtime dialog, so the scan only ever failed with a
+     * toast and the permission had to be granted by hand in the system app
+     * settings. Remember that it is still needed, and ask as soon as
+     * MainActivity is up again.
+     */
+    static volatile boolean scanPermissionPending = false;
+
+    private static long scanPermissionToastMillis = 0L;
+    private static final long SCANPERMISSION_TOAST_INTERVAL = 60000L;
+
+    /**
+     * Asks for the scan (NEARBY DEVICES / location) permission when an Activity
+     * is available, and otherwise marks it pending for the next resume.
+     *
+     * @return true when the permission is already there or the dialog could be
+     *         shown.
+     */
+    static boolean requestScanPermission() {
+        if (Build.VERSION.SDK_INT < 23 || mayscan()) {
+            scanPermissionPending = false;
+            return true;
+        }
+        var main = MainActivity.thisone;
+        if (main == null) {
+            scanPermissionPending = true;
+            return false;
+        }
+        return main.finepermission();
+    }
+
+    /**
+     * A scan needed the permission and did not have it: ask for it if we can,
+     * and keep the toast from repeating on every retry.
+     */
+    static void missingScanPermission() {
+        requestScanPermission();
+        final long now = android.os.SystemClock.elapsedRealtime();
+        if (scanPermissionToastMillis != 0L && now - scanPermissionToastMillis < SCANPERMISSION_TOAST_INTERVAL) {
+            return;
+        }
+        scanPermissionToastMillis = now;
+        Toaster((Build.VERSION.SDK_INT > 30) ? R.string.turn_on_nearby_devices_permission
+                : R.string.turn_on_location_permission);
+    }
+
     static boolean canBluetooth() {
         if (Build.VERSION.SDK_INT > 30) {
             return Applic.hasPermissions(app, scanpermissions).length == 0;
@@ -438,7 +484,15 @@ public class Applic extends Application implements androidx.work.Configuration.P
     }
 
     public static void updateservice(Context context, boolean usebluetooth) {
-        if (usebluetooth || Natives.backuphostNr() > 0) {
+        final int backupHosts = Natives.activeBackupHostNr();
+        final boolean keepAliveRequired = usebluetooth || backupHosts > 0;
+        if (doLog) {
+            Log.i(LOG_ID, "updateservice decision bluetooth=" + usebluetooth
+                    + " backupHosts=" + backupHosts
+                    + " nightscoutEnabled=" + Natives.getuseuploader()
+                    + " keepAlive=" + keepAliveRequired);
+        }
+        if (keepAliveRequired) {
             if (keeprunning.start(context)) {
                 if (doLog) {
                     Log.i(LOG_ID, "updateservice: keeprunning started");
@@ -465,7 +519,7 @@ public class Applic extends Application implements androidx.work.Configuration.P
         }
         ;
         SensorBluetooth.destructor();
-        if (Natives.backuphostNr() <= 0) {
+        if (Natives.activeBackupHostNr() <= 0) {
             keeprunning.stop();
         }
     }
@@ -499,12 +553,12 @@ public class Applic extends Application implements androidx.work.Configuration.P
         }
         ;
         if (!isWearable) {
-            if (Natives.getusegarmin() && numdata.devices == null)
+            if (Natives.getusegarmin() && !numdata.hasGarminDevices())
                 numdata.initIQ(context);
         }
 
         if (!keeprunning.started) {
-            if (usebluetooth || Natives.backuphostNr() > 0) {
+            if (usebluetooth || Natives.activeBackupHostNr() > 0) {
                 if (keeprunning.start(context)) {
                     if (doLog) {
                         Log.i(LOG_ID, "keeprunning started");
@@ -524,7 +578,8 @@ public class Applic extends Application implements androidx.work.Configuration.P
         SensorBluetooth.start(usebluetooth);
 
         if (!isWearable) {
-            BluetoothGlucoseMeter.startDevices();
+            var meters = BluetoothMeterAccess.get();
+            if (meters != null) meters.startDevices();
         }
     }
 
@@ -550,20 +605,68 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
     // @RequiresApi(api = Build.VERSION_CODES.M)
     private static boolean hasonAvailable = false;
-    /*
-     * public static void sendsettings() {
-     * {if(doLog) {Log.i(LOG_ID,"sendsettings");};};
-     * if(!MessageSender.cansend()) {
-     * {if(doLog) {Log.i(LOG_ID,"!cansend()");};};
-     * return;
-     * }
-     * var sender=tk.glucodata.MessageSender.getMessageSender();
-     * if(sender!=null) {
-     * sender.sendsettings();
-     * }
-     * }
-     */
+    private static final Set<Long> availableInternetNetworks = ConcurrentHashMap.newKeySet();
+    private static final NetworkHandoverPolicy networkHandoverPolicy = new NetworkHandoverPolicy();
+    private static final Object networkTransitionLock = new Object();
+    private static ScheduledFuture<?> pendingNetworkAbsence;
+    private static long networkAbsenceGeneration;
+    private static final long NETWORK_ABSENCE_GRACE_MILLIS = 1_000L;
 
+    private static long networkId(Network network) {
+        return network.getNetworkHandle();
+    }
+
+    private static void cancelPendingNetworkAbsence() {
+        synchronized (networkTransitionLock) {
+            ++networkAbsenceGeneration;
+            if (pendingNetworkAbsence != null) {
+                pendingNetworkAbsence.cancel(false);
+                pendingNetworkAbsence = null;
+            }
+        }
+    }
+
+    private static void applyNetworkAction(NetworkHandoverPolicy.Action action) {
+        switch (action) {
+            case PRESENT:
+                cancelPendingNetworkAbsence();
+                Natives.networkpresent();
+                Applic.wakemirrors();
+                break;
+            case HANDOVER:
+                cancelPendingNetworkAbsence();
+                Natives.networkhandover();
+                Applic.wakemirrors();
+                break;
+            case DEFER_ABSENCE:
+                synchronized (networkTransitionLock) {
+                    if (pendingNetworkAbsence != null) {
+                        pendingNetworkAbsence.cancel(false);
+                    }
+                    final long generation = ++networkAbsenceGeneration;
+                    pendingNetworkAbsence = scheduler.schedule(() -> {
+                        synchronized (networkTransitionLock) {
+                            if (generation != networkAbsenceGeneration) {
+                                return;
+                            }
+                            pendingNetworkAbsence = null;
+                        }
+                        final long defaultNetwork = networkHandoverPolicy.currentDefaultNetwork();
+                        final boolean defaultStillAvailable = defaultNetwork != 0L
+                                && availableInternetNetworks.contains(defaultNetwork);
+                        applyNetworkAction(networkHandoverPolicy.afterAbsenceGrace(
+                                defaultStillAvailable));
+                    }, NETWORK_ABSENCE_GRACE_MILLIS, TimeUnit.MILLISECONDS);
+                }
+                break;
+            case ABSENT:
+                cancelPendingNetworkAbsence();
+                Natives.networkabsent();
+                break;
+            case NONE:
+                break;
+        }
+    }
     static private boolean MessageReceiverEnabled() {
         if (!isWearable) {
             try {
@@ -619,11 +722,15 @@ public class Applic extends Application implements androidx.work.Configuration.P
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
             ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(
                     Context.CONNECTIVITY_SERVICE);
-            connectivityManager.registerNetworkCallback((new NetworkRequest.Builder()).build(),
+            connectivityManager.registerNetworkCallback(
+                    (new NetworkRequest.Builder())
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .build(),
                     new ConnectivityManager.NetworkCallback() {
                         @Override
                         public void onAvailable(Network network) {
                             hasonAvailable = true;
+                            availableInternetNetworks.add(networkId(network));
                             {
                                 if (doLog) {
                                     Log.i(LOG_ID, "network: onAvailable(" + network + ")");
@@ -631,16 +738,16 @@ public class Applic extends Application implements androidx.work.Configuration.P
                                 ;
                             }
                             ;
+                            tk.glucodata.drivers.nightscout.NightscoutFollowerRegistry.INSTANCE
+                                    .recoverOnNetworkAvailable(Applic.this);
                             final boolean wearos = useWearos();
-                            if (wearos || hasip()) {
+                            if (wearos) {
                                 Natives.networkpresent();
-                                if (wearos) {
-                                    MessageSender.reinit();
-                                    MessageSender.sendnetinfo();
-                                    Applic.scheduler.schedule(() -> {
-                                        resetWearOS();
-                                    }, 20, TimeUnit.SECONDS);
-                                }
+                                MessageSender.reinit();
+                                MessageSender.sendnetinfo();
+                                Applic.scheduler.schedule(() -> {
+                                    resetWearOS();
+                                }, 20, TimeUnit.SECONDS);
                                 Applic.wakemirrors();
                             }
                         }
@@ -673,6 +780,8 @@ public class Applic extends Application implements androidx.work.Configuration.P
                             var up = networkCapabilities.getLinkUpstreamBandwidthKbps();
                             var wifi = networkCapabilities.hasTransport(TRANSPORT_WIFI);
                             var blue = networkCapabilities.hasTransport(TRANSPORT_BLUETOOTH);
+                            var validated = networkCapabilities.hasCapability(
+                                    NetworkCapabilities.NET_CAPABILITY_VALIDATED);
                             boolean aware = false;
                             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                                 aware = networkCapabilities.hasTransport(TRANSPORT_WIFI_AWARE);
@@ -683,7 +792,7 @@ public class Applic extends Application implements androidx.work.Configuration.P
                                             "network: onCapabilitiesChanged(" + network + "downstream " + down
                                                     + " Kbps up=" + up + " Kbps " + (wifi ? "" : "no ") + " wifi, "
                                                     + (blue ? "" : "no ") + " bluetooth, " + (aware ? "" : " no ")
-                                                    + "WIFI aware)");
+                                                    + "WIFI aware, " + (validated ? "" : "not ") + "validated)");
                                 }
                                 ;
                             }
@@ -704,6 +813,8 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
                         @Override
                         public void onLost(Network network) {
+                            final long lostNetwork = networkId(network);
+                            availableInternetNetworks.remove(lostNetwork);
                             {
                                 if (doLog) {
                                     Log.i(LOG_ID, "onLost(" + network + ")");
@@ -711,7 +822,8 @@ public class Applic extends Application implements androidx.work.Configuration.P
                                 ;
                             }
                             ;
-                            Natives.networkabsent();
+                            applyNetworkAction(networkHandoverPolicy.onInternetNetworkLost(
+                                    lostNetwork));
                             final boolean wearos = useWearos();
                             if (wearos) {
                                 MessageSender.reinit();
@@ -723,6 +835,28 @@ public class Applic extends Application implements androidx.work.Configuration.P
                                     resetWearOS();
                                 }, 20, TimeUnit.SECONDS);
                             }
+                        }
+                    });
+
+            connectivityManager.registerDefaultNetworkCallback(
+                    new ConnectivityManager.NetworkCallback() {
+                        @Override
+                        public void onAvailable(Network network) {
+                            final long availableNetwork = networkId(network);
+                            if (doLog) {
+                                Log.i(LOG_ID, "default network: onAvailable(" + network + ")");
+                            }
+                            applyNetworkAction(networkHandoverPolicy.onDefaultAvailable(
+                                    availableNetwork));
+                        }
+
+                        @Override
+                        public void onLost(Network network) {
+                            if (doLog) {
+                                Log.i(LOG_ID, "default network: onLost(" + network + ")");
+                            }
+                            applyNetworkAction(networkHandoverPolicy.onDefaultLost(
+                                    networkId(network)));
                         }
                     });
 
@@ -810,8 +944,23 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
     boolean initproc() {
         if (!initproccalled) {
+            // setlibrary() restores and starts saved ICE hosts. Seed their
+            // immutable connection settings before any host is constructed.
+            CloneIceNetworkConfigStore.prepareForNativeStartup(this);
             if (!numio.setlibrary(this))
                 return false;
+            // ICE connections can be created by startup services before the
+            // settings screen exists, so restore user-selected endpoints as
+            // soon as the native library and persisted backup hosts are ready.
+            CloneIceNetworkConfigStore.initialize(this);
+            // Native backup hosts are restored before the Java Wear transport.
+            // Honour the persisted companion switch immediately, otherwise a
+            // disabled Wear host reconnects during every process start.
+            MessageSender.syncNativeWearTransportState(useWearos());
+            // First thing after the natives are up, so Log reaches trace.log: whatever killed the
+            // previous process is otherwise lost. Both apps died inside the 2026-08-01 jamming
+            // storm and 767s of the downtime is unattributed purely because no log line says why.
+            ProcessExitReasons.logPrevious(this);
             if (isWearable) {
                 if (Natives.getWifi())
                     UseWifi.usewifi();
@@ -829,7 +978,21 @@ public class Applic extends Application implements androidx.work.Configuration.P
             ;
             libre3init.init();
             SuperGattCallback.initAlarmTalk();
+            // A poll alarm may be the component that starts this process. Restore cloud-only
+            // callbacks before registering network listeners so the receiver and onAvailable
+            // can repair polling without waiting for MainActivity to initialize Bluetooth.
+            tk.glucodata.drivers.nightscout.NightscoutFollowerRegistry.INSTANCE
+                    .restoreConfiguredFollower(this);
             initialize();
+
+            // Load the glucose colour palette + per-band overrides before any
+            // drawing happens, so the notification chart (which runs outside
+            // Compose) renders with the user's choice too.
+            GlucoseRangeColors.initFromPrefs(this);
+
+            // Driver-owned one-time handoff. This must run after native storage initialization
+            // and before SensorBluetooth creates callbacks for the active native sensor list.
+            tk.glucodata.drivers.sibionics.SibionicsLegacyMigration.migrateActiveSensors(this);
 
             // Preserve an explicit non-active selection across startup. Historical sensors
             // are still valid dashboard targets even if they are not in activeSensors().
@@ -856,10 +1019,10 @@ public class Applic extends Application implements androidx.work.Configuration.P
                 Log.i("Applic", "startup sensor initialization failed: " + t.getMessage());
             }
 
-            // Check if FloatingService should be started
-            if (getSharedPreferences("tk.glucodata_preferences", Context.MODE_PRIVATE)
+            // Check if FloatingService should be started (mobile-only class, so no compile-time reference)
+            if (!isWearable && getSharedPreferences("tk.glucodata_preferences", Context.MODE_PRIVATE)
                     .getBoolean("floating_glucose_enabled", false)) {
-                Intent intent = new Intent(this, tk.glucodata.service.FloatingGlucoseService.class);
+                Intent intent = new Intent().setClassName(this, "tk.glucodata.service.FloatingGlucoseService");
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                     startForegroundService(intent);
                 } else {
@@ -869,6 +1032,10 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
             NumAlarm.handlealarm(this);
             Maintenance.setMaintenancealarm(this);
+            // A quiet window is checked against the wall clock on every start: an
+            // expired one ends now, a running one re-arms its expiry alarm. A process
+            // kill must never stretch it.
+            tk.glucodata.alerts.QuietWindow.syncOnStart(this);
             initbroadcasts();
             initproccalled = true;
             if (isWearable && !(dataAtStart = hasData())) {
@@ -884,9 +1051,17 @@ public class Applic extends Application implements androidx.work.Configuration.P
             } else if (useWearos()) {
                 MessageSender.sendnetinfo();
             }
-            Specific.start(this);
+            VariantBootstrapAccess.create().start(this);
+            SensorOwnershipRuntime.start();
             if (isWearable) {
-                tk.glucodata.glucosecomplication.GlucoseValue.updateall();
+                var refresh = GlucoseValueRefreshAccess.get();
+                if (refresh != null) refresh.updateAll();
+                // Direct sensor mode has to survive a restart of the watch app,
+                // otherwise a handoff silently stops scanning.
+                WearSensorClaim.restoreOnStart();
+                // Same for automatic switching: the setting survives, the
+                // scanning it enables would not.
+                AutoSensorSwitch.restoreOnStart();
             }
         }
         return true;
@@ -902,6 +1077,10 @@ public class Applic extends Application implements androidx.work.Configuration.P
         ;
         Natives.setusebluetooth(on);
         if (on) {
+            // The caller is often a message handler or a restart path, not the
+            // Activity, so this is the only moment where we know Bluetooth is
+            // wanted and can still ask for the permission it needs.
+            requestScanPermission();
             Applic.app.initbluetooth(on, activity, activity instanceof MainActivity);
         } else {
             Applic.dontusebluetooth();
@@ -922,12 +1101,48 @@ public class Applic extends Application implements androidx.work.Configuration.P
     @Override
     public void onCreate() {
         super.onCreate();
+        // Before anything else: Application.onCreate precedes every component
+        // (boot receiver, restarted service, activity), so this is the only
+        // place that guarantees the trend/alert bridges exist before the first
+        // reading is evaluated. Waiting for the variant start() at the end of
+        // initproc() left a post-reboot window where forecast alerts fired on
+        // the degraded two-point slope.
+        Specific.registerBridges();
+        // The field was filled when this object was constructed, before any bridge
+        // existed, so on the phone it still holds the no-op. Take the registered hub.
+        numdata = NumberDataAccess.get();
+        enlargeCursorWindow();
         updateWearMessageReceiverComponent();
         if (DiskSpace.check(this)) {
             initproc();
         } else {
             android.util.Log.e(LOG_ID, "Stop program");
             stopprogram = 1;
+        }
+    }
+
+    /**
+     * Raise the global {@link android.database.CursorWindow} size (default 2 MB).
+     *
+     * The glucose history Room table is read in a few places with an unbounded
+     * {@code SELECT * FROM history_readings} that returns the whole table as a
+     * single list. {@code SELECT *} fetches all 8 physical columns (including the
+     * dead customValue/customRate columns left over from an old migration), so a
+     * row is ~330-350 bytes and the 2 MB window overflows at ~6000 readings,
+     * crashing with "Couldn't read row N, col 0 from CursorWindow" — most visibly
+     * right after importing history/settings, which pushes the table over that
+     * threshold. Bumping the ceiling to 16 MB (ashmem is committed lazily, so this
+     * does not reserve 16 MB up front) covers ~48k readings. Best-effort: the
+     * field is hidden, so any failure is logged and ignored.
+     */
+    private static void enlargeCursorWindow() {
+        try {
+            java.lang.reflect.Field field =
+                    android.database.CursorWindow.class.getDeclaredField("sCursorWindowSize");
+            field.setAccessible(true);
+            field.setInt(null, 16 * 1024 * 1024);
+        } catch (Throwable t) {
+            android.util.Log.w(LOG_ID, "Could not enlarge CursorWindow size", t);
         }
     }
 
@@ -1052,6 +1267,12 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
     static final boolean usewakelock = true;
 
+    /**
+     * Safety net on the ingest wakelock. Handling one reading is sub-second work; this only
+     * exists so a crash between acquire and release can never pin the CPU awake indefinitely.
+     */
+    static final long GLUCOSE_WAKELOCK_TIMEOUT_MS = 60_000L;
+
     @Keep
     static void doglucose(String SerialNumber, int mgdl, float gl, float rate, int alarm, long timmsec,
             boolean wasblueoff, long sensorstartmsec, long sensorptr, int sensorgen) {
@@ -1065,29 +1286,46 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
         var wakelock = usewakelock ? (((PowerManager) app.getSystemService(POWER_SERVICE))
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Juggluco::Applic")) : null;
-        if (wakelock != null)
-            wakelock.acquire();
-        if (!wasblueoff) {
-            Applic.dontusebluetooth();
+        if (wakelock != null) {
+            wakelock.setReferenceCounted(false);
+            wakelock.acquire(GLUCOSE_WAKELOCK_TIMEOUT_MS);
         }
-        SuperGattCallback.dowithglucose(SerialNumber, mgdl, gl, rate, alarm, timmsec, sensorstartmsec,
-                Notify.glucosetimeout, sensorgen);
-        if (!isWearable) {
-            if (sensorptr != 0L) {
-                {
-                    if (doLog) {
-                        Log.i(LOG_ID, "sensorptr=" + format("%x", sensorptr));
+        try {
+            if (!wasblueoff) {
+                Applic.dontusebluetooth();
+            }
+            SuperGattCallback.dowithglucose(SerialNumber, mgdl, gl, rate, alarm, timmsec, sensorstartmsec,
+                    Notify.glucosetimeout, sensorgen);
+            if (!isWearable) {
+                if (sensorptr != 0L) {
+                    {
+                        if (doLog) {
+                            Log.i(LOG_ID, "sensorptr=" + format("%x", sensorptr));
+                        }
+                        ;
                     }
                     ;
-                }
-                ;
-                if (Build.VERSION.SDK_INT >= 28) {
-                    HealthConnection.Companion.writeAll(sensorptr, SerialNumber);
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        var health = HealthConnectAccess.get();
+                        if (health != null) health.writeAll(sensorptr, SerialNumber);
+                    }
                 }
             }
+        } finally {
+            releasewakelock(wakelock);
         }
-        if (wakelock != null)
-            wakelock.release();
+    }
+
+    /** Release a wakelock without letting a release failure escape over the caller's own work. */
+    static void releasewakelock(PowerManager.WakeLock wakelock) {
+        if (wakelock == null)
+            return;
+        try {
+            if (wakelock.isHeld())
+                wakelock.release();
+        } catch (Throwable th) {
+            Log.stack(LOG_ID, "wakelock.release", th);
+        }
     }
 
     @Keep
@@ -1168,7 +1406,6 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
     private static void initbroadcasts() {
         if (isWearable) {
-            Specific.setclose(!Natives.getdontuseclose());
         }
 
         Floating.init();
@@ -1198,7 +1435,6 @@ public class Applic extends Application implements androidx.work.Configuration.P
 
         setjavahour24(Natives.gethour24());
         XInfuus.setlibrenames();
-        EverSense.setreceivers();
         JugglucoSend.setreceivers();
         SendLikexDrip.setreceivers();
     }
@@ -1262,14 +1498,14 @@ public class Applic extends Application implements androidx.work.Configuration.P
     @Keep
     static void setinittext(String str) {
         RunOnUiThread(() -> {
-            Specific.settext(str);
+            VariantBootstrapAccess.create().settext(str);
         });
     }
 
     @Keep
     static void rminitlayout() {
         RunOnUiThread(() -> {
-            Specific.rmlayout();
+            VariantBootstrapAccess.create().rmlayout();
         });
     }
 

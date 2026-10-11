@@ -7,6 +7,7 @@ import androidx.annotation.Keep
 import androidx.work.Data
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -34,6 +35,7 @@ object OutboundApi {
     private const val QUEUE_BUSY_STATUS_INTERVAL_MS = 5 * 60 * 1000L
     private const val ERROR_QUEUE_BUSY = "API send queue is busy; dropped stale live reading"
     private const val ERROR_NETWORK_UNAVAILABLE = "Network unavailable; skipped live API send"
+    private const val STALE_READING_LOOKBACK_MS = 12 * 60 * 60 * 1000L
 
     private val pendingSends = AtomicInteger(0)
     private val lastQueueBusyStatusAtMs = AtomicLong(0)
@@ -53,6 +55,9 @@ object OutboundApi {
     private const val IN_AUTO_MGDL = "auto_mgdl"
     private const val IN_RAW_VALUE = "raw_value"
     private const val IN_RATE = "rate"
+    private const val IN_TREND_INDEX = "trend_index"
+    private const val IN_TREND_NAME = "trend_name"
+    private const val IN_TREND_RATE = "trend_rate"
     private const val IN_TIME_MILLIS = "time_millis"
     private const val IN_SENSOR_GEN = "sensor_gen"
     private const val IN_ALARM = "alarm"
@@ -125,6 +130,42 @@ object OutboundApi {
         rawValue: Float,
         alarm: Int
     ) {
+        val trend = ExchangeTrend.resolve(sensorId, timeMillis, rate)
+        enqueueGlucose(
+            sensorId = sensorId,
+            primaryText = primaryText,
+            primaryDisplayValue = primaryDisplayValue,
+            primaryMgdl = primaryMgdl,
+            rate = rate,
+            timeMillis = timeMillis,
+            sensorGen = sensorGen,
+            autoValue = autoValue,
+            autoMgdl = autoMgdl,
+            rawValue = rawValue,
+            trendIndex = trend.index,
+            trendName = trend.name,
+            trendRate = trend.rateMgdlPerMinute,
+            alarm = alarm
+        )
+    }
+
+    @JvmStatic
+    fun enqueueGlucose(
+        sensorId: String?,
+        primaryText: String?,
+        primaryDisplayValue: Double,
+        primaryMgdl: Int,
+        rate: Float,
+        timeMillis: Long,
+        sensorGen: Int,
+        autoValue: Float,
+        autoMgdl: Int,
+        rawValue: Float,
+        trendIndex: Int,
+        trendName: String?,
+        trendRate: Float,
+        alarm: Int
+    ) {
         enqueueGlucoseInternal(
             context = Applic.app,
             sensorId = sensorId,
@@ -137,6 +178,9 @@ object OutboundApi {
             sensorGen = sensorGen,
             autoValue = autoValue,
             autoMgdl = autoMgdl,
+            trendIndex = trendIndex,
+            trendName = trendName,
+            trendRate = trendRate,
             alarm = alarm,
             test = false,
             destinationId = null
@@ -152,6 +196,7 @@ object OutboundApi {
             return TEST_NOT_CONFIGURED
         }
         val current = CurrentDisplaySource.resolveCurrent(Notify.glucosetimeout) ?: return TEST_NO_CURRENT_READING
+        val trend = ExchangeTrend.resolve(current.sensorId, current.timeMillis, current.rate)
         enqueueGlucoseInternal(
             context = context,
             sensorId = current.sensorId,
@@ -164,6 +209,9 @@ object OutboundApi {
             sensorGen = current.sensorGen,
             autoValue = current.autoValue,
             autoMgdl = displayToMgdl(current.autoValue),
+            trendIndex = trend.index,
+            trendName = trend.name,
+            trendRate = trend.rateMgdlPerMinute,
             alarm = 0,
             test = true,
             destinationId = destinationId
@@ -183,6 +231,9 @@ object OutboundApi {
         sensorGen: Int,
         autoValue: Float,
         autoMgdl: Int,
+        trendIndex: Int,
+        trendName: String?,
+        trendRate: Float,
         alarm: Int,
         test: Boolean,
         destinationId: String?
@@ -221,6 +272,9 @@ object OutboundApi {
                 sensorGen = sensorGen,
                 autoValue = autoValue,
                 autoMgdl = autoMgdl,
+                trendIndex = trendIndex,
+                trendName = trendName,
+                trendRate = trendRate,
                 alarm = alarm,
                 test = test
             )
@@ -234,7 +288,42 @@ object OutboundApi {
         val candidates = destinationId
             ?.let { id -> listOfNotNull(config.findDestination(id)) }
             ?: config.activeDestinations()
-        return candidates.filter { it.isReady() }
+        // SMS destinations are event-driven (see tk.glucodata.sms.SmsWatchdog) and must
+        // never be fed by the reading stream — a text per reading would be ruinous.
+        return candidates.filter { it.isReady() && !it.isSms() }
+    }
+
+    /**
+     * The latest reading as the template engine sees it, or null when the app has
+     * never had one. Tolerates stale data on purpose: the SMS watchdog needs the
+     * last known value precisely when readings have stopped arriving.
+     */
+    internal fun currentReadingOrNull(
+        recipient: String = "",
+        maxAgeMillis: Long = STALE_READING_LOOKBACK_MS
+    ): Reading? {
+        val current = CurrentDisplaySource.resolveCurrent(maxAgeMillis) ?: return null
+        if (current.timeMillis <= 0L || current.sharedMgdl <= 0) return null
+        val trend = ExchangeTrend.resolve(current.sensorId, current.timeMillis, current.rate)
+        return Reading(
+            eventId = "${current.sensorId.orEmpty()}:${current.timeMillis}:${current.sharedMgdl}",
+            recipient = recipient,
+            sensorId = current.sensorId.orEmpty(),
+            primaryText = current.primaryStr,
+            displayValue = current.primaryValue.toDouble(),
+            mgdl = current.sharedMgdl,
+            autoValue = current.autoValue,
+            autoMgdl = displayToMgdl(current.autoValue),
+            rawValue = current.rawValue,
+            rateMgdlPerMinute = current.rate,
+            trendIndex = trend.index,
+            trendNameFromInput = trend.name.orEmpty(),
+            trendRateMgdlPerMinute = trend.rateMgdlPerMinute,
+            timeMillis = current.timeMillis,
+            sensorGen = current.sensorGen,
+            alarm = 0,
+            test = false
+        )
     }
 
     private fun enqueueForDestination(
@@ -251,6 +340,9 @@ object OutboundApi {
         sensorGen: Int,
         autoValue: Float,
         autoMgdl: Int,
+        trendIndex: Int,
+        trendName: String?,
+        trendRate: Float,
         alarm: Int,
         test: Boolean
     ) {
@@ -273,6 +365,9 @@ object OutboundApi {
                 .putInt(IN_AUTO_MGDL, autoMgdl)
                 .putFloat(IN_RAW_VALUE, rawValue)
                 .putFloat(IN_RATE, rate)
+                .putInt(IN_TREND_INDEX, trendIndex)
+                .putString(IN_TREND_NAME, trendName.orEmpty())
+                .putFloat(IN_TREND_RATE, trendRate)
                 .putLong(IN_TIME_MILLIS, timeMillis)
                 .putInt(IN_SENSOR_GEN, sensorGen)
                 .putInt(IN_ALARM, alarm)
@@ -358,6 +453,9 @@ object OutboundApi {
             autoMgdl = input.getInt(IN_AUTO_MGDL, 0),
             rawValue = input.getFloat(IN_RAW_VALUE, Float.NaN),
             rateMgdlPerMinute = input.getFloat(IN_RATE, Float.NaN),
+            trendIndex = input.getInt(IN_TREND_INDEX, 0),
+            trendNameFromInput = input.getString(IN_TREND_NAME).orEmpty(),
+            trendRateMgdlPerMinute = input.getFloat(IN_TREND_RATE, Float.NaN),
             timeMillis = timeMillis,
             sensorGen = input.getInt(IN_SENSOR_GEN, 0),
             alarm = input.getInt(IN_ALARM, 0),
@@ -376,6 +474,9 @@ object OutboundApi {
         val autoMgdl: Int,
         val rawValue: Float,
         val rateMgdlPerMinute: Float,
+        val trendIndex: Int,
+        val trendNameFromInput: String,
+        val trendRateMgdlPerMinute: Float,
         val timeMillis: Long,
         val sensorGen: Int,
         val alarm: Int,
@@ -390,7 +491,19 @@ object OutboundApi {
                 ?: Float.NaN
         val rawGlucoseMmol: Float get() = rawGlucoseMgdl / MGDL_PER_MMOLL
         val rateMmolPerMinute: Float get() = rateMgdlPerMinute / MGDL_PER_MMOLL
-        val trendName: String get() = Natives.getxDripTrendName(rateMgdlPerMinute) ?: ""
+        val trendRateMmolPerMinute: Float get() = trendRateMgdlPerMinute / MGDL_PER_MMOLL
+        val trendName: String get() = trendNameFromInput.ifBlank {
+            ExchangeTrend.nameForIndex(trendIndex).ifBlank {
+                Natives.getxDripTrendName(rateMgdlPerMinute) ?: ""
+            }
+        }
+        /**
+         * Latest known skin temperature in °C for this reading's sensor, from
+         * the same sources the Statistics card reads ([SensorTemperature]).
+         * Null when the sensor has no temperature channel — rendered as empty.
+         */
+        val temperatureC: Float? get() =
+            runCatching { SensorTemperature.latestTemperatureC(sensorId) }.getOrNull()
         val trendArrow: String get() = trendArrow(trendName)
         val iob: Float get() = runCatching { Natives.getIOBvalue(timeMillis) }.getOrDefault(Float.NaN)
         val journal: JournalSnapshot get() = loadJournalSnapshot(timeMillis)
@@ -421,23 +534,25 @@ object OutboundApi {
         val json: JSONObject? = null
     )
 
-    internal fun renderMessage(template: String, reading: Reading): String {
+    internal fun renderMessage(
+        template: String,
+        reading: Reading,
+        destination: OutboundApiSettings.Destination? = null,
+        status: String? = null
+    ): String {
         val time = DateFormat.getDateTimeInstance(
             DateFormat.SHORT,
             DateFormat.SHORT,
             Locale.getDefault()
         ).format(Date(reading.timeMillis))
-        val journal = if (
-            template.contains("{journal") ||
-            template.contains("{iob}") ||
-            template.contains("{cob}")
-        ) {
-            reading.journal
-        } else {
-            JournalSnapshot()
-        }
+        val journal = if (needsJournalSnapshot(template)) reading.journal else JournalSnapshot()
         val effectiveIob = journal.iob.takeIf { it.isFinite() } ?: reading.iob
-        return template
+        val journalEvents = journalEventsJsonArray(journal)
+        val effectiveStatus = status
+            ?: destination?.rangeStatus(reading.mgdl)
+            ?: OutboundApiSettings.TUNNEL_STATUS_IN_RANGE
+        val statusEmojiValue = statusEmoji(effectiveStatus)
+        val rendered = template
             .replace("{event_id}", reading.eventId)
             .replace("{recipient}", reading.recipient)
             .replace("{value}", reading.displayText)
@@ -467,18 +582,73 @@ object OutboundApi {
             .replace("{time}", time)
             .replace("{sensor}", reading.sensorId)
             .replace("{sensor_gen}", reading.sensorGen.toString())
+            .replace("{temp}", formatTemperatureC(reading.temperatureC))
             .replace("{alarm}", reading.alarm.toString())
             .replace("{iob}", if (effectiveIob.isFinite()) formatNumber(effectiveIob, 2) else "0")
             .replace("{journal_iob}", if (journal.iob.isFinite()) formatNumber(journal.iob, 2) else "0")
             .replace("{cob}", if (journal.cob.isFinite()) formatNumber(journal.cob, 1) else "0")
+            .replace("{journal_cob}", if (journal.cob.isFinite()) formatNumber(journal.cob, 1) else "0")
+            .replace("{journal_events}", journalEvents?.toString().orEmpty())
             .replace("{journal}", journal.json?.toString().orEmpty())
             .replace("{test}", reading.test.toString())
+            .replace("{status}", effectiveStatus)
+            .replace("{status_emoji}", statusEmojiValue)
+        return OutboundApiInsulinTokens.expand(
+            template = rendered,
+            types = OutboundApiInsulinTokens.parse(journal.json),
+            atMillis = reading.timeMillis,
+            formatTime = ::formatTimeOfDay
+        )
+    }
+
+    private fun formatTimeOfDay(timeMillis: Long): String =
+        DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date(timeMillis))
+
+    /**
+     * Tokens that need no journal read. Anything else in a template — `{iob}`,
+     * `{cob}`, `{journal…}` or a per-insulin-type token, whose spelling depends
+     * on what the user named their insulin — means the snapshot has to be
+     * loaded, which costs a Room query per send.
+     */
+    private val STATIC_TOKENS = setOf(
+        "event_id", "recipient", "value", "unit", "mgdl", "mmol",
+        "auto", "auto_value", "auto_mgdl", "auto_mmol",
+        "raw", "raw_mgdl", "raw_mmol",
+        "trend", "trend_arrow", "rate_mgdl", "rate_mmol",
+        "timestamp", "time", "sensor", "sensor_gen", "temp", "alarm",
+        "test", "status", "status_emoji"
+    )
+
+    // The closing brace must be escaped: JVM java.util.regex tolerates a bare
+    // `}`, but Android's ICU-backed Pattern (Android 16) rejects it with
+    // PatternSyntaxException, which turns this object's <clinit> into an
+    // ExceptionInInitializerError and force-closes the app on every reading.
+    private val PLACEHOLDER = Regex("\\{[^{}\\s]+\\}")
+
+    internal fun needsJournalSnapshot(template: String): Boolean =
+        PLACEHOLDER.findAll(template).any { match ->
+            match.value.removeSurrounding("{", "}") !in STATIC_TOKENS
+        }
+
+    internal fun statusEmoji(status: String): String = when (status) {
+        OutboundApiSettings.TUNNEL_STATUS_HIGH -> "\uD83D\uDFE1"      // 🟡
+        OutboundApiSettings.TUNNEL_STATUS_LOW -> "\uD83D\uDD34"       // 🔴
+        OutboundApiSettings.TUNNEL_STATUS_STALE -> "\u26A0\uFE0F"     // ⚠️
+        OutboundApiSettings.TUNNEL_STATUS_MISSED -> "\u26AA"          // ⚪
+        else -> "\uD83D\uDFE2"                                        // 🟢
     }
 
     internal fun formatNumber(value: Float, decimals: Int): String {
         if (!value.isFinite()) return ""
         return "%.${decimals}f".format(Locale.US, value)
     }
+
+    /**
+     * Renders a `{temp}` token: 1-decimal °C number, or empty when the sensor
+     * has no known temperature. Never invents a value.
+     */
+    internal fun formatTemperatureC(value: Float?): String =
+        if (value != null && value.isFinite()) formatNumber(value, 1) else ""
 
     internal fun displayToMgdl(value: Float): Int {
         if (!value.isFinite() || value <= 0f) return 0
@@ -498,11 +668,7 @@ object OutboundApi {
     }
 
     private fun loadJournalSnapshot(timeMillis: Long): JournalSnapshot {
-        val raw = runCatching {
-            val type = Class.forName("tk.glucodata.OutboundApiJournalSnapshot")
-            val method = type.getMethod("snapshotJson", java.lang.Long.TYPE)
-            method.invoke(null, timeMillis) as? String
-        }.getOrNull() ?: return JournalSnapshot()
+        val raw = JournalSnapshotAccess.snapshotJson(timeMillis)
         if (raw.isBlank()) return JournalSnapshot()
         return runCatching {
             val json = JSONObject(raw)
@@ -513,6 +679,9 @@ object OutboundApi {
             )
         }.getOrDefault(JournalSnapshot())
     }
+
+    internal fun journalEventsJsonArray(journal: JournalSnapshot): JSONArray? =
+        journal.json?.optJSONArray("events") ?: journal.json?.optJSONArray("treatments")
 
     private fun trendArrow(trendName: String): String =
         when (trendName) {
@@ -559,9 +728,38 @@ class OutboundApiWorker(
             val reading = OutboundApi.inputToReading(inputData) ?: return Result.success()
 
             return try {
-                val response = send(destination, reading)
+                val response = send(context, destination, reading)
                 if (response.ok) {
                     OutboundApiSettings.recordSuccess(context, destination.id, response.code)
+                    val nowMs = System.currentTimeMillis()
+                    if (!response.suppressed) {
+                        OutboundApiSettings.recordBubbleSent(
+                            context = context.applicationContext,
+                            destinationId = destination.id,
+                            recipient = reading.recipient,
+                            messageId = response.messageId,
+                            sentAtMs = nowMs,
+                            mgdl = reading.mgdl
+                        )
+                    } else {
+                        // Reading arrived but bubble text was unchanged — still update the
+                        // "last received" timestamp so the stale timer doesn't fire during
+                        // a flat-glucose stretch where every reading is suppressed.
+                        OutboundApiSettings.recordReadingArrived(
+                            context = context.applicationContext,
+                            destinationId = destination.id,
+                            recipient = reading.recipient,
+                            arrivedAtMs = nowMs
+                        )
+                    }
+                    if (destination.normalizedPreset() == OutboundApiSettings.PRESET_TELEGRAM_BOT) {
+                        TelegramStaleCheckWork.schedule(
+                            context = context.applicationContext,
+                            destinationId = destination.id,
+                            delayMs = (destination.staleThresholdMinutes.coerceIn(1, 120) * 60_000L) +
+                                OutboundApiSettings.STALE_CHECK_SLACK_MS
+                        )
+                    }
                     Result.success()
                 } else {
                     OutboundApiSettings.recordAttempt(context, destination.id, response.code, response.error)
@@ -582,7 +780,9 @@ class OutboundApiWorker(
             val code: Int,
             val ok: Boolean,
             val retryable: Boolean,
-            val error: String?
+            val error: String?,
+            val messageId: Long? = null,
+            val suppressed: Boolean = false
         )
 
         private data class ApiError(
@@ -592,12 +792,17 @@ class OutboundApiWorker(
         )
 
         private fun send(
+            context: Context,
             destination: OutboundApiSettings.Destination,
             reading: OutboundApi.Reading
         ): SendResponse {
-            val message = OutboundApi.renderMessage(destination.resolvedTemplate(), reading)
+            val message = OutboundApi.renderMessage(
+                template = destination.resolvedTemplate(),
+                reading = reading,
+                destination = destination
+            )
             return when (destination.normalizedPreset()) {
-                OutboundApiSettings.PRESET_TELEGRAM_BOT -> sendTelegram(destination, reading, message)
+                OutboundApiSettings.PRESET_TELEGRAM_BOT -> sendTelegram(context, destination, reading, message)
                 OutboundApiSettings.PRESET_GLUCO_WATCH_VK,
                 OutboundApiSettings.PRESET_VK_MESSAGES -> sendVk(destination, reading, message)
                 else -> sendJson(destination, reading, message)
@@ -605,6 +810,71 @@ class OutboundApiWorker(
         }
 
         private fun sendTelegram(
+            context: Context,
+            destination: OutboundApiSettings.Destination,
+            reading: OutboundApi.Reading,
+            message: String
+        ): SendResponse {
+            val now = System.currentTimeMillis()
+            val lastMsgId = destination.lastMessageIdByRecipient[reading.recipient] ?: 0L
+            val lastSentMs = destination.lastSentAtMsByRecipient[reading.recipient] ?: 0L
+            val lastMgdl = destination.lastSentMgdlByRecipient[reading.recipient] ?: 0
+            val windowMs = destination.refreshWindowMinutes.coerceIn(1, 60) * 60_000L
+            val withinWindow = destination.refreshInPlaceEnabled &&
+                lastMsgId > 0L && lastSentMs > 0L &&
+                (now - lastSentMs) <= windowMs
+            val suppressThreshold = destination.suppressDeltaBelowMgdl.coerceIn(0, 100)
+            // Test sends use the same reading data every time, so never suppress them —
+            // the user needs to be able to verify edit-in-place via the test button.
+            val shouldSuppress = withinWindow && !reading.test && suppressThreshold > 0 &&
+                kotlin.math.abs(reading.mgdl - lastMgdl) < suppressThreshold
+
+            if (shouldSuppress) {
+                return SendResponse(
+                    code = 200,
+                    ok = true,
+                    retryable = false,
+                    error = null,
+                    messageId = lastMsgId,
+                    suppressed = true
+                )
+            }
+            if (withinWindow) {
+                val editResponse = sendTelegramEdit(
+                    destination = destination,
+                    reading = reading,
+                    message = message,
+                    messageId = lastMsgId
+                )
+                if (editResponse.ok) return editResponse
+                // Telegram rejects edits where the content hasn't changed (400 "not modified").
+                // This is a success — the bubble is already correct — so preserve state and
+                // return without posting a new message.
+                if (editResponse.error?.contains("not modified") == true) {
+                    return SendResponse(
+                        code = 200,
+                        ok = true,
+                        retryable = false,
+                        error = null,
+                        messageId = lastMsgId
+                    )
+                }
+                // Transient failure (rate limit, server error): preserve the message ID so
+                // the next reading retries the edit. Don't attempt a fresh send that will
+                // likely also fail.
+                if (editResponse.retryable) return editResponse
+                // Definitive rejection (message deleted, chat not found, etc.):
+                // clear stale state so the next reading starts a fresh bubble.
+                OutboundApiSettings.clearRecipientState(
+                    context = context.applicationContext,
+                    destinationId = destination.id,
+                    recipient = reading.recipient
+                )
+            }
+            return sendTelegramSend(destination, reading, message)
+        }
+
+        private fun sendTelegramSend(
             destination: OutboundApiSettings.Destination,
             reading: OutboundApi.Reading,
             message: String
@@ -621,7 +891,34 @@ class OutboundApiWorker(
                 body = body,
                 parseApiError = ::parseTelegramError,
                 connectTimeoutMs = 20_000,
-                readTimeoutMs = 30_000
+                readTimeoutMs = 30_000,
+                parseMessageId = ::parseTelegramMessageId
+            )
+        }
+
+        private fun sendTelegramEdit(
+            destination: OutboundApiSettings.Destination,
+            reading: OutboundApi.Reading,
+            message: String,
+            messageId: Long
+        ): SendResponse {
+            val editUrl = destination.resolvedUrl()
+                .replace(Regex("/sendMessage$"), "/editMessageText")
+            val body = JSONObject()
+                .put("chat_id", reading.recipient)
+                .put("message_id", messageId)
+                .put("text", message)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            return executePost(
+                urlString = editUrl,
+                contentType = "application/json; charset=UTF-8",
+                headers = destination.headers,
+                body = body,
+                parseApiError = ::parseTelegramError,
+                connectTimeoutMs = 20_000,
+                readTimeoutMs = 30_000,
+                parseMessageId = ::parseTelegramMessageId
             )
         }
 
@@ -667,7 +964,8 @@ class OutboundApiWorker(
             parseApiError: (String) -> ApiError?,
             connectTimeoutMs: Int = 15_000,
             readTimeoutMs: Int = 30_000,
-            preResponseRetries: Int = 0
+            preResponseRetries: Int = 0,
+            parseMessageId: (String) -> Long? = { null }
         ): SendResponse {
             var lastFailure: Throwable? = null
             repeat(preResponseRetries + 1) { attempt ->
@@ -679,7 +977,8 @@ class OutboundApiWorker(
                         body = body,
                         parseApiError = parseApiError,
                         connectTimeoutMs = connectTimeoutMs,
-                        readTimeoutMs = readTimeoutMs
+                        readTimeoutMs = readTimeoutMs,
+                        parseMessageId = parseMessageId
                     )
                 } catch (th: Throwable) {
                     lastFailure = th
@@ -697,7 +996,8 @@ class OutboundApiWorker(
             body: ByteArray,
             parseApiError: (String) -> ApiError?,
             connectTimeoutMs: Int,
-            readTimeoutMs: Int
+            readTimeoutMs: Int,
+            parseMessageId: (String) -> Long?
         ): SendResponse {
             val connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
@@ -727,11 +1027,13 @@ class OutboundApiWorker(
                     )
                 }
                 val ok = code in 200..299
+                val messageId = if (ok) parseMessageId(responseText) else null
                 return SendResponse(
                     code = code,
                     ok = ok,
                     retryable = code == 429 || code >= 500,
-                    error = if (ok) null else responseText.take(500).ifBlank { "HTTP $code" }
+                    error = if (ok) null else responseText.take(500).ifBlank { "HTTP $code" },
+                    messageId = messageId
                 )
             } finally {
                 connection.disconnect()
@@ -744,6 +1046,7 @@ class OutboundApiWorker(
             message: String
         ): JSONObject {
             val journal = reading.journal
+            val journalEvents = OutboundApi.journalEventsJsonArray(journal)
             return JSONObject()
                 .put("schema", "tk.glucodata.outbound.glucose.v1")
                 .put("type", "glucose")
@@ -780,10 +1083,19 @@ class OutboundApiWorker(
                 .put("rate_mmol_per_min", reading.rateMmolPerMinute.takeIf { it.isFinite() })
                 .put("trend", reading.trendName)
                 .put("trend_arrow", reading.trendArrow)
+                .put("trend_index", reading.trendIndex.takeIf { it > 0 })
+                .put("trend_rate_mgdl_per_min", reading.trendRateMgdlPerMinute.takeIf { it.isFinite() })
+                .put("trend_rate_mmol_per_min", reading.trendRateMmolPerMinute.takeIf { it.isFinite() })
                 .put("alarm", reading.alarm)
                 .put("iob", reading.iob.takeIf { it.isFinite() })
                 .put("journal_iob", journal.iob.takeIf { it.isFinite() })
                 .put("cob", journal.cob.takeIf { it.isFinite() })
+                .put("journal_cob", journal.cob.takeIf { it.isFinite() })
+                .put("journal_events", journalEvents)
+                .put(
+                    OutboundApiInsulinTokens.JSON_ARRAY,
+                    journal.json?.optJSONArray(OutboundApiInsulinTokens.JSON_ARRAY)
+                )
                 .put("journal", journal.json)
                 .put("message", message)
         }
@@ -864,6 +1176,19 @@ class OutboundApiWorker(
                     code = code,
                     retryable = code == 429 || code == 500 || code == 502 || code == 503
                 )
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        private fun parseTelegramMessageId(responseText: String): Long? {
+            if (responseText.isBlank()) return null
+            return try {
+                val root = JSONObject(responseText)
+                if (!root.optBoolean("ok", true)) return null
+                val result = root.optJSONObject("result") ?: return null
+                val id = result.optLong("message_id", 0L)
+                if (id > 0L) id else null
             } catch (_: Throwable) {
                 null
             }

@@ -2,33 +2,39 @@ package tk.glucodata.data
 
 import android.content.Context
 import android.net.Uri
+import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import tk.glucodata.BuildConfig
+import tk.glucodata.GlucoseReadingSource
+import tk.glucodata.HistorySourceProvenance
 import tk.glucodata.data.calibration.CalibrationDatabase
 import tk.glucodata.data.calibration.CalibrationEntity
 import tk.glucodata.data.calibration.CalibrationManager
 import tk.glucodata.data.journal.JournalEntryEntity
+import tk.glucodata.data.journal.CloneJournalIdentity
 import tk.glucodata.data.journal.JournalFoodEntity
 import tk.glucodata.data.journal.JournalInsulinPresetEntity
+import tk.glucodata.data.journal.JournalPendingDeleteEntity
+import tk.glucodata.drivers.sibionics.SibionicsSourceJournalBackup
 import java.io.File
-import java.io.OutputStreamWriter
-import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 object ExportPackageExporter {
-    private const val SCHEMA = "tk.glucodata.export-package"
-    private const val SCHEMA_VERSION = 1
+    internal const val SCHEMA = "tk.glucodata.export-package"
+    private const val SCHEMA_VERSION = 2
+    private const val SQLITE_BIND_CHUNK = 900
 
     data class ExportRequest(
         val includeSettings: Boolean,
         val includeHistory: Boolean,
         val includeCalibrations: Boolean,
-        val historyDays: Long?
+        val historyDays: Long?,
+        val compression: ExportCompression = ExportCompression.GZIP
     ) {
         val hasSelection: Boolean
             get() = includeSettings || includeHistory || includeCalibrations
@@ -59,14 +65,39 @@ object ExportPackageExporter {
         val journalFoods: Int,
         val insulinPresets: Int,
         val calibrations: Int,
-        val restartRequired: Boolean
+        val restartRequired: Boolean,
+        // Serial to display on the dashboard for the imported glucose (may be a
+        // synthetic "imported"/"__imported_csv__" id when the file had no serial).
+        val historyDisplaySerial: String? = null
+    )
+
+    data class BackupValidationSummary(
+        val settingsIncluded: Boolean,
+        val historyReadings: Int,
+        val journalEntries: Int,
+        val journalFoods: Int,
+        val insulinPresets: Int,
+        val calibrations: Int
+    )
+
+    enum class ImportFileType {
+        SETTINGS,
+        EXPORT_PACKAGE,
+        OTHER
+    }
+
+    // Result of importing only the glucose/history section.
+    data class HistoryOnlyImport(
+        val readings: Int,
+        val displaySerial: String?
     )
 
     private data class HistoryImportSummary(
         val readings: Int = 0,
         val journalEntries: Int = 0,
         val journalFoods: Int = 0,
-        val insulinPresets: Int = 0
+        val insulinPresets: Int = 0,
+        val displaySerial: String? = null
     )
 
     suspend fun exportToUri(
@@ -81,10 +112,11 @@ object ExportPackageExporter {
                 val (payload, summary) = buildPayload(appContext, request)
                 val outputStream = appContext.contentResolver.openOutputStream(uri)
                     ?: error("Could not open export destination")
-                OutputStreamWriter(outputStream, StandardCharsets.UTF_8).use { writer ->
-                    writer.write(payload.toString(2))
-                    writer.write("\n")
-                }
+                ExportPackageCodec.writeJson(
+                    output = outputStream,
+                    payload = payload,
+                    compression = request.compression
+                )
                 summary
             }
         }
@@ -96,6 +128,131 @@ object ExportPackageExporter {
             runCatching {
                 readPayload(appContext, uri).optString("schema") == SCHEMA
             }.getOrDefault(false)
+        }
+    }
+
+    suspend fun detectImportFileType(context: Context, uri: Uri): ImportFileType {
+        val appContext = context.applicationContext
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                classifyPayload(readPayload(appContext, uri))
+            }.getOrDefault(ImportFileType.OTHER)
+        }
+    }
+
+    internal fun classifyPayload(payload: JSONObject): ImportFileType {
+        return when (payload.optString("schema")) {
+            SettingsExporter.SCHEMA -> ImportFileType.SETTINGS
+            SCHEMA -> ImportFileType.EXPORT_PACKAGE
+            else -> ImportFileType.OTHER
+        }
+    }
+
+    suspend fun validateBackup(context: Context, uri: Uri): Result<BackupValidationSummary> {
+        val appContext = context.applicationContext
+        return withContext(Dispatchers.IO) {
+            runCatching { validateBackupPayload(readPayload(appContext, uri)) }
+        }
+    }
+
+    internal fun validateBackupPayload(payload: JSONObject): BackupValidationSummary {
+        return when (classifyPayload(payload)) {
+            ImportFileType.SETTINGS -> {
+                val settings = SettingsExporter.validatePayload(payload)
+                BackupValidationSummary(
+                    settingsIncluded = true,
+                    historyReadings = 0,
+                    journalEntries = settings.journalEntries,
+                    journalFoods = settings.journalFoods,
+                    insulinPresets = settings.journalInsulinPresets,
+                    calibrations = 0
+                )
+            }
+            ImportFileType.EXPORT_PACKAGE -> validateExportPackagePayload(payload)
+            ImportFileType.OTHER -> error("Unsupported backup file")
+        }
+    }
+
+    private fun validateExportPackagePayload(payload: JSONObject): BackupValidationSummary {
+        val schemaVersion = payload.optInt("schemaVersion", 0)
+        require(schemaVersion in 1..SCHEMA_VERSION) {
+            "Unsupported export package version: $schemaVersion"
+        }
+        val sections = payload.optJSONArray("sections") ?: error("Backup section list is missing")
+        val sectionNames = buildSet {
+            for (index in 0 until sections.length()) add(sections.getString(index))
+        }
+        require(sectionNames.isNotEmpty()) { "Backup contains no restorable sections" }
+        val supported = setOf("settings", "history", "calibrations")
+        require(sectionNames.all { it in supported }) {
+            "Backup contains an unsupported section"
+        }
+        sectionNames.forEach { section ->
+            require(payload.optJSONObject(section) != null) { "Backup section is missing: $section" }
+        }
+
+        payload.optJSONObject("settings")?.let { settings ->
+            SettingsExporter.validatePayload(settings, requireJournalData = false)
+        }
+        val history = payload.optJSONObject("history")
+        val readings = history?.requiredArray("readings").toHistoryReadings()
+        val journalEntries = history?.requiredArray("journalEntries").toJournalEntries()
+        val insulinPresets = history?.requiredArray("journalInsulinPresets").toInsulinPresets()
+        val foods = history?.requiredArray("journalFoods").toFoods()
+        // Both tombstone arrays arrived after the first packages shipped; the importer
+        // treats them as optional, so validation must too or every older export fails.
+        val deletedReadings = history?.optJSONArray("deletedReadings").toDeletedReadings()
+        val pendingDeletes = history?.optJSONArray("pendingJournalDeletes").toPendingJournalDeletes()
+        if (history != null) {
+            requireFullyParsed("history readings", history.getJSONArray("readings"), readings.size)
+            requireFullyParsed("journal entries", history.getJSONArray("journalEntries"), journalEntries.size)
+            requireFullyParsed(
+                "insulin presets",
+                history.getJSONArray("journalInsulinPresets"),
+                insulinPresets.size
+            )
+            requireFullyParsed("food presets", history.getJSONArray("journalFoods"), foods.size)
+            history.optJSONArray("deletedReadings")?.let { source ->
+                requireFullyParsed("deleted history readings", source, deletedReadings.size)
+            }
+            history.optJSONArray("pendingJournalDeletes")?.let { source ->
+                requireFullyParsed("pending Nightscout deletes", source, pendingDeletes.size)
+            }
+            validateSensorSourceJournals(history.optJSONObject("sensorSourceJournals"))
+        }
+
+        val calibrationsSection = payload.optJSONObject("calibrations")
+        val calibrations = calibrationsSection?.requiredArray("calibrations").toCalibrationEntities()
+        if (calibrationsSection != null) {
+            requireFullyParsed(
+                "calibrations",
+                calibrationsSection.getJSONArray("calibrations"),
+                calibrations.size
+            )
+            calibrationsSection.optJSONArray("sensorEnablement")?.let { states ->
+                val validStates = (0 until states.length()).count { index ->
+                    states.optJSONObject(index)?.optString("sensorId")?.isNotBlank() == true
+                }
+                requireFullyParsed("calibration sensor settings", states, validStates)
+            }
+        }
+
+        return BackupValidationSummary(
+            settingsIncluded = payload.optJSONObject("settings") != null,
+            historyReadings = readings.size,
+            journalEntries = journalEntries.size,
+            journalFoods = foods.size,
+            insulinPresets = insulinPresets.size,
+            calibrations = calibrations.size
+        )
+    }
+
+    private fun JSONObject.requiredArray(name: String): JSONArray =
+        optJSONArray(name) ?: error("Backup field is missing: $name")
+
+    private fun requireFullyParsed(label: String, source: JSONArray, parsedCount: Int) {
+        require(parsedCount == source.length()) {
+            "$label contains ${source.length() - parsedCount} invalid record(s)"
         }
     }
 
@@ -127,8 +284,31 @@ object ExportPackageExporter {
                     journalFoods = historySummary.journalFoods,
                     insulinPresets = historySummary.insulinPresets,
                     calibrations = calibrationCount,
-                    restartRequired = settingsResult != null
+                    restartRequired = settingsResult != null,
+                    historyDisplaySerial = historySummary.displaySerial
                 )
+            }
+        }
+    }
+
+    /**
+     * Import only the glucose/history section from an export package, ignoring
+     * settings and calibrations. Returns the number of imported glucose readings,
+     * or null when the package contains no history section at all.
+     */
+    suspend fun importHistoryFromPackage(context: Context, uri: Uri): Result<HistoryOnlyImport?> {
+        val appContext = context.applicationContext
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val payload = readPayload(appContext, uri)
+                require(payload.optString("schema") == SCHEMA) { "Unsupported export package" }
+                val schemaVersion = payload.optInt("schemaVersion", 0)
+                require(schemaVersion in 1..SCHEMA_VERSION) {
+                    "Unsupported export package version: $schemaVersion"
+                }
+                val history = payload.optJSONObject("history") ?: return@runCatching null
+                val summary = importHistorySection(appContext, history)
+                HistoryOnlyImport(readings = summary.readings, displaySerial = summary.displaySerial)
             }
         }
     }
@@ -149,10 +329,11 @@ object ExportPackageExporter {
 
                 val fileName = suggestedFileName(request)
                 val file = File(exportDir, fileName)
-                OutputStreamWriter(file.outputStream(), StandardCharsets.UTF_8).use { writer ->
-                    writer.write(payload.toString(2))
-                    writer.write("\n")
-                }
+                ExportPackageCodec.writeJson(
+                    output = file.outputStream(),
+                    payload = payload,
+                    compression = request.compression
+                )
                 CachedExport(
                     file = file,
                     fileName = fileName,
@@ -162,7 +343,7 @@ object ExportPackageExporter {
         }
     }
 
-    fun mimeTypeFor(request: ExportRequest): String = "application/json"
+    fun mimeTypeFor(request: ExportRequest): String = request.compression.mimeType
 
     fun suggestedFileName(request: ExportRequest): String {
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(System.currentTimeMillis())
@@ -173,7 +354,7 @@ object ExportPackageExporter {
             request.includeCalibrations && !request.includeSettings && !request.includeHistory -> "Calibrations"
             else -> "Package"
         }
-        return "Juggluco_${label}_$date.json"
+        return "Juggluco_${label}_$date${request.compression.fileSuffix}"
     }
 
     fun suggestedReadableReportFileName(): String {
@@ -265,6 +446,7 @@ object ExportPackageExporter {
             ?.let { endMillis - TimeUnit.DAYS.toMillis(it.coerceAtLeast(1L)) }
             ?: 0L
         val readings = database.historyDao().getReadingsSince(startMillis)
+        val deletedReadings = database.historyDao().getDeletedReadingsSince(startMillis)
         val journalEntries = if (startMillis > 0L) {
             database.journalDao().getEntriesBetween(startMillis, endMillis)
         } else {
@@ -272,15 +454,59 @@ object ExportPackageExporter {
         }
         val insulinPresets = database.journalDao().getInsulinPresets()
         val foods = database.journalDao().getFoods()
+        val pendingJournalDeletes = database.journalDao().getPendingNightscoutDeletes()
+            .filter { it.deletedAt >= startMillis }
+
+        // Non-destructive software calibration (issue #130): the stored values stay
+        // raw mg/dL; each reading additionally carries the calibrated mg/dL that live
+        // outputs (Nightscout/xDrip/screen) would show, when a calibration applies.
+        val isMmol = tk.glucodata.Applic.unit == 1
+        val viewModeOf = ExportCalibration.viewModeResolver()
+        // Readings whose displayed value was recorded export that value rather
+        // than a fresh recomputation — see ReadingDisplay. The whole record is
+        // kept (not just the number) so the lane it was shown on survives: a
+        // raw-line record must not stand in for the auto line, and emitting the
+        // record itself is what makes a wrong-lane freeze diagnosable instead
+        // of visible only through its effect on the calibrated column.
+        val sealedByKey: Map<Long, ReadingDisplay> = if (
+            runCatching { CalibrationManager.shouldFreezeDisplayedValues() }.getOrDefault(false)
+        ) {
+            val nowMs = System.currentTimeMillis()
+            runCatching {
+                database.readingDisplayDao().getAllSince(0L)
+                    .filter { it.isUsable && it.isSealedAt(nowMs) }
+                    .associateBy { sealedDisplayKey(it.timestamp) }
+            }.getOrDefault(emptyMap())
+        } else {
+            emptyMap()
+        }
+        val sealedOf: (HistoryReading) -> ReadingDisplay? = { reading ->
+            sealedByKey[sealedDisplayKey(reading.timestamp)]
+        }
+        val readingDisplaySummary = JSONObject()
+            .put("sealedMinutes", sealedByKey.size)
+            .put(
+                "viewModes",
+                JSONArray().also { array ->
+                    sealedByKey.values.map { it.viewMode }.distinct().sorted().forEach(array::put)
+                }
+            )
+            .put(
+                "sensorSerials",
+                JSONArray().also { array ->
+                    sealedByKey.values.map { it.sensorSerial }.distinct().sorted().forEach(array::put)
+                }
+            )
 
         return JSONObject()
             .put("rangeStartEpochMillis", if (startMillis > 0L) startMillis else JSONObject.NULL)
             .put("rangeEndEpochMillis", endMillis)
             .put("storedUnit", "mg/dL")
+            .put("readingDisplay", readingDisplaySummary)
             .put(
                 "readings",
                 JSONArray().also { array ->
-                    readings.forEach { array.put(it.toJson()) }
+                    readings.forEach { array.put(it.toJson(isMmol, viewModeOf, sealedOf)) }
                 }
             )
             .put(
@@ -300,7 +526,23 @@ object ExportPackageExporter {
                 JSONArray().also { array ->
                     foods.forEach { array.put(it.toJson()) }
                 }
-            ) to HistorySummary(
+            )
+            .put(
+                "deletedReadings",
+                JSONArray().also { array ->
+                    deletedReadings.forEach { array.put(it.toJson()) }
+                }
+            )
+            .put(
+                "pendingJournalDeletes",
+                JSONArray().also { array ->
+                    pendingJournalDeletes.forEach { array.put(it.toJson()) }
+                }
+            )
+            // Raw sensor samples the Sibionics driver rebuilds its history from.
+            // Not range-limited: a rebuild needs the journal whole from idx=1, and a
+            // restore without it re-downloads the sensor's entire life over BLE.
+            .put("sensorSourceJournals", buildSensorSourceJournals(context)) to HistorySummary(
             readings = readings.size,
             journalEntries = journalEntries.size,
             journalFoods = foods.size,
@@ -308,23 +550,91 @@ object ExportPackageExporter {
         )
     }
 
+    private fun buildSensorSourceJournals(context: Context): JSONObject {
+        val result = JSONObject()
+        SibionicsSourceJournalBackup.collect(context.filesDir).forEach { (relativePath, file) ->
+            result.put(
+                relativePath,
+                JSONObject()
+                    .put("byteCount", file.length())
+                    .put("base64", android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP))
+            )
+        }
+        return result
+    }
+
+    /** Returns the number of source samples the local journals did not already hold. */
+    private fun importSensorSourceJournals(context: Context, journals: JSONObject?): Int {
+        if (journals == null) return 0
+        var imported = 0
+        val names = journals.keys()
+        while (names.hasNext()) {
+            val relativePath = names.next()
+            val entry = journals.optJSONObject(relativePath) ?: continue
+            val encoded = entry.optString("base64").takeIf { it.isNotBlank() } ?: continue
+            val bytes = android.util.Base64.decode(encoded, android.util.Base64.DEFAULT)
+            imported += SibionicsSourceJournalBackup.restore(context.filesDir, relativePath, bytes)
+        }
+        return imported
+    }
+
+    private fun validateSensorSourceJournals(journals: JSONObject?) {
+        if (journals == null) return
+        val names = journals.keys()
+        while (names.hasNext()) {
+            val relativePath = names.next()
+            require(SibionicsSourceJournalBackup.isJournalPath(relativePath)) {
+                "Backup contains an unsupported sensor journal: $relativePath"
+            }
+            val entry = journals.optJSONObject(relativePath)
+                ?: error("Invalid sensor journal entry: $relativePath")
+            val encoded = entry.optString("base64")
+            require(encoded.isNotBlank()) { "Sensor journal data is missing: $relativePath" }
+            android.util.Base64.decode(encoded, android.util.Base64.DEFAULT)
+        }
+    }
+
     private suspend fun buildCalibrationSection(context: Context): Pair<JSONObject, Int> {
         CalibrationManager.init(context)
+        CalibrationManager.getCachedCalibrations()
         val rows = CalibrationDatabase.getInstance(context)
             .calibrationDao()
             .getAllSync()
             .sortedByDescending { it.timestamp }
+        val currentSensorId = CalibrationManager.getResolvedCurrentSensorId()
 
         return JSONObject()
-            .put("version", 1)
+            .put("version", 2)
             .put("createdAtEpochMillis", System.currentTimeMillis())
-            .put("rawEnabled", CalibrationManager.isEnabledForRaw.value)
-            .put("autoEnabled", CalibrationManager.isEnabledForAuto.value)
+            .put(
+                "rawEnabled",
+                CalibrationManager.isEnabledForMode(isRawMode = true, sensorIdOverride = currentSensorId)
+            )
+            .put(
+                "autoEnabled",
+                CalibrationManager.isEnabledForMode(isRawMode = false, sensorIdOverride = currentSensorId)
+            )
+            .put(
+                "sensorEnablement",
+                JSONArray().also { array ->
+                    CalibrationManager.getSensorEnablementSnapshot().forEach { state ->
+                        array.put(
+                            JSONObject()
+                                .put("sensorId", state.sensorId)
+                                .put("rawEnabled", state.rawEnabled)
+                                .put("autoEnabled", state.autoEnabled)
+                        )
+                    }
+                }
+            )
             .put("hideInitialWhenCalibrated", CalibrationManager.hideInitialWhenCalibrated.value)
             .put("applyToPast", CalibrationManager.applyToPast.value)
             .put("lockPastHistory", CalibrationManager.lockPastHistory.value)
+            .put("keepDisabledHistory", CalibrationManager.keepDisabledHistory.value)
             .put("overwriteSensorValues", CalibrationManager.overwriteSensorValues.value)
             .put("visualContinuity", CalibrationManager.visualContinuity.value)
+            .put("calibrateFromJournal", CalibrationManager.calibrateFromJournal.value)
+            .put("weightMode", CalibrationManager.getWeightMode().storageValue)
             .put("rawAlgorithm", CalibrationManager.getAlgorithmForMode(isRawMode = true).storageValue)
             .put("autoAlgorithm", CalibrationManager.getAlgorithmForMode(isRawMode = false).storageValue)
             .put(
@@ -344,9 +654,23 @@ object ExportPackageExporter {
         val entries = history.optJSONArray("journalEntries").toJournalEntries()
         val insulinPresets = history.optJSONArray("journalInsulinPresets").toInsulinPresets()
         val foods = history.optJSONArray("journalFoods").toFoods()
+        val deletedReadings = history.optJSONArray("deletedReadings").toDeletedReadings()
+        val pendingJournalDeletes = history.optJSONArray("pendingJournalDeletes").toPendingJournalDeletes()
 
         if (readings.isNotEmpty()) {
-            database.historyDao().insertAll(readings)
+            database.withTransaction {
+                val dao = database.historyDao()
+                val existingByKey = HashMap<Pair<String, Long>, HistoryReading>()
+                readings.groupBy(HistoryReading::sensorSerial).forEach { (serial, rows) ->
+                    rows.map(HistoryReading::timestamp).distinct().chunked(SQLITE_BIND_CHUNK)
+                        .forEach { timestamps ->
+                            dao.getSensorReadingsAtTimestamps(serial, timestamps).forEach { existing ->
+                                existingByKey[serial to existing.timestamp] = existing
+                            }
+                        }
+                }
+                dao.insertAll(preserveImportedHistoryProvenance(readings, existingByKey))
+            }
         }
         if (foods.isNotEmpty()) {
             database.journalDao().insertFoods(foods)
@@ -356,13 +680,34 @@ object ExportPackageExporter {
         }
         if (entries.isNotEmpty()) {
             database.journalDao().upsertEntries(entries)
+            // Written straight to the table rather than through the repository, so the wake
+            // it raises has to be raised here: a restored journal is a backlog like any
+            // other and would otherwise sit until something unrelated woke the uploader.
+            tk.glucodata.NightscoutUploadWake.afterJournalChange()
         }
+        if (deletedReadings.isNotEmpty()) {
+            database.historyDao().insertDeletedReadings(deletedReadings)
+        }
+        if (pendingJournalDeletes.isNotEmpty()) {
+            for (tombstone in pendingJournalDeletes) {
+                database.journalDao().enqueuePendingNightscoutDelete(tombstone)
+            }
+            tk.glucodata.NightscoutUploadWake.afterJournalChange()
+        }
+        // Merged into the on-disk journals; a driver already running for that
+        // sensor reads the merged file on its next start.
+        importSensorSourceJournals(context, history.optJSONObject("sensorSourceJournals"))
+
+        // Serial to key the dashboard on: the newest reading's serial (already
+        // normalized to "imported" by toHistoryReadings() when the file had none).
+        val displaySerial = readings.maxByOrNull { it.timestamp }?.sensorSerial
 
         return HistoryImportSummary(
             readings = readings.size,
             journalEntries = entries.size,
             journalFoods = foods.size,
-            insulinPresets = insulinPresets.size
+            insulinPresets = insulinPresets.size,
+            displaySerial = displaySerial
         )
     }
 
@@ -376,14 +721,43 @@ object ExportPackageExporter {
             CalibrationDatabase.getInstance(context).calibrationDao().insertAll(rows)
         }
 
-        CalibrationManager.setEnabledForMode(
-            isRawMode = true,
-            enabled = calibrations.optBoolean("rawEnabled", CalibrationManager.isEnabledForRaw.value)
-        )
-        CalibrationManager.setEnabledForMode(
-            isRawMode = false,
-            enabled = calibrations.optBoolean("autoEnabled", CalibrationManager.isEnabledForAuto.value)
-        )
+        val sensorEnablement = calibrations.optJSONArray("sensorEnablement")
+        if (sensorEnablement != null) {
+            for (index in 0 until sensorEnablement.length()) {
+                val state = sensorEnablement.optJSONObject(index) ?: continue
+                val sensorId = state.optString("sensorId", "").takeIf { it.isNotBlank() } ?: continue
+                CalibrationManager.setEnabledForMode(
+                    isRawMode = true,
+                    enabled = state.optBoolean("rawEnabled", true),
+                    sensorIdOverride = sensorId
+                )
+                CalibrationManager.setEnabledForMode(
+                    isRawMode = false,
+                    enabled = state.optBoolean("autoEnabled", true),
+                    sensorIdOverride = sensorId
+                )
+            }
+        } else {
+            val currentSensorId = CalibrationManager.getResolvedCurrentSensorId()
+            if (currentSensorId.isNotBlank()) {
+                CalibrationManager.setEnabledForMode(
+                    isRawMode = true,
+                    enabled = calibrations.optBoolean(
+                        "rawEnabled",
+                        CalibrationManager.isEnabledForMode(true, currentSensorId)
+                    ),
+                    sensorIdOverride = currentSensorId
+                )
+                CalibrationManager.setEnabledForMode(
+                    isRawMode = false,
+                    enabled = calibrations.optBoolean(
+                        "autoEnabled",
+                        CalibrationManager.isEnabledForMode(false, currentSensorId)
+                    ),
+                    sensorIdOverride = currentSensorId
+                )
+            }
+        }
         CalibrationManager.setHideInitialWhenCalibrated(
             calibrations.optBoolean(
                 "hideInitialWhenCalibrated",
@@ -396,11 +770,22 @@ object ExportPackageExporter {
         CalibrationManager.setLockPastHistory(
             calibrations.optBoolean("lockPastHistory", CalibrationManager.lockPastHistory.value)
         )
+        CalibrationManager.setKeepDisabledHistory(
+            calibrations.optBoolean("keepDisabledHistory", CalibrationManager.keepDisabledHistory.value)
+        )
         CalibrationManager.setOverwriteSensorValues(
             calibrations.optBoolean("overwriteSensorValues", CalibrationManager.overwriteSensorValues.value)
         )
         CalibrationManager.setVisualContinuity(
             calibrations.optBoolean("visualContinuity", CalibrationManager.visualContinuity.value)
+        )
+        CalibrationManager.setCalibrateFromJournal(
+            calibrations.optBoolean("calibrateFromJournal", CalibrationManager.calibrateFromJournal.value)
+        )
+        CalibrationManager.setWeightMode(
+            CalibrationManager.CalibrationWeightMode.fromStorage(
+                calibrations.optString("weightMode", "")
+            )
         )
         CalibrationManager.setAlgorithmForMode(
             isRawMode = true,
@@ -418,13 +803,37 @@ object ExportPackageExporter {
         return rows.size
     }
 
-    private fun HistoryReading.toJson(): JSONObject {
+    /** Mirrors HistoryRepository's display key: the minute, and nothing else. */
+    private fun sealedDisplayKey(timestamp: Long): Long = ReadingDisplay.minuteOf(timestamp)
+
+    private fun HistoryReading.toJson(
+        isMmol: Boolean,
+        viewModeOf: (String?) -> Int,
+        sealedOf: (HistoryReading) -> ReadingDisplay?
+    ): JSONObject {
+        val sealed = sealedOf(this)
+        val calibratedMgDl = ExportCalibration.calibratedMgDl(
+            autoMgDl = value,
+            rawMgDl = rawValue,
+            timestamp = timestamp,
+            sensorId = sensorSerial,
+            viewMode = viewModeOf(sensorSerial),
+            isMmol = isMmol,
+            sealedMgDl = sealed?.displayMgdl,
+            sealedViewMode = sealed?.viewMode
+        )
         return JSONObject()
             .put("timestamp", timestamp)
             .put("sensorSerial", sensorSerial)
             .put("valueMgDl", value.toDouble())
             .put("rawValueMgDl", rawValue.toDouble())
+            .put("calibratedValueMgDl", calibratedMgDl?.toDouble() ?: JSONObject.NULL)
+            .put("sealedMgDl", sealed?.displayMgdl?.toDouble() ?: JSONObject.NULL)
+            .put("sealedViewMode", sealed?.viewMode ?: JSONObject.NULL)
+            .put("sealedSensorSerial", sealed?.sensorSerial ?: JSONObject.NULL)
             .put("rate", rate?.toDouble() ?: JSONObject.NULL)
+            .put("source", source)
+            .put("firstStoredAt", firstStoredAt)
     }
 
     private fun JournalEntryEntity.toJson(): JSONObject {
@@ -444,11 +853,19 @@ object ExportPackageExporter {
             .put("proteinGrams", proteinGrams?.toDouble() ?: JSONObject.NULL)
             .put("fatGrams", fatGrams?.toDouble() ?: JSONObject.NULL)
             .put("source", source)
+            .put("originSource", originSource ?: JSONObject.NULL)
             .put("sourceRecordId", sourceRecordId ?: JSONObject.NULL)
+            .put("recoveryId", recoveryId ?: JSONObject.NULL)
             .put("createdAt", createdAt)
             .put("updatedAt", updatedAt)
             .put("nsUploadedAt", nsUploadedAt ?: JSONObject.NULL)
             .put("nsRemoteId", nsRemoteId ?: JSONObject.NULL)
+            .put("insulinCurveJsonSnapshot", insulinCurveJsonSnapshot ?: JSONObject.NULL)
+            .put("insulinCurveProfileId", insulinCurveProfileId ?: JSONObject.NULL)
+            .put("insulinCurveModelVersion", insulinCurveModelVersion ?: JSONObject.NULL)
+            .put("insulinCurveEvidence", insulinCurveEvidence ?: JSONObject.NULL)
+            .put("insulinBodyWeightKg", insulinBodyWeightKg?.toDouble() ?: JSONObject.NULL)
+            .put("insulinCurveWasApproximated", insulinCurveWasApproximated)
     }
 
     private fun JournalInsulinPresetEntity.toJson(): JSONObject {
@@ -462,7 +879,11 @@ object ExportPackageExporter {
             .put("isBuiltIn", isBuiltIn)
             .put("isArchived", isArchived)
             .put("countsTowardIob", countsTowardIob)
+            .put("useForCalculation", useForCalculation)
             .put("sortOrder", sortOrder)
+            .put("curveProfileId", curveProfileId ?: JSONObject.NULL)
+            .put("curveModelVersion", curveModelVersion)
+            .put("curveEvidence", curveEvidence)
     }
 
     private fun JournalFoodEntity.toJson(): JSONObject {
@@ -490,6 +911,23 @@ object ExportPackageExporter {
             .put("userValue", userValue.toDouble())
             .put("isEnabled", isEnabled)
             .put("isRawMode", isRawMode)
+            .put("journalEntryId", journalEntryId ?: JSONObject.NULL)
+    }
+
+    private fun DeletedHistoryReading.toJson(): JSONObject {
+        return JSONObject()
+            .put("timestamp", timestamp)
+            .put("sensorSerial", sensorSerial)
+            .put("deletedAt", deletedAt)
+    }
+
+    private fun JournalPendingDeleteEntity.toJson(): JSONObject {
+        return JSONObject()
+            .put("entryId", entryId)
+            .put("nsRemoteId", nsRemoteId)
+            .put("deletedAt", deletedAt)
+            .put("attempts", attempts)
+            .put("lastAttemptAt", lastAttemptAt)
     }
 
     private fun JSONArray?.toHistoryReadings(): List<HistoryReading> {
@@ -508,11 +946,29 @@ object ExportPackageExporter {
                         sensorSerial = sensorSerial,
                         value = value,
                         rawValue = rawValue,
-                        rate = item.optNullableFloat("rate")
+                        rate = item.optNullableFloat("rate"),
+                        source = item.optString("source", GlucoseReadingSource.SENSOR)
+                            .ifBlank { GlucoseReadingSource.SENSOR },
+                        firstStoredAt = item.optLong("firstStoredAt", System.currentTimeMillis())
+                            .takeIf { it > 0L } ?: System.currentTimeMillis(),
                     )
                 )
             }
         }
+    }
+
+    internal fun preserveImportedHistoryProvenance(
+        incoming: List<HistoryReading>,
+        existingByKey: Map<Pair<String, Long>, HistoryReading>,
+    ): List<HistoryReading> = incoming.map { reading ->
+        val existing = existingByKey[reading.sensorSerial to reading.timestamp]
+        reading.copy(
+            source = HistorySourceProvenance.stableSource(existing?.source, reading.source),
+            firstStoredAt = HistorySourceProvenance.stableFirstStoredAt(
+                existing?.firstStoredAt,
+                reading.firstStoredAt,
+            ),
+        )
     }
 
     private fun JSONArray?.toJournalEntries(): List<JournalEntryEntity> {
@@ -539,11 +995,24 @@ object ExportPackageExporter {
                         proteinGrams = item.optNullableFloat("proteinGrams"),
                         fatGrams = item.optNullableFloat("fatGrams"),
                         source = item.optString("source", "import"),
+                        originSource = item.optNullableString("originSource"),
                         sourceRecordId = item.optNullableString("sourceRecordId"),
+                        recoveryId = CloneJournalIdentity.normalizeRecoveryId(
+                            item.optNullableString("recoveryId")
+                        ) ?: CloneJournalIdentity.newRecoveryId(),
                         createdAt = item.optLong("createdAt", timestamp),
                         updatedAt = item.optLong("updatedAt", timestamp),
                         nsUploadedAt = item.optNullableLong("nsUploadedAt"),
-                        nsRemoteId = item.optNullableString("nsRemoteId")
+                        nsRemoteId = item.optNullableString("nsRemoteId"),
+                        insulinCurveJsonSnapshot = item.optNullableString("insulinCurveJsonSnapshot"),
+                        insulinCurveProfileId = item.optNullableString("insulinCurveProfileId"),
+                        insulinCurveModelVersion = item.optNullableInt("insulinCurveModelVersion"),
+                        insulinCurveEvidence = item.optNullableString("insulinCurveEvidence"),
+                        insulinBodyWeightKg = item.optNullableFloat("insulinBodyWeightKg"),
+                        insulinCurveWasApproximated = item.optBoolean(
+                            "insulinCurveWasApproximated",
+                            false
+                        )
                     )
                 )
             }
@@ -566,7 +1035,15 @@ object ExportPackageExporter {
                         isBuiltIn = item.optBoolean("isBuiltIn", false),
                         isArchived = item.optBoolean("isArchived", false),
                         countsTowardIob = item.optBoolean("countsTowardIob", true),
-                        sortOrder = item.optInt("sortOrder", index)
+                        sortOrder = item.optInt("sortOrder", index),
+                        useForCalculation = item.optBoolean(
+                            "useForCalculation",
+                            !(item.optBoolean("isBuiltIn", false) &&
+                                item.optInt("sortOrder", index) in setOf(1, 10))
+                        ),
+                        curveProfileId = item.optNullableString("curveProfileId"),
+                        curveModelVersion = item.optInt("curveModelVersion", 0),
+                        curveEvidence = item.optString("curveEvidence", "unverified")
                     )
                 )
             }
@@ -613,7 +1090,48 @@ object ExportPackageExporter {
                         sensorValueRaw = item.optDouble("sensorValueRaw", 0.0).toFloat(),
                         userValue = item.optDouble("userValue", 0.0).toFloat(),
                         isEnabled = item.optBoolean("isEnabled", true),
-                        isRawMode = item.optBoolean("isRawMode", false)
+                        isRawMode = item.optBoolean("isRawMode", false),
+                        journalEntryId = item.optNullableLong("journalEntryId")
+                    )
+                )
+            }
+        }
+    }
+
+    private fun JSONArray?.toDeletedReadings(): List<DeletedHistoryReading> {
+        if (this == null) return emptyList()
+        return buildList {
+            for (index in 0 until length()) {
+                val item = optJSONObject(index) ?: continue
+                val timestamp = item.optLong("timestamp", 0L)
+                val sensorSerial = item.optString("sensorSerial", "")
+                if (timestamp <= 0L || sensorSerial.isBlank()) continue
+                add(
+                    DeletedHistoryReading(
+                        timestamp = timestamp,
+                        sensorSerial = sensorSerial,
+                        deletedAt = item.optLong("deletedAt", timestamp)
+                    )
+                )
+            }
+        }
+    }
+
+    private fun JSONArray?.toPendingJournalDeletes(): List<JournalPendingDeleteEntity> {
+        if (this == null) return emptyList()
+        return buildList {
+            for (index in 0 until length()) {
+                val item = optJSONObject(index) ?: continue
+                val entryId = item.optLong("entryId", 0L)
+                val remoteId = item.optString("nsRemoteId", "")
+                if (entryId <= 0L || remoteId.isBlank()) continue
+                add(
+                    JournalPendingDeleteEntity(
+                        entryId = entryId,
+                        nsRemoteId = remoteId,
+                        deletedAt = item.optLong("deletedAt", System.currentTimeMillis()),
+                        attempts = item.optInt("attempts", 0),
+                        lastAttemptAt = item.optLong("lastAttemptAt", 0L)
                     )
                 )
             }
@@ -639,7 +1157,7 @@ object ExportPackageExporter {
     private fun readPayload(context: Context, uri: Uri): JSONObject {
         val inputStream = context.contentResolver.openInputStream(uri)
             ?: error("Could not open import source")
-        val text = inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+        val text = ExportPackageCodec.readUtf8(inputStream)
         return JSONObject(text)
     }
 }

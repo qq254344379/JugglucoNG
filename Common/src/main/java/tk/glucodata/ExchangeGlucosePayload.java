@@ -13,6 +13,10 @@ final class ExchangeGlucosePayload {
     final int autoMgdl;
     final float rawValue;
     final float rate;
+    final int trendIndex;
+    final String trendName;
+    final String trendArrow;
+    final float trendRate;
     final long timeMillis;
     final int sensorGen;
 
@@ -25,6 +29,7 @@ final class ExchangeGlucosePayload {
             int autoMgdl,
             float rawValue,
             float rate,
+            ExchangeTrend trend,
             long timeMillis,
             int sensorGen) {
         this.sensorId = sensorId;
@@ -35,6 +40,10 @@ final class ExchangeGlucosePayload {
         this.autoMgdl = autoMgdl;
         this.rawValue = rawValue;
         this.rate = rate;
+        this.trendIndex = trend.index;
+        this.trendName = trend.name;
+        this.trendArrow = trend.arrow;
+        this.trendRate = trend.rateMgdlPerMinute;
         this.timeMillis = timeMillis;
         this.sensorGen = sensorGen;
     }
@@ -69,6 +78,22 @@ final class ExchangeGlucosePayload {
 
     float getRate() {
         return rate;
+    }
+
+    int getTrendIndex() {
+        return trendIndex;
+    }
+
+    String getTrendName() {
+        return trendName;
+    }
+
+    String getTrendArrow() {
+        return trendArrow;
+    }
+
+    float getTrendRate() {
+        return trendRate;
     }
 
     long getTimeMillis() {
@@ -106,13 +131,21 @@ final class ExchangeGlucosePayload {
                     ? SensorIdentity.resolveAppSensorId(rawSensorId)
                     : rawSensorId;
             final String primaryText = formatPrimary(primaryDisplayValue, current.getPrimaryStr());
-            final float rate = Float.isFinite(current.getRate()) ? current.getRate() : fallbackRate;
+            final float nativeRate = Float.isFinite(current.getRate()) ? current.getRate() : fallbackRate;
             final long timeMillis = current.getTimeMillis() > 0L ? current.getTimeMillis() : fallbackTimeMillis;
             final int sensorGen = current.getSensorGen() != 0 ? current.getSensorGen() : fallbackSensorGen;
             final int primaryMgdl = toMgdl(primaryDisplayValue);
             final float autoValue = current.getAutoValue();
             final int autoMgdl = toMgdl(autoValue);
             final float rawValue = current.getRawValue();
+            // Opt-in: send the app's computed trend instead of the sensor's
+            // lagging estimate; index/name follow the sent rate so the
+            // outgoing extras stay consistent with each other.
+            final boolean computedTrend = BroadcastTrendRate.enabled();
+            final float rate = computedTrend ? BroadcastTrendRate.computed(sensorId, nativeRate) : nativeRate;
+            final ExchangeTrend trend = computedTrend
+                    ? ExchangeTrend.fromRate(rate)
+                    : ExchangeTrend.resolve(sensorId, timeMillis, rate);
             return new ExchangeGlucosePayload(
                     sensorId,
                     primaryText,
@@ -122,6 +155,7 @@ final class ExchangeGlucosePayload {
                     autoMgdl,
                     rawValue,
                     rate,
+                    trend,
                     timeMillis,
                     sensorGen);
         }
@@ -130,6 +164,10 @@ final class ExchangeGlucosePayload {
                 ? SensorIdentity.resolveAppSensorId(preferredSensorId)
                 : preferredSensorId;
 
+        final boolean computedTrend = BroadcastTrendRate.enabled();
+        final float outgoingRate = computedTrend
+                ? BroadcastTrendRate.computed(fallbackSensorId, fallbackRate)
+                : fallbackRate;
         return new ExchangeGlucosePayload(
                 fallbackSensorId,
                 formatPrimary(fallbackDisplayValue, fallbackPrimaryText),
@@ -138,7 +176,10 @@ final class ExchangeGlucosePayload {
                 Float.NaN,
                 0,
                 Float.NaN,
-                fallbackRate,
+                outgoingRate,
+                computedTrend
+                        ? ExchangeTrend.fromRate(outgoingRate)
+                        : ExchangeTrend.resolve(fallbackSensorId, fallbackTimeMillis, fallbackRate),
                 fallbackTimeMillis,
                 fallbackSensorGen);
     }

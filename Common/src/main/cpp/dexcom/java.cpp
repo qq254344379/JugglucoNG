@@ -19,6 +19,7 @@
 /*      Fri Nov 22 12:21:09 CET 2024 */
 
 #ifdef DEXCOM
+#include "../exchangetrend.hpp"
 #include "datbackup.hpp"
 #include "destruct.hpp"
 #include "fromjava.h"
@@ -47,24 +48,9 @@ Composed(19,19,0,11,[
   Digit(1,1,10,"",[],"Info",1,1)],"",[],"",1,1);
   */
 
-int rate2changeindex(float rate) {
-  if (rate <= -2.0f) {
-    return 1;
-  }
-  if (rate <= -1.0f) {
-    return 2;
-  }
-  if (rate <= 1.0f) {
-    return 3;
-  }
-  if (rate <= 2.0f) {
-    return 4;
-  }
-  if (std::isnan(rate)) {
-    return 0;
-  }
-  return 5;
-}
+// Kept as an exported symbol for accu/java.cpp; the ladder itself lives in exchangetrend.hpp so
+// drivers built without the Dexcom flavour can share it.
+int rate2changeindex(float rate) { return ratetolegacytrendindex(rate); }
 
 constexpr const int dexmaxtime = 907500; //  907385
 constexpr const int DEXSECONDS = 5 * 60;
@@ -723,15 +709,9 @@ fromjava(dexCandidate)(JNIEnv *env, jclass cl, jlong dataptr,
     return false;
   }
 }
-#include "EverSense.hpp"
 extern "C" JNIEXPORT void JNICALL fromjava(dexEndBackfill)(JNIEnv *env,
                                                            jclass cl,
                                                            jlong dataptr) {
   backup->wakebackup(Backup::wakestream);
-#ifdef OLDEVERSENSE
-  if (!settings->data()->everSenseBroadcast.nr)
-    return;
-  sendEverSenseold(reinterpret_cast<const streamdata *>(dataptr)->hist, 1);
-#endif
 }
 #endif

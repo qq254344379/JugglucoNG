@@ -2,6 +2,7 @@ package tk.glucodata.drivers
 
 import tk.glucodata.Applic
 import android.content.Context
+import tk.glucodata.Log
 import tk.glucodata.SensorIdentity
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.drivers.aidex.AiDexManagedSensorIdentityAdapter
@@ -9,14 +10,20 @@ import tk.glucodata.drivers.api.ApiGlucoseSourceIdentityAdapter
 import tk.glucodata.drivers.anytime.AnytimeManagedSensorIdentityAdapter
 import tk.glucodata.drivers.icanhealth.ICanHealthManagedSensorIdentityAdapter
 import tk.glucodata.drivers.mq.MQManagedSensorIdentityAdapter
+import tk.glucodata.drivers.ottai.OttaiManagedSensorIdentityAdapter
+import tk.glucodata.drivers.sibionics.SibionicsManagedSensorIdentityAdapter
 import tk.glucodata.drivers.nightscout.NightscoutFollowerIdentityAdapter
 
 object ManagedSensorIdentityRegistry {
+    private const val TAG = "ManagedSensorIdentity"
+
     val all: List<ManagedSensorIdentityAdapter> = listOf(
         AiDexManagedSensorIdentityAdapter,
         AnytimeManagedSensorIdentityAdapter,
         ICanHealthManagedSensorIdentityAdapter,
         MQManagedSensorIdentityAdapter,
+        OttaiManagedSensorIdentityAdapter,
+        SibionicsManagedSensorIdentityAdapter,
         NightscoutFollowerIdentityAdapter,
         ApiGlucoseSourceIdentityAdapter,
     )
@@ -38,6 +45,20 @@ object ManagedSensorIdentityRegistry {
                 }
             }
         }
+    }
+
+    /**
+     * The family whose persisted record owns [sensorId], or null when no
+     * adapter claims it. Reads only the adapters' own records: no driver needs
+     * to be running, and no SensorBluetooth lock is taken, so this is safe on
+     * the reading broadcast path.
+     */
+    @JvmStatic
+    fun resolvePersistedFamily(sensorId: String?): ManagedSensorUiFamily? {
+        val normalized = sensorId?.trim().takeIf { !it.isNullOrEmpty() } ?: return null
+        return all.firstOrNull { adapter ->
+            runCatching { adapter.hasPersistedManagedRecord(normalized) }.getOrDefault(false)
+        }?.uiFamily
     }
 
     fun persistedSensorIds(context: Context): List<String> =
@@ -78,8 +99,30 @@ object ManagedSensorIdentityRegistry {
             .firstOrNull()
 
     fun removePersistedSensor(context: Context, sensorId: String?) {
-        all.forEach { it.removePersistedSensor(context, sensorId) }
+        val normalized = sensorId?.trim().takeIf { !it.isNullOrEmpty() }
+        if (normalized != null) {
+            val exactOwners = all.filter { adapter ->
+                adapter.persistedSensorIds(context).any { it.equals(normalized, ignoreCase = true) }
+            }
+            val owners = if (exactOwners.isNotEmpty()) {
+                exactOwners
+            } else {
+                all.filter { it.hasPersistedManagedRecord(normalized) }
+            }
+            when (owners.size) {
+                0 -> Unit
+                1 -> owners.single().removePersistedSensor(context, normalized)
+                else -> Log.e(
+                    TAG,
+                    "Refusing ambiguous persisted sensor removal for $normalized: " +
+                        owners.joinToString { it.javaClass.simpleName }
+                )
+            }
+        }
         ManagedSensorViewModeStore.clear(context, sensorId)
         SensorIdentity.invalidateCaches()
+        // Removals never propagated to the watch: its handoff-synced record
+        // kept the sensor listed as "Connected" and hijacked current selection.
+        tk.glucodata.WearSync2.pushRemoval(sensorId)
     }
 }

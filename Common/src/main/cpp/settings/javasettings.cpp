@@ -923,15 +923,38 @@ fromjava(getusexdripwebserver)(JNIEnv *env, jclass cl) {
 }
 extern void stopwatchthread();
 extern void startwatchthread(int port);
+extern void restartwatchthread(int port);
 extern "C" JNIEXPORT void JNICALL fromjava(setusexdripwebserver)(JNIEnv *env,
                                                                  jclass cl,
                                                                  jboolean val) {
 #ifndef WEAROS
   settings->data()->usexdripwebserver = val;
   if (val) {
-    startwatchthread(defaulthttpport);
+    startwatchthread(settings->data()->effectivehttpport());
   } else {
     stopwatchthread();
+  }
+#endif
+}
+
+extern "C" JNIEXPORT jint JNICALL fromjava(getxdripport)(JNIEnv *env,
+                                                         jclass cl) {
+  return settings->data()->effectivehttpport();
+}
+
+// The port was always in the settings file and always honoured by the desktop
+// build; on Android both start sites passed the compile-time default instead,
+// so it could not be reached from the phone at all.
+extern "C" JNIEXPORT void JNICALL fromjava(setxdripport)(JNIEnv *env, jclass cl,
+                                                         jint val) {
+#ifndef WEAROS
+  if (val < 1024 || val > UINT16_MAX)
+    return;
+  if (settings->data()->effectivehttpport() == val)
+    return;
+  settings->data()->httpport = static_cast<uint16_t>(val);
+  if (settings->data()->usexdripwebserver) {
+    restartwatchthread(val);
   }
 #endif
 }
@@ -1117,9 +1140,7 @@ static jlong getlibreaccountidnumber() {
   const jlong num = settings->data()->libreaccountIDnum;
   if (num != -1LL)
     return num;
-  if (!settings->data()->sendtolibreview) {
-    return 0;
-  }
+  // Libre 3 NFC needs the fetched account ID even when LibreView upload is off.
   auto &accountid = settings->data()->libreviewAccountID;
   uint32_t res = 0;
   for (auto el : accountid) {
@@ -1437,21 +1458,6 @@ fromjava(setglucodataRecepters)(JNIEnv *env, jclass cl, jobjectArray jnames) {
   auto *broad = &settings->data()->glucodataBroadcast;
   setstringarray(env, jnames, reinterpret_cast<BroadcastListeners<0> *>(broad),
                  broad->getmax());
-}
-
-extern "C" JNIEXPORT jobjectArray JNICALL
-fromjava(everSenseRecepters)(JNIEnv *env, jclass cl) {
-  return mkjavastringarray(env, &settings->data()->everSenseBroadcast);
-}
-extern "C" JNIEXPORT void JNICALL
-fromjava(seteverSenseRecepters)(JNIEnv *env, jclass cl, jobjectArray jnames) {
-  auto *broad = &settings->data()->everSenseBroadcast;
-  setstringarray(env, jnames, reinterpret_cast<BroadcastListeners<0> *>(broad),
-                 broad->getmax());
-}
-extern "C" JNIEXPORT jboolean JNICALL
-fromjava(geteverSensebroadcast)(JNIEnv *env, jclass cl) {
-  return settings->data()->everSenseBroadcast.nr;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL fromjava(getxbroadcast)(JNIEnv *env,
@@ -2157,6 +2163,14 @@ extern "C" JNIEXPORT jfloat JNICALL fromjava(getIOBvalue)(JNIEnv *env,
   return getiob(time / 1000LL);
 }
 #endif
+
+extern void setjournaliob(float iob, float iobnext30, float cob,
+                          float cobnext30, int64_t timmsec);
+extern "C" JNIEXPORT void JNICALL fromjava(setJournalIob)(
+    JNIEnv *env, jclass cl, jfloat iob, jfloat iobnext30, jfloat cob,
+    jfloat cobnext30, jlong timmsec) {
+  setjournaliob(iob, iobnext30, cob, cobnext30, timmsec);
+}
 
 extern "C" JNIEXPORT void JNICALL fromjava(setfloattime)(JNIEnv *env, jclass cl,
                                                          jboolean val) {

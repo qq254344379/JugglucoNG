@@ -143,6 +143,7 @@ public class SiGattCallback extends SuperGattCallback {
    @SuppressLint("MissingPermission")
    @Override
    public void onConnectionStateChange(BluetoothGatt bluetoothGatt, int status, int newState) {
+      noteFirstGattCallback("onConnectionStateChange", bluetoothGatt);
       if (stop) {
          if (newState == BluetoothProfile.STATE_DISCONNECTED) {
             bluetoothGatt.close();
@@ -177,7 +178,6 @@ public class SiGattCallback extends SuperGattCallback {
          }
          connected = true;
          constatstatusstr = Applic.app.getString(R.string.status_waiting_for_data);
-         Natives.EverSenseClear(dataptr);
       } else {
          connected = false;
          if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -392,6 +392,10 @@ public class SiGattCallback extends SuperGattCallback {
 
    @SuppressLint("MissingPermission")
    private boolean write2(byte[] bytes) {
+      if (bytes == null || bytes.length == 0) {
+         Log.e(LOG_ID, "write2 skipped empty command");
+         return false;
+      }
       if (service2 == null) {
          disconnect();
          return false;
@@ -523,6 +527,16 @@ public class SiGattCallback extends SuperGattCallback {
          scheduleHistoryUiRefresh();
          return;
        }
+      if (res == 11L) {
+         charcha[0] = timmsec;
+         SensorBluetooth.othersworking(this, timmsec);
+         if (constatstatusstr != null &&
+             constatstatusstr.equals(Applic.app.getString(R.string.status_waiting_for_data))) {
+            constatstatusstr = Applic.app.getString(R.string.status_raw_values_received);
+         }
+         scheduleHistoryUiRefresh();
+         return;
+      }
       if (res == 4L) {
          Applic.app.getHandler().postDelayed(() -> {
             authenticate();

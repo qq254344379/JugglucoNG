@@ -28,7 +28,22 @@ interface CalibrationDao {
 
     @Query("DELETE FROM calibrations WHERE sensorId = :sensorId")
     suspend fun deleteForSensor(sensorId: String): Int
+
+    @Query("SELECT * FROM calibrations WHERE TRIM(sensorId) = '' ORDER BY timestamp DESC")
+    suspend fun getBlankSensorIdRows(): List<CalibrationEntity>
+
+    @Query("UPDATE calibrations SET sensorId = :sensorId WHERE id = :id AND TRIM(sensorId) = ''")
+    suspend fun assignBlankSensorId(id: Int, sensorId: String): Int
+
+    @Query("UPDATE calibrations SET sensorId = :sensorId WHERE id = :id")
+    suspend fun updateSensorId(id: Int, sensorId: String): Int
     
+    @Query("DELETE FROM calibrations WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<Int>)
+
+    @Query("DELETE FROM calibrations WHERE journalEntryId IS NOT NULL")
+    suspend fun deleteJournalDerived(): Int
+
     @Query("DELETE FROM calibrations")
     suspend fun deleteAll()
 }

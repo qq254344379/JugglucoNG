@@ -2,6 +2,7 @@ package tk.glucodata.drivers.aidex.native.ble
 
 internal object AiDexHistoryPolicy {
     private const val OFFSET_TIMESTAMP_FUTURE_SLACK_MS = 5L * 60_000L
+    private const val POST_RESET_HISTORY_RESIDUE_GRACE_MINUTES = 30
 
     enum class InitialAction {
         COMPLETE_EMPTY,
@@ -35,6 +36,7 @@ internal object AiDexHistoryPolicy {
         }
 
         val effectiveRawNextIndex = if (
+            persistedRawNextIndex <= newest &&
             persistedBriefNextIndex > 0 &&
             persistedRawNextIndex > persistedBriefNextIndex
         ) {
@@ -102,6 +104,31 @@ internal object AiDexHistoryPolicy {
         return entryOffsetMinutes == liveOffsetCutoff
     }
 
+    fun wearDurationMinutes(wearDays: Int?): Long? {
+        if (wearDays == null || wearDays <= 0) return null
+        return wearDays.toLong() * 24L * 60L
+    }
+
+    fun isWithinWearDuration(
+        offsetMinutes: Int,
+        wearDays: Int?,
+    ): Boolean {
+        if (offsetMinutes < 0) return false
+        val wearMinutes = wearDurationMinutes(wearDays) ?: return true
+        return offsetMinutes.toLong() < wearMinutes
+    }
+
+    fun shouldQuarantinePostResetHistoryRange(
+        newestOffsetMinutes: Int,
+        resetRequestedAtMs: Long,
+        nowMs: Long,
+        graceMinutes: Int = POST_RESET_HISTORY_RESIDUE_GRACE_MINUTES,
+    ): Boolean {
+        if (newestOffsetMinutes <= 0 || resetRequestedAtMs <= 0L || nowMs <= 0L) return false
+        val elapsedMinutes = ((nowMs - resetRequestedAtMs).coerceAtLeast(0L) / 60_000L).toInt()
+        return newestOffsetMinutes > elapsedMinutes + graceMinutes.coerceAtLeast(0)
+    }
+
     fun resolveOffsetBackedTimestampMs(
         observedAtMs: Long,
         sensorStartMs: Long,
@@ -116,6 +143,14 @@ internal object AiDexHistoryPolicy {
         } else {
             observedAtMs
         }
+    }
+
+    fun shouldAcceptRealtimeTimestamp(
+        candidateTimeMs: Long,
+        latestAcceptedTimeMs: Long,
+    ): Boolean {
+        if (candidateTimeMs <= 0L) return false
+        return latestAcceptedTimeMs <= 0L || candidateTimeMs >= latestAcceptedTimeMs
     }
 
     private fun normalizePersistedIndex(

@@ -2,8 +2,10 @@ package tk.glucodata.drivers
 
 import java.util.Locale
 import tk.glucodata.Applic
+import tk.glucodata.GlucoseReadingSource
 import tk.glucodata.HistorySyncAccess
 import tk.glucodata.Log
+import tk.glucodata.Natives
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.UiRefreshBus
 
@@ -12,10 +14,69 @@ import tk.glucodata.UiRefreshBus
  * Values are stored in Room as mg/dL and published through the same live path as
  * managed BLE sensors, so dashboard, notification history, widgets, and alerts can
  * consume them without source-specific UI code.
+ *
+ * Sources that own no native sensor record ask for [mirrorToNative]. Room is what
+ * the phone's own UI reads, so stopping there looks complete — but everything
+ * served out of native reads the native sensor list instead, and a sensor with no
+ * poll data there is skipped entirely. That is why a follower-only setup answered
+ * the built-in web server's /api/v1/entries endpoints with "{}". BLE drivers that
+ * already keep their own native shell must leave the flag off so exactly one
+ * writer owns each sensor's window.
  */
 object VirtualGlucoseSensorBridge {
     private const val TAG = "VirtualGlucose"
     private const val MMOL_TO_MGDL = 18.0182f
+    private const val MIN_REASONABLE_TIMESTAMP_MS = 946_684_800_000L
+    private const val MAX_FUTURE_TIMESTAMP_DRIFT_MS = 10L * 60L * 1000L
+    private val mirrorLock = Any()
+
+    private val nativeMirror = VirtualSensorNativeMirror(
+        readShellStartSeconds = { serial ->
+            val sensorPtr = Natives.str2sensorptr(serial)
+            if (sensorPtr == 0L) 0L else Natives.getSensorStartmsecFromSensorptr(sensorPtr) / 1000L
+        },
+        openShell = { serial, startSeconds, minimumRecords ->
+            if (Natives.ensureSensorShellWithCapacity(serial, startSeconds, minimumRecords) == 0L) {
+                // Geometry is chosen once, at creation; a shell that already
+                // exists at a smaller size is still perfectly usable.
+                Natives.ensureSensorShell(serial, startSeconds)
+            }
+        },
+        rebaseShell = { serial, startSeconds -> Natives.rebaseDirectStreamWindow(serial, startSeconds) },
+        writeBatch = { timestampsSec, glucose, raws, serial ->
+            Natives.addGlucoseStreamBatchWithRawTemp(
+                timestampsSec,
+                glucose,
+                raws,
+                FloatArray(timestampsSec.size),
+                serial,
+            )
+        },
+    )
+
+    /**
+     * Serialised because the window's start is read, then written, then used to
+     * decide which readings are in range; two poll threads interleaving there
+     * would filter against a start the other had already moved.
+     */
+    private fun mirrorIntoNative(
+        sensorSerial: String,
+        readings: List<Reading>,
+        logLabel: String,
+        nativeFamily: ManagedSensorUiFamily,
+    ): Int = synchronized(mirrorLock) {
+        val stored = runCatching { nativeMirror.mirror(sensorSerial, readings, logLabel) }
+            .onFailure { Log.stack(TAG, "mirrorIntoNative($sensorSerial)", it) }
+            .getOrDefault(0)
+        // Stamp only once a shell exists: the stamp call would otherwise create one.
+        // Without it the mirror is Libre 2 by elimination to anything reading the
+        // native record, including the xDrip source name and a Clone recipient.
+        if (stored > 0 && nativeFamily != ManagedSensorUiFamily.GENERIC) {
+            runCatching { Natives.setSensorManagedFamily(sensorSerial, nativeFamily.nativeCode) }
+                .onFailure { Log.stack(TAG, "mirrorIntoNative(setSensorManagedFamily)", it) }
+        }
+        stored
+    }
 
     data class Reading(
         val timestampMs: Long,
@@ -39,12 +100,30 @@ object VirtualGlucoseSensorBridge {
         logLabel: String = "virtual",
         backfill: Boolean = true,
         nearDuplicateWindowMs: Long = 0L,
+        mirrorToNative: Boolean = false,
+        source: String = GlucoseReadingSource.SENSOR,
+        nativeFamily: ManagedSensorUiFamily = ManagedSensorUiFamily.GENERIC,
     ): Int {
         if (sensorSerial.isBlank() || readings.isEmpty()) return 0
+        val nowMs = System.currentTimeMillis()
+        val validReadings = readings.filter { isUsableHistoryReading(it, nowMs) }
+        val skippedInvalid = readings.size - validReadings.size
+        if (skippedInvalid > 0) {
+            Log.w(TAG, "Skipped $skippedInvalid invalid $logLabel history points for $sensorSerial")
+        }
+        if (validReadings.isEmpty()) return 0
+        // Deliberately before the Room dedup below: on an app that already holds
+        // this history in Room, every point is a duplicate there and nothing
+        // would reach native, leaving the mirror empty forever. Native writes are
+        // addressed by minute slot and idempotent, so re-offering the whole page
+        // each poll is what refills a mirror that started out behind.
+        if (mirrorToNative) {
+            mirrorIntoNative(sensorSerial, validReadings, logLabel, nativeFamily)
+        }
         val latestRoomTimestamp = if (backfill) 0L else HistorySyncAccess.getLatestTimestampForSensor(sensorSerial)
         val existingTimestamps = if (nearDuplicateWindowMs > 0L) {
-            val minTimestamp = readings.minOf { it.timestampMs }
-            val maxTimestamp = readings.maxOf { it.timestampMs }
+            val minTimestamp = validReadings.minOf { it.timestampMs }
+            val maxTimestamp = validReadings.maxOf { it.timestampMs }
             HistorySyncAccess.getHistoryTimestampsForSensor(
                 sensorSerial = sensorSerial,
                 startTime = (minTimestamp - nearDuplicateWindowMs).coerceAtLeast(1L),
@@ -54,16 +133,15 @@ object VirtualGlucoseSensorBridge {
             LongArray(0)
         }
         val deduped = LinkedHashMap<Long, Reading>()
-        readings
+        validReadings
             .asSequence()
             .filter { it.timestampMs > latestRoomTimestamp }
-            .filter { it.storageGlucoseMgdl.isFinite() && it.storageGlucoseMgdl > 0f }
             .filterNot {
                 existingTimestamps.isNotEmpty() &&
                     hasNearbyTimestamp(existingTimestamps, it.timestampMs, nearDuplicateWindowMs)
             }
             .forEach { deduped[it.timestampMs] = it }
-        val skippedAsNearDuplicate = readings.size - deduped.size
+        val skippedAsNearDuplicate = validReadings.size - deduped.size
         if (skippedAsNearDuplicate > 0 && nearDuplicateWindowMs > 0L) {
             Log.i(
                 TAG,
@@ -81,7 +159,14 @@ object VirtualGlucoseSensorBridge {
             values[index] = reading.storageGlucoseMgdl
             rawValues[index] = reading.rawMgdl.takeIf { it.isFinite() && it > 0f } ?: Float.NaN
         }
-        if (!HistorySyncAccess.storeSensorHistoryBatchBlocking(sensorSerial, timestamps, values, rawValues)) {
+        if (!HistorySyncAccess.storeSensorHistoryBatchWithSourceBlocking(
+                sensorSerial,
+                timestamps,
+                values,
+                rawValues,
+                source,
+            )
+        ) {
             return 0
         }
         Log.i(
@@ -95,6 +180,20 @@ object VirtualGlucoseSensorBridge {
             ),
         )
         return ordered.size
+    }
+
+    @JvmStatic
+    fun pruneFutureHistory(
+        sensorSerial: String,
+        logLabel: String = "virtual",
+    ): Int {
+        if (sensorSerial.isBlank()) return 0
+        val cutoff = System.currentTimeMillis() + MAX_FUTURE_TIMESTAMP_DRIFT_MS
+        val removed = HistorySyncAccess.deleteReadingsForSensorAfter(sensorSerial, cutoff)
+        if (removed > 0) {
+            Log.w(TAG, "Removed $removed future $logLabel history rows for $sensorSerial after $cutoff")
+        }
+        return removed
     }
 
     private fun hasNearbyTimestamp(
@@ -129,24 +228,29 @@ object VirtualGlucoseSensorBridge {
         reading: Reading,
         sensorGen: Int,
         logLabel: String = "virtual",
+        mirrorToNative: Boolean = false,
+        source: String = GlucoseReadingSource.SENSOR,
+        nativeFamily: ManagedSensorUiFamily = ManagedSensorUiFamily.GENERIC,
     ) {
         if (sensorSerial.isBlank()) return
-        if (reading.timestampMs <= 0L ||
-            !reading.storageGlucoseMgdl.isFinite() ||
-            reading.storageGlucoseMgdl <= 0f
-        ) {
+        if (!isUsableCurrentReading(reading, System.currentTimeMillis())) {
+            Log.w(TAG, "Ignored invalid $logLabel current for $sensorSerial at ${reading.timestampMs}")
             return
         }
 
         val rawMgdl = reading.rawMgdl.takeIf { it.isFinite() && it > 0f } ?: 0f
         val rate = reading.rate.takeIf { it.isFinite() } ?: 0f
-        HistorySyncAccess.storeCurrentReadingAsync(
+        HistorySyncAccess.storeCurrentReadingWithSourceAsync(
             reading.timestampMs,
             reading.storageGlucoseMgdl,
             rawMgdl,
             rate,
             sensorSerial,
+            source,
         )
+        if (mirrorToNative) {
+            mirrorIntoNative(sensorSerial, listOf(reading), logLabel, nativeFamily)
+        }
 
         val primaryMgdl = reading.primaryGlucoseMgdl
         val glucoseDisplay = if (Applic.unit == 1) {
@@ -154,9 +258,11 @@ object VirtualGlucoseSensorBridge {
         } else {
             primaryMgdl
         }
+        // Resolved: a follower publishes the upstream app's own final number
+        // (its calibrated value when it sends one), not a stock lane to calibrate.
         SuperGattCallback.processExternalCurrentReading(
             sensorSerial,
-            glucoseDisplay,
+            tk.glucodata.LiveReadingLanes.resolved(glucoseDisplay),
             rate,
             reading.timestampMs,
             sensorGen,
@@ -174,4 +280,19 @@ object VirtualGlucoseSensorBridge {
         )
         UiRefreshBus.requestDataRefresh()
     }
+
+    private fun isUsableCurrentReading(reading: Reading, nowMs: Long): Boolean =
+        isPlausibleTimestamp(reading.timestampMs, nowMs) &&
+            reading.storageGlucoseMgdl.isFinite() &&
+            reading.storageGlucoseMgdl > 0f
+
+    private fun isUsableHistoryReading(reading: Reading, nowMs: Long): Boolean =
+        isPlausibleTimestamp(reading.timestampMs, nowMs) &&
+            (
+                (reading.storageGlucoseMgdl.isFinite() && reading.storageGlucoseMgdl > 0f) ||
+                    (reading.rawMgdl.isFinite() && reading.rawMgdl > 0f)
+            )
+
+    private fun isPlausibleTimestamp(timestampMs: Long, nowMs: Long): Boolean =
+        timestampMs in MIN_REASONABLE_TIMESTAMP_MS..(nowMs + MAX_FUTURE_TIMESTAMP_DRIFT_MS)
 }

@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import tk.glucodata.GlucoseRangeColors
 import tk.glucodata.R
 import tk.glucodata.ui.GlucosePoint
 import tk.glucodata.ui.util.GlucoseFormatter
@@ -84,6 +85,12 @@ object StatsReportExporter {
         val useOutfitFont: Boolean,
         val shadowOffsetY: Float
     )
+
+    /** The colours a style prints with, for the style picker's preview. */
+    data class PdfStyleSwatch(val paper: Int, val text: Int, val primary: Int, val secondary: Int)
+
+    fun swatch(style: PdfVisualStyle): PdfStyleSwatch =
+        resolveVisualTheme(style).let { PdfStyleSwatch(it.paper, it.text, it.primary, it.secondary) }
 
     private fun resolveVisualTheme(style: PdfVisualStyle): PdfVisualTheme = when (style) {
         PdfVisualStyle.CURRENT -> PdfVisualTheme(
@@ -360,11 +367,13 @@ object StatsReportExporter {
                 )
             }
 
-            val colorTirVeryLow = mixColors(colorDanger, colorWarn, 0.35f)
-            val colorTirLow = mixColors(colorWarn, colorEmerald, 0.15f)
-            val colorTirInRange = colorEmerald
-            val colorTirHigh = mixColors(colorSecondary, colorWarn, 0.25f)
-            val colorTirVeryHigh = mixColors(colorSecondary, colorDanger, 0.38f)
+            // Follow the active glucose palette + overrides (light variant for
+            // the printed/exported report, which has no dark theme).
+            val colorTirVeryLow = GlucoseRangeColors.veryLow(false)
+            val colorTirLow = GlucoseRangeColors.low(false)
+            val colorTirInRange = GlucoseRangeColors.inRange(false)
+            val colorTirHigh = GlucoseRangeColors.high(false)
+            val colorTirVeryHigh = GlucoseRangeColors.veryHigh(false)
 
             fun loadFontSafely(fontRes: Int): android.graphics.Typeface? =
                 runCatching { ResourcesCompat.getFont(context, fontRes) }
@@ -1276,7 +1285,7 @@ object StatsReportExporter {
                 cardHeight,
                 context.getString(R.string.time_in_range),
                 formatPercent(summary.tir.inRangePercent),
-                "${context.getString(R.string.gmi_target)} ${formatGlucose(uiState.targets.lowMgDl, false)}-${formatGlucose(uiState.targets.highMgDl, false)}",
+                "${context.getString(R.string.gmi_target)} ${formatGlucose(uiState.targets.lowMgDl, false)}–${formatGlucose(uiState.targets.highMgDl, false)}",
                 colorEmerald
             )
             drawMetricCard(
@@ -1549,12 +1558,12 @@ object StatsReportExporter {
                         canvas.drawRect(tableLeft, y, tableRight, y + agpRowHeight, fillPaint)
                     }
                     val iqrText = if (bin.p25MgDl != null && bin.p75MgDl != null) {
-                        "${formatGlucose(bin.p25MgDl, false)}-${formatGlucose(bin.p75MgDl, false)}"
+                        "${formatGlucose(bin.p25MgDl, false)}–${formatGlucose(bin.p75MgDl, false)}"
                     } else {
                         "-"
                     }
                     val p10p90Text = if (bin.p10MgDl != null && bin.p90MgDl != null) {
-                        "${formatGlucose(bin.p10MgDl, false)}-${formatGlucose(bin.p90MgDl, false)}"
+                        "${formatGlucose(bin.p10MgDl, false)}–${formatGlucose(bin.p90MgDl, false)}"
                     } else {
                         "-"
                     }

@@ -3,6 +3,7 @@ package tk.glucodata.data.journal
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import androidx.room.ColumnInfo
 
 @Entity(
     tableName = "journal_entries",
@@ -11,7 +12,8 @@ import androidx.room.PrimaryKey
         Index(value = ["entryType"]),
         Index(value = ["insulinPresetId"]),
         Index(value = ["foodId"]),
-        Index(value = ["sourceRecordId"], unique = true)
+        Index(value = ["sourceRecordId"], unique = true),
+        Index(value = ["recoveryId"], unique = true)
     ]
 )
 data class JournalEntryEntity(
@@ -31,9 +33,26 @@ data class JournalEntryEntity(
     val proteinGrams: Float? = null,
     val fatGrams: Float? = null,
     val source: String,
+    /** Authoritative origin on the sending device; [source] remains the ingress transport. */
+    val originSource: String? = null,
     val sourceRecordId: String?,
+    /** Stable across Clone replication, backup restore, and local row-id reuse. */
+    val recoveryId: String? = null,
     val createdAt: Long,
     val updatedAt: Long,
     val nsUploadedAt: Long? = null,
-    val nsRemoteId: String? = null
+    val nsRemoteId: String? = null,
+    val insulinCurveJsonSnapshot: String? = null,
+    val insulinCurveProfileId: String? = null,
+    val insulinCurveModelVersion: Int? = null,
+    val insulinCurveEvidence: String? = null,
+    val insulinBodyWeightKg: Float? = null,
+    @ColumnInfo(defaultValue = "0")
+    val insulinCurveWasApproximated: Boolean = false,
+    /**
+     * When this row last went out to LibreView, so an unchanged entry is not resent on
+     * every upload pass. Tracked separately from [nsUploadedAt] because the two
+     * destinations succeed and fail independently.
+     */
+    val lvUploadedAt: Long? = null
 )

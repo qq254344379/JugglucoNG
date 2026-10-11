@@ -7,23 +7,26 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.widget.Toast
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.filled.TrendingDown
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
@@ -35,11 +38,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -49,10 +52,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import tk.glucodata.ui.components.IconTile
+import tk.glucodata.ui.components.IconTileDefaults
 import tk.glucodata.Applic
+import tk.glucodata.GlucoseRangeColors
 import tk.glucodata.Notify
 import tk.glucodata.R
 import tk.glucodata.alerts.*
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.ui.components.SettingsItem
 import tk.glucodata.ui.components.StyledSwitch
 import tk.glucodata.ui.components.CardPosition as SettingsItemPosition
@@ -60,7 +67,6 @@ import tk.glucodata.ui.theme.displayLargeExpressive
 import tk.glucodata.ui.theme.labelLargeExpressive
 import tk.glucodata.ui.util.ConnectedButtonGroup
 import tk.glucodata.logic.CustomAlertManager
-import java.util.UUID
 import kotlinx.coroutines.delay
 
 /**
@@ -87,6 +93,9 @@ fun AlertSettingsScreen(
         customAlerts = CustomAlertRepository.getAll()
     }
     fun saveCustomAlerts(updatedAlerts: List<CustomAlertConfig>) {
+        if (updatedAlerts == customAlerts) {
+            return
+        }
         CustomAlertRepository.saveAll(updatedAlerts)
         customAlerts = updatedAlerts
     }
@@ -101,6 +110,14 @@ fun AlertSettingsScreen(
         saveCustomAlerts(customAlerts.filterNot { it.id == alertId })
     }
 
+    fun persistConfigIfChanged(updated: AlertConfig) {
+        if (configs[updated.type] == updated) {
+            return
+        }
+        configs[updated.type] = updated
+        AlertRepository.saveConfig(updated)
+    }
+
     // Dialog States
     // var showAddDialogType by remember { mutableStateOf<CustomAlertType?>(null) } // Removed, using instant add
     var alertToEdit by remember { mutableStateOf<CustomAlertConfig?>(null) }
@@ -110,43 +127,34 @@ fun AlertSettingsScreen(
         val baseName = if (type == CustomAlertType.HIGH) context.getString(R.string.custom_high) else context.getString(R.string.custom_low)
         val newName = "$baseName ${existingCount + 1}"
         
-        // Default values respecting isMmol
-        val threshold = if (type == CustomAlertType.HIGH) {
-            if (isMmol) 10.0f else 180f
-        } else {
-            if (isMmol) 3.9f else 70f
-        }
-        
         val newAlert = CustomAlertConfig(
-            id = UUID.randomUUID().toString(),
             name = newName,
-            type = type,
-            threshold = threshold,
-            startTimeMinutes = 0,
-            endTimeMinutes = 1440, // All day by default
-            enabled = true
-        )
+            type = type
+        ).resetToDefaults(isMmol)
         saveCustomAlerts(customAlerts + newAlert)
     }
 
-    // Group alerts by category
+    // Grouped by what the alert is about, not by how it is computed: a persistent
+    // high is a high, and the trend alerts sit together whether they count deltas
+    // or extrapolate.
     val highAlerts = remember {
-        listOf(AlertType.HIGH, AlertType.VERY_HIGH)
+        listOf(AlertType.HIGH, AlertType.VERY_HIGH, AlertType.PERSISTENT_HIGH)
     }
 
     val lowAlerts = remember {
         listOf(AlertType.LOW, AlertType.VERY_LOW)
     }
 
-    val predictiveAlerts = remember {
+    val trendAlerts = remember {
         listOf(
+            AlertType.FALLING_FAST,
+            AlertType.RISING_FAST,
             AlertType.PRE_LOW,
-            AlertType.PRE_HIGH,
-            AlertType.PERSISTENT_HIGH
+            AlertType.PRE_HIGH
         )
     }
 
-    val otherAlerts = remember {
+    val sensorAlerts = remember {
         listOf(
             AlertType.MISSED_READING,
             AlertType.LOSS,
@@ -155,29 +163,32 @@ fun AlertSettingsScreen(
     }
     val customHighs = remember(customAlerts) { customAlerts.filter { it.type == CustomAlertType.HIGH } }
     val customLows = remember(customAlerts) { customAlerts.filter { it.type == CustomAlertType.LOW } }
-    val talkerSummary = listOf(
-        stringResource(R.string.speakglucose),
-//        stringResource(R.string.speakmessages),
-        stringResource(R.string.speakalarms)
-    ).joinToString(" • ")
 
     // Track expanded states
     var expandedType by remember { mutableStateOf<AlertType?>(null) }
+    var showPreemptiveSnooze by remember { mutableStateOf(false) }
     // Track sound picker state (Generic: Current URI + AlertTypeId + Callback)
     var soundPickerRequest by remember { mutableStateOf<Triple<String?, Int, (String?) -> Unit>?>(null) }
+    var sameDirectionSuppressionMinutes by remember {
+        mutableStateOf(AlertRepository.loadSameDirectionSuppressionMinutes())
+    }
+    fun persistSameDirectionSuppressionMinutes(minutes: Int) {
+        sameDirectionSuppressionMinutes = minutes
+        AlertRepository.saveSameDirectionSuppressionMinutes(minutes)
+    }
 
+    // Collected outside the LazyColumn: the quiet-window card only exists while
+    // something can be silenced, or while a window runs.
+    val quietWindowStateNow by tk.glucodata.alerts.QuietWindow.state.collectAsStateWithLifecycle()
+    // One Advanced state for every card on this screen.
+    val advancedOpen = rememberSaveable { mutableStateOf(false) }
+
+    CompositionLocalProvider(LocalAlertsAdvancedOpen provides advancedOpen) {
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.glucose_alerts_title)) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.navigate_back))
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color.Transparent
-                )
+            AppTopBar(
+                title = stringResource(R.string.glucose_alerts_title),
+                onNavigateBack = { navController.popBackStack() },
             )
         }
     ) { padding ->
@@ -189,52 +200,49 @@ fun AlertSettingsScreen(
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             // === GLOBAL ALERTS SECTION ===
-            item {
+            item(key = "global-alerts") {
                 GlobalAlertSettingsCard(
                     allConfigs = configs,
                     hasCustomAlertsEnabled = customAlerts.any { it.enabled },
                     onMasterToggle = { enabled ->
-                         // Update ALL configs to enabled/disabled
-                         configs.forEach { (type, config) ->
-                             val updated = config.copy(enabled = enabled)
-                             configs[type] = updated
-                             AlertRepository.saveConfig(updated)
-                         }
-                         // Also update Custom Alerts
-                         saveCustomAlerts(customAlerts.map { alert -> alert.copy(enabled = enabled) })
+                        configs.values.toList().forEach { config ->
+                            persistConfigIfChanged(config.copy(enabled = enabled))
+                        }
+                        saveCustomAlerts(customAlerts.map { alert -> alert.copy(enabled = enabled) })
                     },
                     onApplyToAll = { draft ->
-                        // Apply draft settings to ALL configs
-                        configs.forEach { (type, config) ->
-                             val updated = config.copy(
-                                  soundEnabled = draft.soundEnabled,
-                                  vibrationEnabled = draft.vibrationEnabled,
-                                  flashEnabled = draft.flashEnabled,
-                                  deliveryMode = draft.deliveryMode,
-                                  hapticProfile = draft.hapticProfile,
-                                  customSoundUri = draft.customSoundUri,
-                                  overrideDND = draft.overrideDND,
-                                  alarmDurationSeconds = draft.alarmDurationSeconds,
-                                  timeRangeEnabled = draft.timeRangeEnabled,
-                                  activeStartHour = draft.activeStartHour,
-                                  activeStartMinute = draft.activeStartMinute,
-                                  activeEndHour = draft.activeEndHour,
-                                  activeEndMinute = draft.activeEndMinute,
-                                  retryEnabled = draft.retryEnabled,
-                                  retryIntervalMinutes = draft.retryIntervalMinutes,
-                                  retryCount = draft.retryCount,
-                                  defaultSnoozeMinutes = draft.defaultSnoozeMinutes
-                             )
-                             configs[type] = updated
-                             AlertRepository.saveConfig(updated)
+                        configs.values.toList().forEach { config ->
+                            val updated = config.copy(
+                                soundEnabled = draft.soundEnabled,
+                                vibrationEnabled = draft.vibrationEnabled,
+                                flashEnabled = draft.flashEnabled,
+                                deliveryMode = draft.deliveryMode,
+                                hapticProfile = draft.hapticProfile,
+                                customSoundUri = BundledAlertSounds.forAlert(
+                                    draft.customSoundUri, context.packageName, config.type.id
+                                ),
+                                overrideDND = draft.overrideDND,
+                                alarmDurationSeconds = draft.alarmDurationSeconds,
+                                timeRangeEnabled = draft.timeRangeEnabled,
+                                activeStartHour = draft.activeStartHour,
+                                activeStartMinute = draft.activeStartMinute,
+                                activeEndHour = draft.activeEndHour,
+                                activeEndMinute = draft.activeEndMinute,
+                                retryEnabled = draft.retryEnabled,
+                                retryIntervalMinutes = draft.retryIntervalMinutes,
+                                retryCount = draft.retryCount,
+                                soundDelayEnabled = draft.soundDelayEnabled,
+                                soundDelaySeconds = draft.soundDelaySeconds,
+                                defaultSnoozeMinutes = draft.defaultSnoozeMinutes
+                            )
+                            persistConfigIfChanged(updated)
                         }
-                        // Also apply to Custom Alerts
                         val updatedCustomAlerts = customAlerts.map { alert ->
                             alert.copy(
                                 sound = draft.soundEnabled,
                                 vibrate = draft.vibrationEnabled,
                                 flash = draft.flashEnabled,
-                                style = when(draft.deliveryMode) {
+                                style = when (draft.deliveryMode) {
                                     AlertDeliveryMode.NOTIFICATION_ONLY -> "notification"
                                     AlertDeliveryMode.SYSTEM_ALARM -> "alarm"
                                     AlertDeliveryMode.BOTH -> "both"
@@ -248,7 +256,10 @@ fun AlertSettingsScreen(
                                 timeRangeEnabled = draft.timeRangeEnabled,
                                 startTimeMinutes = (draft.activeStartHour ?: 0) * 60 + (draft.activeStartMinute ?: 0),
                                 endTimeMinutes = (draft.activeEndHour ?: 0) * 60 + (draft.activeEndMinute ?: 0),
-                                soundUri = draft.customSoundUri
+                                soundUri = BundledAlertSounds.forAlert(
+                                    draft.customSoundUri, context.packageName,
+                                    if (alert.type == CustomAlertType.LOW) 0 else 1
+                                )
                             )
                         }
                         saveCustomAlerts(updatedCustomAlerts)
@@ -262,8 +273,23 @@ fun AlertSettingsScreen(
                 )
             }
 
+            // The quiet window: one card, collapsed unless a window runs. It has
+            // nothing to silence unless some enabled alert makes a sound or vibrates,
+            // so it only appears then - or while a window runs, so it can be ended.
+            val anySound = configs.values.any { it.enabled && it.soundEnabled } ||
+                customAlerts.any { it.enabled && it.sound }
+            val anythingAudible = anySound ||
+                configs.values.any { it.enabled && it.vibrationEnabled } ||
+                customAlerts.any { it.enabled && it.vibrate }
+            if (anythingAudible || quietWindowStateNow.active) {
+                item(key = "quiet-window") {
+                    QuietWindowCard(anySound = anySound)
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
+
             // === HIGH ALERTS SECTION ===
-            item {
+            item(key = "high-alerts-header") {
                 SectionHeader(
                     title = stringResource(R.string.high_alerts_title),
                     icon = Icons.AutoMirrored.Filled.TrendingUp // Using TrendingUp for Highs
@@ -273,11 +299,6 @@ fun AlertSettingsScreen(
             // Standard High Alerts
             items(highAlerts, key = { it.name }) { type ->
                 val config = configs[type] ?: return@items
-                val index = highAlerts.indexOf(type)
-                val isFirst = index == 0
-                val isLast = index == highAlerts.lastIndex
-                
-                // Position logic: Standard alerts form their own group
                 val position = getCardPosition(type, highAlerts)
 
                 AlertCard(
@@ -286,20 +307,15 @@ fun AlertSettingsScreen(
                     isExpanded = expandedType == type,
                     position = position,
                     onToggle = { enabled ->
-                        val updated = config.copy(enabled = enabled)
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(config.copy(enabled = enabled))
                     },
                     onExpand = { expandedType = if (expandedType == type) null else type },
                     onConfigChange = { updated ->
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(updated)
                     },
                     onPickSound = {
                         soundPickerRequest = Triple(config.customSoundUri, config.type.id) { uri ->
-                            val updated = config.copy(customSoundUri = uri)
-                            configs[type] = updated
-                            AlertRepository.saveConfig(updated)
+                            persistConfigIfChanged(config.copy(customSoundUri = uri))
                             soundPickerRequest = null
                         }
                     }
@@ -308,15 +324,10 @@ fun AlertSettingsScreen(
 
             // Custom High Alerts
             if (customHighs.isNotEmpty()) {
-                item { Spacer(Modifier.height(4.dp)) }
-            
+                item(key = "custom-highs-spacer") { Spacer(Modifier.height(4.dp)) }
+
                 items(customHighs, key = { it.id }) { alert ->
                     var isExpanded by remember { mutableStateOf(false) }
-                    val index = customHighs.indexOf(alert)
-                    val isFirst = index == 0
-                    val isLast = index == customHighs.lastIndex
-                    
-                    // Position logic: Custom alerts form their own group
                     val position = getCardPosition(alert, customHighs)
                     
                     CustomAlertCard(
@@ -346,7 +357,7 @@ fun AlertSettingsScreen(
             }
 
             // Add High Alert Button
-            item {
+            item(key = "add-high-alert") {
                 AddCustomAlertButton(
                     text = stringResource(R.string.add_high_alert),
                     onClick = { createDefaultCustomAlert(CustomAlertType.HIGH) }
@@ -354,7 +365,7 @@ fun AlertSettingsScreen(
             }
 
             // === LOW ALERTS SECTION ===
-            item {
+            item(key = "low-alerts-header") {
                 Spacer(Modifier.height(8.dp))
                 SectionHeader(
                     title = stringResource(R.string.low_alerts_title),
@@ -365,11 +376,6 @@ fun AlertSettingsScreen(
             // Standard Low Alerts
             items(lowAlerts, key = { it.name }) { type ->
                 val config = configs[type] ?: return@items
-                val index = lowAlerts.indexOf(type)
-                val isFirst = index == 0
-                val isLast = index == lowAlerts.lastIndex
-                
-                // Position logic: Standard alerts form their own group
                 val position = getCardPosition(type, lowAlerts)
 
                 AlertCard(
@@ -378,20 +384,15 @@ fun AlertSettingsScreen(
                     isExpanded = expandedType == type,
                     position = position,
                     onToggle = { enabled ->
-                        val updated = config.copy(enabled = enabled)
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(config.copy(enabled = enabled))
                     },
                     onExpand = { expandedType = if (expandedType == type) null else type },
                     onConfigChange = { updated ->
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(updated)
                     },
                     onPickSound = {
                         soundPickerRequest = Triple(config.customSoundUri, config.type.id) { uri ->
-                            val updated = config.copy(customSoundUri = uri)
-                            configs[type] = updated
-                            AlertRepository.saveConfig(updated)
+                            persistConfigIfChanged(config.copy(customSoundUri = uri))
                             soundPickerRequest = null
                         }
                     }
@@ -400,15 +401,10 @@ fun AlertSettingsScreen(
 
             // Custom Low Alerts
             if (customLows.isNotEmpty()) {
-                item { Spacer(Modifier.height(4.dp)) }
+                item(key = "custom-lows-spacer") { Spacer(Modifier.height(4.dp)) }
 
                 items(customLows, key = { it.id }) { alert ->
                     var isExpanded by remember { mutableStateOf(false) }
-                    val index = customLows.indexOf(alert)
-                    val isFirst = index == 0
-                    val isLast = index == customLows.lastIndex
-                    
-                    // Position logic: Custom alerts form their own group
                     val position = getCardPosition(alert, customLows)
                     
                     CustomAlertCard(
@@ -438,7 +434,7 @@ fun AlertSettingsScreen(
             }
 
             // Add Low Alert Button
-            item {
+            item(key = "add-low-alert") {
                 AddCustomAlertButton(
                     text = stringResource(R.string.add_low_alert),
                     onClick = { createDefaultCustomAlert(CustomAlertType.LOW) }
@@ -446,7 +442,7 @@ fun AlertSettingsScreen(
             }
 
             // === PREDICTIVE ALERTS SECTION ===
-            item {
+            item(key = "predictive-alerts-header") {
                 Spacer(Modifier.height(8.dp))
                 SectionHeader(
                     title = stringResource(R.string.predictive_alerts),
@@ -454,36 +450,55 @@ fun AlertSettingsScreen(
                 )
             }
 
-            items(predictiveAlerts, key = { it.name }) { type ->
+            items(trendAlerts, key = { it.name }) { type ->
                 val config = configs[type] ?: return@items
                 AlertCard(
                     config = config,
                     isMmol = isMmol,
                     isExpanded = expandedType == type,
-                    position = getCardPosition(type, predictiveAlerts),
+                    position = getCardPosition(type, trendAlerts),
                     onToggle = { enabled ->
-                        val updated = config.copy(enabled = enabled)
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(config.copy(enabled = enabled))
                     },
                     onExpand = { expandedType = if (expandedType == type) null else type },
                     onConfigChange = { updated ->
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(updated)
                     },
                     onPickSound = {
                         soundPickerRequest = Triple(config.customSoundUri, config.type.id) { uri ->
-                            val updated = config.copy(customSoundUri = uri)
-                            configs[type] = updated
-                            AlertRepository.saveConfig(updated)
+                            persistConfigIfChanged(config.copy(customSoundUri = uri))
                             soundPickerRequest = null
                         }
                     }
                 )
             }
 
+            // The cross-family quiet period (#210) belongs with the trend alerts it
+            // coordinates. Its High coverage is on and has no switch.
+            item(key = "same-direction-quiet-period") {
+                Spacer(Modifier.height(8.dp))
+                SliderSettingsItem(
+                    title = stringResource(R.string.same_direction_suppression_title),
+                    subtitle = stringResource(R.string.same_direction_suppression_summary),
+                    icon = Icons.Default.NotificationsPaused,
+                    position = SettingsItemPosition.SINGLE
+                ) {
+                    DurationSlider(
+                        label = "",
+                        value = sameDirectionSuppressionMinutes,
+                        range = 0..AlertDefaults.SAME_DIRECTION_SUPPRESSION_MAX_MINUTES,
+                        stepSize = 1,
+                        onValueChange = { persistSameDirectionSuppressionMinutes(it) },
+                        valueText = { v ->
+                            if (v == 0) stringResource(R.string.off)
+                            else stringResource(R.string.minutes_short_format, v)
+                        }
+                    )
+                }
+            }
+
             // === OTHER ALERTS SECTION ===
-            item {
+            item(key = "other-alerts-header") {
                 Spacer(Modifier.height(16.dp))
                 SectionHeader(
                     title = stringResource(R.string.other_alerts),
@@ -491,59 +506,62 @@ fun AlertSettingsScreen(
                 )
             }
 
-            items(otherAlerts, key = { it.name }) { type ->
+            items(sensorAlerts, key = { it.name }) { type ->
                 val config = configs[type] ?: return@items
                 AlertCard(
                     config = config,
                     isMmol = isMmol,
                     isExpanded = expandedType == type,
-                    position = getCardPosition(type, otherAlerts),
+                    position = getCardPosition(type, sensorAlerts),
                     onToggle = { enabled ->
-                        val updated = config.copy(enabled = enabled)
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(config.copy(enabled = enabled))
                     },
                     onExpand = { expandedType = if (expandedType == type) null else type },
                     onConfigChange = { updated ->
-                        configs[type] = updated
-                        AlertRepository.saveConfig(updated)
+                        persistConfigIfChanged(updated)
                     },
                     onPickSound = {
                         soundPickerRequest = Triple(config.customSoundUri, config.type.id) { uri ->
-                            val updated = config.copy(customSoundUri = uri)
-                            configs[type] = updated
-                            AlertRepository.saveConfig(updated)
+                            persistConfigIfChanged(config.copy(customSoundUri = uri))
                             soundPickerRequest = null
                         }
                     }
                 )
             }
 
-            // === SNOOZE SECTION ===
-            item {
-                Spacer(Modifier.height(24.dp))
-                PreemptiveSnoozeCard()
-            }
-
-            item {
+            // Preemptive snooze: a row that opens a dialog, not a screen, so no
+            // chevron. Plain SettingsItem keeps the 16/40/12 grid — the same
+            // 68dp text inset as the alert cards above.
+            item(key = "preemptive-snooze") {
                 Spacer(Modifier.height(24.dp))
                 SettingsItem(
+                    title = stringResource(R.string.preemptive_snooze),
+                    subtitle = stringResource(R.string.preemptive_snooze_desc),
+                    icon = Icons.Default.Snooze,
+                    iconTint = MaterialTheme.colorScheme.primary,
+                    position = SettingsItemPosition.TOP,
+                    onClick = { showPreemptiveSnooze = true }
+                )
+            }
+
+            item(key = "talker-settings") {
+                SettingsItem(
                     title = stringResource(R.string.talker),
-                    subtitle = talkerSummary,
+                    subtitle = stringResource(R.string.speakglucose) + " \u2022 " + stringResource(R.string.speakalarms),
                     icon = Icons.AutoMirrored.Filled.VolumeUp,
                     iconTint = MaterialTheme.colorScheme.secondary,
-                    showArrow = true,
-                    position = SettingsItemPosition.SINGLE,
+                    position = SettingsItemPosition.BOTTOM,
                     onClick = { navController.navigate("settings/alerts/talker") }
                 )
             }
 
             // Bottom padding
-            item { Spacer(Modifier.height(100.dp)) }
+            item(key = "bottom-padding") { Spacer(Modifier.height(100.dp)) }
         }
 
-        // Custom Alert Dialogs
-        // Removed showAddDialogType block
+        if (showPreemptiveSnooze) {
+            PreemptiveSnoozeDialog(onDismiss = { showPreemptiveSnooze = false })
+        }
 
         if (alertToEdit != null) {
             CustomAlertDialog(
@@ -566,6 +584,7 @@ fun AlertSettingsScreen(
             )
         }
     }
+    }
 }
 
 @Composable
@@ -573,7 +592,6 @@ fun AddCustomAlertButton(text: String, onClick: () -> Unit) {
     FilledTonalButton(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-        shape = RoundedCornerShape(50), // Fully rounded
         colors = ButtonDefaults.filledTonalButtonColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHighest
         )
@@ -598,8 +616,12 @@ fun CustomAlertCard(
 ) {
     // Determine icon/color based on type to match AlertCard style
     val icon = if (alert.type == CustomAlertType.HIGH) Icons.AutoMirrored.Filled.TrendingUp else Icons.AutoMirrored.Filled.TrendingDown
-    // Standard High is usually Orange, Low is Red/Primary.
-    val accentColor = if (alert.type == CustomAlertType.HIGH) Color(0xFFFF9800) else Color(0xFFF44336) 
+    val isDark = tk.glucodata.ui.isAppInDarkTheme()
+    val accentColor = if (alert.type == CustomAlertType.HIGH) {
+        Color(GlucoseRangeColors.high(isDark))
+    } else {
+        Color(GlucoseRangeColors.low(isDark))
+    }
     var draftName by rememberSaveable(alert.id) { mutableStateOf(alert.name) }
     LaunchedEffect(alert.id, alert.name) {
         if (draftName != alert.name) {
@@ -635,6 +657,10 @@ fun CustomAlertCard(
             append(" • ${stringResource(R.string.disabled_status)}")
         }
     }
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (isExpanded) 180f else 0f,
+        label = "customAlertChevron"
+    )
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -652,22 +678,13 @@ fun CustomAlertCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 // Colored icon container (Identical to AlertCard)
-                Surface(
-                    modifier = Modifier.size(40.dp),
-                    shape = RoundedCornerShape(40.dp),
-                    color = accentColor.copy(alpha = 0.12f)
-                ) {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        Icon(icon, null, tint = accentColor, modifier = Modifier.size(20.dp))
-                    }
-                }
+                IconTile(icon = icon, tint = accentColor)
 
                 // Title and subtitle
                 Column(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
                     Text(
                         text = title,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Medium,
+                        style = MaterialTheme.typography.titleMediumEmphasized,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     
@@ -684,9 +701,12 @@ fun CustomAlertCard(
 
                 // Chevron Indicator
                 Icon(
-                    if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    imageVector = Icons.Default.ExpandMore,
                     contentDescription = if (isExpanded) stringResource(R.string.collapse_action) else stringResource(R.string.expand_action),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .size(24.dp)
+                        .graphicsLayer { rotationZ = chevronRotation }
                 )
                 
                 Spacer(Modifier.width(16.dp))
@@ -701,14 +721,14 @@ fun CustomAlertCard(
             // Expanded content
             AnimatedVisibility(
                 visible = isExpanded,
-                enter = expandVertically(animationSpec = tween(150)),
-                exit = shrinkVertically(animationSpec = tween(100))
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut()
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                        .padding(vertical = 16.dp)
+                        .padding(top = 16.dp)
                 ) {
                     // Map to AlertConfig for shared UI component
                     val genericConfig = AlertConfig(
@@ -754,6 +774,8 @@ fun CustomAlertCard(
                     // Render common settings
                     CommonAlertSettings(
                         config = genericConfig,
+                        onReset = { onUpdate(alert.resetToDefaults(isMmol)) },
+                        isModified = alert.isModifiedFromDefaults(isMmol),
                         onConfigChange = { newConfig ->
                             val updated = alert.copy(
                                 enabled = newConfig.enabled,
@@ -834,6 +856,49 @@ fun CustomAlertCard(
 
 
 
+/**
+ * A settings row that holds a slider instead of a trailing control: same
+ * surface, shape and 68dp text inset as [SettingsItem], so it sits in a group
+ * of rows without reading as a different kind of thing.
+ */
+@Composable
+private fun SliderSettingsItem(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    position: SettingsItemPosition,
+    slider: @Composable () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = tk.glucodata.ui.components.cardShape(position),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            IconTile(icon = icon, tint = MaterialTheme.colorScheme.secondary)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                slider()
+            }
+        }
+    }
+}
+
 @Composable
 private fun SectionHeader(
     title: String,
@@ -854,10 +919,8 @@ private fun SectionHeader(
         )
         Text(
             text = title,
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.primary,
-            fontWeight = FontWeight.Bold
-        )
+            style = MaterialTheme.typography.titleMediumEmphasized,
+            color = MaterialTheme.colorScheme.primary,)
     }
 }
 
@@ -904,7 +967,12 @@ private fun AlertCard(
     onConfigChange: (AlertConfig) -> Unit,
     onPickSound: () -> Unit
 ) {
-    val (icon, accentColor) = getAlertIconAndColor(config.type)
+    val isDark = tk.glucodata.ui.isAppInDarkTheme()
+    val (icon, accentColor) = getAlertIconAndColor(config.type, isDark, MaterialTheme.colorScheme)
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (isExpanded) 180f else 0f,
+        label = "standardAlertChevron"
+    )
 
 
     Surface(
@@ -922,32 +990,13 @@ private fun AlertCard(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Colored icon container
-                Surface(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .padding(end = 0.dp),
-                    shape = RoundedCornerShape(40.dp),
-                    color = accentColor.copy(alpha = 0.12f)
-                )
-                {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = null,
-                            tint = accentColor,
-                            modifier = Modifier.size(20.dp),
-
-                            )
-                    }
-                }
+                IconTile(icon = icon, tint = accentColor)
 
                 // Title and subtitle
                 Column(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
                     Text(
                         text = stringResource(config.type.nameResId),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Medium,
+                        style = MaterialTheme.typography.titleMediumEmphasized,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     val subtitle = buildString {
@@ -955,6 +1004,12 @@ private fun AlertCard(
                         config.durationMinutes?.let {
                             if (isNotEmpty()) append(" • ")
                             append(stringResource(R.string.minutes_short_format, it))
+                        }
+                        config.deltaThreshold?.let { dt ->
+                            if (isNotEmpty()) append(" • ")
+                            append(formatThreshold(dt, isMmol))
+                            append(" ×")
+                            append(config.deltaCount ?: AlertDefaults.DELTA_COUNT_DEFAULT)
                         }
                         // Add time range if enabled
                         if (config.timeRangeEnabled) {
@@ -983,9 +1038,12 @@ private fun AlertCard(
 
                 // Chevron Indicator (Before Switch)
                 Icon(
-                    if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    imageVector = Icons.Default.ExpandMore,
                     contentDescription = if (isExpanded) stringResource(R.string.collapse_action) else stringResource(R.string.expand_action),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .size(24.dp)
+                        .graphicsLayer { rotationZ = chevronRotation }
                 )
 
                 Spacer(Modifier.width(16.dp))
@@ -997,21 +1055,18 @@ private fun AlertCard(
                 )
             }
 
-            // Expanded content with faster animation
+            // Expanded content
             AnimatedVisibility(
                 visible = isExpanded,
-                enter = expandVertically(animationSpec = tween(150)),
-                exit = shrinkVertically(animationSpec = tween(100))
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut()
             ) {
-                Column { // Removed redundant animateContentSize() as AnimatedVisibility handles it
+                Column {
                     AlertSettingsExpanded(
                         config = config,
                         isMmol = isMmol,
                         onConfigChange = onConfigChange,
                         onTest = {
-                            // Explicitly reset state for TEST to ensure it always fires
-                            // (ignoring previous triggers or suppressed state)
-                            AlertStateTracker.resetState(config.type)
                             // Use Notify.testTrigger to simulate real alarm flow
                             Notify.testTrigger(config.type.id)
                         },
@@ -1039,14 +1094,25 @@ private fun AlertSettingsExpanded(
         modifier = Modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-            .padding(vertical = 16.dp)
+            .padding(top = 16.dp)
     ) {
         CommonAlertSettings(
             config = config,
             onConfigChange = onConfigChange,
             onPickSound = { onPickSound() },
             onTest = onTest,
+            onReset = { onConfigChange(config.resetToDefaults(isMmol)) },
+            isModified = config.isModifiedFromDefaults(isMmol),
             headerContent = {
+                // === Delta-counter Section (FALLING_FAST / RISING_FAST) ===
+                if (config.type == AlertType.FALLING_FAST || config.type == AlertType.RISING_FAST) {
+                    DeltaAlarmSettings(
+                        config = config,
+                        isMmol = isMmol,
+                        onConfigChange = onConfigChange
+                    )
+                }
+
                  // === Threshold Section (If applicable) ===
                 if (config.threshold != null) {
                     ThresholdSlider(
@@ -1085,14 +1151,265 @@ private fun AlertSettingsExpanded(
                         }
                     }
                 }
+
+                // === Sensor-expiry pre-warnings (multi-select, this type only) ===
+                if (config.type == AlertType.SENSOR_EXPIRY) {
+                    SensorExpiryThresholdSelector(
+                        selected = config.expiryWarningMinutes,
+                        onToggle = { minutes ->
+                            val next = if (minutes in config.expiryWarningMinutes) {
+                                config.expiryWarningMinutes - minutes
+                            } else {
+                                config.expiryWarningMinutes + minutes
+                            }
+                            onConfigChange(config.copy(expiryWarningMinutes = next))
+                        }
+                    )
+                }
+            },
+            advancedContent = {
+                // Tuning from #201, for people who know what the numbers mean. The
+                // margin is how far the measured value must recover before the episode
+                // ends and the alert may fire again; the interval (forecasts) is a hard
+                // floor between firings, whatever value and projection do.
+                val rearmMarginTypes = setOf(
+                    AlertType.PRE_LOW, AlertType.PRE_HIGH,
+                    AlertType.LOW, AlertType.HIGH,
+                    AlertType.VERY_LOW, AlertType.VERY_HIGH
+                )
+                if (config.type in rearmMarginTypes) {
+                    ThresholdSlider(
+                        label = stringResource(R.string.rearm_margin_label),
+                        value = config.rearmMargin ?: 0f,
+                        isMmol = isMmol,
+                        range = if (isMmol) 0f..3f else 0f..50f,
+                        onValueChange = { onConfigChange(config.copy(rearmMargin = it)) },
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        prominent = false
+                    )
+                }
+                if (config.type == AlertType.PRE_LOW || config.type == AlertType.PRE_HIGH) {
+                    DurationSlider(
+                        label = stringResource(R.string.rearm_min_interval_label),
+                        value = config.rearmMinIntervalMinutes ?: 0,
+                        range = 0..60,
+                        stepSize = 5,
+                        onValueChange = { v -> onConfigChange(config.copy(rearmMinIntervalMinutes = v)) },
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                }
+                // PRE_HIGH only: insulin makes a predicted LOW more likely, so PRE_LOW
+                // must never get this. Off by default; a value here silences the alert
+                // while insulin on board covers the projected overshoot x this factor.
+                if (config.type == AlertType.PRE_HIGH) {
+                    DurationSlider(
+                        label = stringResource(R.string.pre_high_iob_coverage_label),
+                        value = ((config.iobCoverageFactor ?: 0f) * 100f).toInt(),
+                        range = 0..200,
+                        stepSize = 10,
+                        onValueChange = { v -> onConfigChange(config.copy(iobCoverageFactor = v / 100f)) },
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        valueText = { if (it == 0) stringResource(R.string.alert_feature_off) else "$it%" }
+                    )
+                }
+
+                // A high that is already coming down is not news. HIGH ships with this
+                // off and follows the arrow on its alarm screen; PERSISTENT_HIGH has
+                // waited out its duration and ships with it on. VERY_HIGH never gets
+                // it: there the number itself is the problem, whichever way it moves.
+                if (config.type == AlertType.HIGH || config.type == AlertType.PERSISTENT_HIGH) {
+                    ClickableToggleRow(
+                        title = stringResource(R.string.persistent_high_fall_suppress_label),
+                        checked = (config.fallRateSuppress ?: 0f) > 0f,
+                        onCheckedChange = { enabled ->
+                            onConfigChange(
+                                config.copy(
+                                    fallRateSuppress = if (enabled) {
+                                        AlertDefaults.FALL_RATE_SUPPRESS_MGDL_PER_MIN
+                                    } else {
+                                        0f
+                                    }
+                                )
+                            )
+                        }
+                    )
+                }
+                if (config.type == AlertType.FALLING_FAST || config.type == AlertType.RISING_FAST) {
+                    DeltaAlarmAdvancedSettings(
+                        config = config,
+                        isMmol = isMmol,
+                        onConfigChange = onConfigChange
+                    )
+                }
             }
         )
     }
-}    
-        
-//        HorizontalDivider()
-        
+}
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SensorExpiryThresholdSelector(
+    selected: Set<Int>,
+    onToggle: (Int) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            stringResource(R.string.sensor_expiry_warnings_title),
+            style = MaterialTheme.typography.bodyMedium
+        )
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            EXPIRY_WARNING_PRESETS.forEach { minutes ->
+                val isSelected = minutes in selected
+                FilterChip(
+                    selected = isSelected,
+                    onClick = { onToggle(minutes) },
+                    label = {
+                        Text(
+                            if (minutes >= 1440) stringResource(R.string.days_short, minutes / 1440)
+                            else stringResource(R.string.hours_short, minutes / 60)
+                        )
+                    },
+                    leadingIcon = if (isSelected) {
+                        { Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                    } else null
+                )
+            }
+        }
+        Text(
+            stringResource(R.string.sensor_expiry_warnings_desc),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun DeltaAlarmSettings(
+    config: AlertConfig,
+    isMmol: Boolean,
+    onConfigChange: (AlertConfig) -> Unit
+) {
+    val falling = config.type == AlertType.FALLING_FAST
+    val deltaThreshold = config.deltaThreshold
+        ?: if (isMmol) AlertDefaults.DELTA_THRESHOLD_MMOL else AlertDefaults.DELTA_THRESHOLD_MGDL
+    val deltaCount = config.deltaCount ?: AlertDefaults.DELTA_COUNT_DEFAULT
+    val deltaBorder = config.deltaBorder ?: if (falling) {
+        if (isMmol) AlertDefaults.FALLING_BORDER_MMOL else AlertDefaults.FALLING_BORDER_MGDL
+    } else {
+        if (isMmol) AlertDefaults.RISING_BORDER_MMOL else AlertDefaults.RISING_BORDER_MGDL
+    }
+    // The alarm follows the Δ readout's global interval unless this alert sets its own window.
+    val displayIntervalMinutes = remember {
+        tk.glucodata.GlucoseDelta.sanitizeIntervalMinutes(
+            Applic.app
+                .getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+                .getInt("delta_interval_minutes", tk.glucodata.GlucoseDelta.DEFAULT_INTERVAL_MINUTES)
+        )
+    }
+    val effectiveIntervalMinutes = config.deltaIntervalMinutes ?: displayIntervalMinutes
+
+    ThresholdSlider(
+        label = stringResource(R.string.delta_change_label, effectiveIntervalMinutes),
+        value = deltaThreshold,
+        isMmol = isMmol,
+        range = if (isMmol) 0.1f..2.5f else 1f..40f,
+        onValueChange = { onConfigChange(config.copy(deltaThreshold = it)) }
+    )
+
+    DurationSlider(
+        label = stringResource(R.string.delta_count_label),
+        value = deltaCount,
+        range = 2..12,
+        stepSize = 1,
+        onValueChange = { onConfigChange(config.copy(deltaCount = it)) },
+        valueText = { "$it" }
+    )
+
+    ThresholdSlider(
+        label = stringResource(if (falling) R.string.delta_border_below_label else R.string.delta_border_above_label),
+        value = deltaBorder,
+        isMmol = isMmol,
+        range = if (falling) {
+            if (isMmol) 4.0f..11.0f else 70f..200f
+        } else {
+            if (isMmol) 7.0f..17.0f else 120f..300f
+        },
+        onValueChange = { onConfigChange(config.copy(deltaBorder = it)) },
+        prominent = false
+    )
+
+    Text(
+        text = stringResource(
+            if (falling) R.string.falling_fast_explanation else R.string.rising_fast_explanation,
+            deltaCount,
+            effectiveIntervalMinutes,
+            formatThreshold(deltaThreshold, isMmol),
+            deltaCount * effectiveIntervalMinutes,
+            formatThreshold(deltaBorder, isMmol)
+        ),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+/** The delta alarm's power-user half: which window it counts over, and the early trigger. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DeltaAlarmAdvancedSettings(
+    config: AlertConfig,
+    isMmol: Boolean,
+    onConfigChange: (AlertConfig) -> Unit
+) {
+    val deltaThreshold = config.deltaThreshold
+        ?: if (isMmol) AlertDefaults.DELTA_THRESHOLD_MMOL else AlertDefaults.DELTA_THRESHOLD_MGDL
+    val deltaCount = config.deltaCount ?: AlertDefaults.DELTA_COUNT_DEFAULT
+    val displayIntervalMinutes = remember {
+        tk.glucodata.GlucoseDelta.sanitizeIntervalMinutes(
+            Applic.app
+                .getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+                .getInt("delta_interval_minutes", tk.glucodata.GlucoseDelta.DEFAULT_INTERVAL_MINUTES)
+        )
+    }
+    Column(
+        modifier = Modifier.padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        // With checkpoint counting the window directly scales the confirmation time
+        // (count x window), so it must not silently change with a display preference.
+        Text(
+            text = stringResource(R.string.delta_alarm_interval_label),
+            style = MaterialTheme.typography.bodyMedium
+        )
+        val windowLabels = mapOf(
+            0 to stringResource(R.string.delta_alarm_interval_follow, displayIntervalMinutes),
+            1 to stringResource(R.string.delta_interval_1min),
+            5 to stringResource(R.string.delta_interval_5min)
+        )
+        tk.glucodata.ui.util.ConnectedButtonGroup(
+            options = listOf(0, 1, 5),
+            selectedOption = config.deltaIntervalMinutes ?: 0,
+            onOptionSelected = { onConfigChange(config.copy(deltaIntervalMinutes = if (it == 0) null else it)) },
+            labelText = { windowLabels[it] ?: it.toString() },
+            label = { Text(windowLabels[it] ?: it.toString(), style = MaterialTheme.typography.labelMedium) },
+            modifier = Modifier.fillMaxWidth(),
+            itemHeight = 36.dp
+        )
+    }
+    // Optional escalation on the implied total distance (count x threshold).
+    ClickableToggleRow(
+        title = stringResource(R.string.delta_early_trigger_label),
+        subtitle = stringResource(
+            R.string.delta_early_trigger_desc,
+            formatThreshold(deltaCount * deltaThreshold, isMmol),
+            stringResource(if (isMmol) R.string.unit_mmol else R.string.unit_mg)
+        ),
+        checked = config.earlyTriggerEnabled,
+        onCheckedChange = { onConfigChange(config.copy(earlyTriggerEnabled = it)) }
+    )
+}
 
 @Composable
 private fun ThresholdSlider(
@@ -1100,7 +1417,11 @@ private fun ThresholdSlider(
     value: Float,
     isMmol: Boolean,
     range: ClosedFloatingPointRange<Float>,
-    onValueChange: (Float) -> Unit
+    onValueChange: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+    // The card's headline threshold is set big; a secondary threshold (the
+    // re-arm margin, under Advanced) is set like every other slider there.
+    prominent: Boolean = true
 ) {
     // Calculate step size based on range and unit
     // Lower ranges need finer control (0.1 mmol or 1 mg/dL)
@@ -1111,7 +1432,7 @@ private fun ThresholdSlider(
     }
     val steps = ((range.endInclusive - range.start) / stepSize).toInt() - 1
 
-    Column {
+    Column(modifier = modifier) {
         var sliderValue by remember { mutableStateOf(value) }
         LaunchedEffect(value) {
             sliderValue = value
@@ -1124,15 +1445,20 @@ private fun ThresholdSlider(
         ) {
             Text(
                 text = label,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurface
+                style = if (prominent) MaterialTheme.typography.titleMedium else MaterialTheme.typography.bodyMedium,
+                fontWeight = if (prominent) FontWeight.Medium else null,
+                color = MaterialTheme.colorScheme.onSurface,
+                // A long (localised) label must wrap, not push the value out
+                // of the row.
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
             )
             Text(
                 // Use LOCAL sliderValue for real-time updates
                 formatThreshold(sliderValue, isMmol),
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold,
+                style = if (prominent) MaterialTheme.typography.headlineSmall else MaterialTheme.typography.bodyMedium,
+                fontWeight = if (prominent) FontWeight.SemiBold else FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary
             )
         }
@@ -1190,7 +1516,15 @@ internal fun DurationSlider(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyMedium,
+                // A long (localised) label must wrap, not push the value out
+                // of the row.
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp)
+            )
             Text(
                 valueText(displayValue),
                 style = MaterialTheme.typography.bodyMedium,
@@ -1213,132 +1547,6 @@ internal fun DurationSlider(
     }
 }
 
-@Composable
-private fun DeliveryModeSelector(
-    mode: AlertDeliveryMode,
-    onModeChange: (AlertDeliveryMode) -> Unit
-) {
-    Column {
-        Text(
-            stringResource(R.string.alert_style),
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(bottom = 8.dp)
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            val deliveryModeLabels = AlertDeliveryMode.entries.associateWith { it.localizedName() }
-            AlertDeliveryMode.entries.forEach { deliveryMode ->
-                FilterChip(
-                    selected = mode == deliveryMode,
-                    onClick = { onModeChange(deliveryMode) },
-                    label = { Text(deliveryModeLabels[deliveryMode] ?: deliveryMode.displayName) },
-                    leadingIcon = if (mode == deliveryMode) {
-                        { Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }
-                    } else null,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SnoozeDurationSelector(
-    minutes: Int,
-    onMinutesChange: (Int) -> Unit
-) {
-    DurationSlider(
-        label = stringResource(R.string.default_snooze),
-        value = minutes,
-        range = 5..120,
-        stepSize = 5,
-        onValueChange = onMinutesChange
-    )
-}
-
-@Composable
-private fun SettingsRow(
-    title: String,
-    icon: ImageVector,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(20.dp)
-        )
-        Spacer(Modifier.width(12.dp))
-        Text(
-            title,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.weight(1f)
-        )
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange
-        )
-    }
-}
-
-@Composable
-private fun PreemptiveSnoozeCard() {
-    var showDialog by remember { mutableStateOf(false) }
-    
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.secondaryContainer
-    ) {
-        Row(
-            modifier = Modifier
-                .clickable { showDialog = true }
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                Icons.Default.Snooze,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSecondaryContainer
-            )
-            Spacer(Modifier.width(16.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    stringResource(R.string.preemptive_snooze),
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                )
-                Text(
-                    stringResource(R.string.preemptive_snooze_desc),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
-                )
-            }
-            Icon(
-                Icons.Default.ChevronRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSecondaryContainer
-            )
-        }
-    }
-    
-    if (showDialog) {
-        PreemptiveSnoozeDialog(
-            onDismiss = { showDialog = false }
-        )
-    }
-}
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun PreemptiveSnoozeDialog(
@@ -1347,7 +1555,7 @@ private fun PreemptiveSnoozeDialog(
     var snoozeLow by remember { mutableStateOf(false) }
     var snoozeHigh by remember { mutableStateOf(false) }
     var snoozeDuration by remember { mutableStateOf(30) }
-    
+
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Default.Snooze, contentDescription = null) },
@@ -1358,7 +1566,7 @@ private fun PreemptiveSnoozeDialog(
                     stringResource(R.string.preemptive_snooze_desc),
                     style = MaterialTheme.typography.bodyMedium
                 )
-                
+
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1381,7 +1589,7 @@ private fun PreemptiveSnoozeDialog(
                         } else null
                     )
                 }
-                
+
                 DurationSlider(
                     label = stringResource(R.string.duration_label),
                     value = snoozeDuration,
@@ -1432,12 +1640,10 @@ internal fun TimeRangeSettings(
     
     Column {
         ExpressiveExpandableHeader(
-            icon = Icons.Default.Schedule,
             title = stringResource(R.string.active_time_range_title),
             subtitle = if (enabled) stringResource(R.string.time_range_summary, formatTime(startH, startM), formatTime(endH, endM)) else stringResource(R.string.only_alert_during_hours),
             enabled = enabled,
-            onEnabledChange = onEnabledChange,
-            iconTint = MaterialTheme.colorScheme.tertiary
+            onEnabledChange = onEnabledChange
         )
         
         AnimatedVisibility(
@@ -1603,18 +1809,24 @@ private fun TimeRangeSlider(
     onStartChange: (Int) -> Unit,
     onEndChange: (Int) -> Unit
 ) {
-    var sliderValues by remember(startHour, endHour) { 
-        mutableStateOf(startHour.toFloat()..endHour.toFloat()) 
+    var sliderValues by remember(startHour, endHour) {
+        mutableStateOf(startHour.toFloat()..endHour.toFloat())
     }
-    
+
     RangeSlider(
         value = sliderValues,
         onValueChange = { range ->
             sliderValues = range
-            val newStart = range.start.toInt().coerceIn(0, 23)
-            val newEnd = range.endInclusive.toInt().coerceIn(0, 23)
-            if (newStart != startHour) onStartChange(newStart)
-            if (newEnd != endHour) onEndChange(newEnd)
+        },
+        onValueChangeFinished = {
+            val newStart = sliderValues.start.toInt().coerceIn(0, 23)
+            val newEnd = sliderValues.endInclusive.toInt().coerceIn(0, 23)
+            if (newStart != startHour) {
+                onStartChange(newStart)
+            }
+            if (newEnd != endHour) {
+                onEndChange(newEnd)
+            }
         },
         valueRange = 0f..23f,
         steps = 22, // 24 hours - 1 for steps
@@ -1658,9 +1870,7 @@ private fun TimeChip(
             )
             Text(
                 text = formatTime(hour, minute),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
+                style = MaterialTheme.typography.titleMediumEmphasized,)
         }
     }
     
@@ -1724,12 +1934,10 @@ internal fun RetrySettings(
 
     Column {
         ExpressiveExpandableHeader(
-            icon = Icons.Default.Refresh,
             title = stringResource(R.string.retry_if_no_reaction),
             subtitle = retrySubtitle,
             enabled = enabled,
-            onEnabledChange = onEnabledChange,
-            iconTint = MaterialTheme.colorScheme.error
+            onEnabledChange = onEnabledChange
         )
         
         AnimatedVisibility(
@@ -1742,7 +1950,7 @@ internal fun RetrySettings(
                 Spacer(Modifier.height(4.dp))
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     FilterChip(
                         selected = intervalMinutes <= 0,
@@ -1770,7 +1978,7 @@ internal fun RetrySettings(
                 Spacer(Modifier.height(4.dp))
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     listOf(0 to stringResource(R.string.retry_forever), 1 to "1", 2 to "2", 3 to "3", 5 to "5").forEach { (count, label) ->
                         FilterChip(
@@ -1793,19 +2001,22 @@ internal fun RetrySettings(
 
 // ---- Helper functions ----
 
-private fun getAlertIconAndColor(type: AlertType): Pair<ImageVector, Color> {
+/** Glucose alerts wear their range colour; the rest take theme roles (system = secondary). */
+private fun getAlertIconAndColor(type: AlertType, isDark: Boolean, scheme: ColorScheme): Pair<ImageVector, Color> {
     return when (type) {
-        AlertType.VERY_LOW -> Icons.Default.Warning to Color(0xFFE53935)
-        AlertType.LOW -> Icons.Default.ArrowDownward to Color(0xFFFF7043)
-        AlertType.HIGH -> Icons.Default.ArrowUpward to Color(0xFFFFB300)
-        AlertType.VERY_HIGH -> Icons.Default.Warning to Color(0xFFFF6F00)
-        AlertType.PRE_LOW -> Icons.AutoMirrored.Filled.TrendingDown to Color(0xFFFF8A65)
-        AlertType.PRE_HIGH -> Icons.AutoMirrored.Filled.TrendingUp to Color(0xFFFFCA28)
-        AlertType.PERSISTENT_HIGH -> Icons.Default.Timer to Color(0xFFFFA726)
-        AlertType.MISSED_READING -> Icons.Default.SignalWifiOff to Color(0xFF78909C)
-        AlertType.LOSS -> Icons.Default.BluetoothDisabled to Color(0xFF90A4AE)
-        AlertType.SENSOR_EXPIRY -> Icons.Default.Schedule to Color(0xFF7E57C2)
-        else -> Icons.Default.Notifications to Color(0xFF42A5F5)  // Default blue
+        AlertType.VERY_LOW -> Icons.Default.Warning to Color(GlucoseRangeColors.veryLow(isDark))
+        AlertType.LOW -> Icons.Default.ArrowDownward to Color(GlucoseRangeColors.low(isDark))
+        AlertType.HIGH -> Icons.Default.ArrowUpward to Color(GlucoseRangeColors.high(isDark))
+        AlertType.VERY_HIGH -> Icons.Default.Warning to Color(GlucoseRangeColors.veryHigh(isDark))
+        AlertType.PRE_LOW -> Icons.AutoMirrored.Filled.TrendingDown to Color(GlucoseRangeColors.low(isDark))
+        AlertType.PRE_HIGH -> Icons.AutoMirrored.Filled.TrendingUp to Color(GlucoseRangeColors.high(isDark))
+        AlertType.FALLING_FAST -> Icons.AutoMirrored.Filled.TrendingDown to Color(GlucoseRangeColors.veryLow(isDark))
+        AlertType.RISING_FAST -> Icons.AutoMirrored.Filled.TrendingUp to Color(GlucoseRangeColors.veryHigh(isDark))
+        AlertType.PERSISTENT_HIGH -> Icons.Default.Timer to Color(GlucoseRangeColors.veryHigh(isDark))
+        AlertType.MISSED_READING -> Icons.Default.SignalWifiOff to scheme.secondary
+        AlertType.LOSS -> Icons.Default.BluetoothDisabled to scheme.secondary
+        AlertType.SENSOR_EXPIRY -> Icons.Default.Schedule to scheme.tertiary
+        else -> Icons.Default.Notifications to scheme.primary
     }
 }
 
@@ -1857,7 +2068,8 @@ internal fun SoundSelector(
                         text = when {
                             currentUri.isNullOrEmpty() -> stringResource(R.string.app_default_sound)
                             currentUri == SYSTEM_DEFAULT_SOUND -> stringResource(R.string.system_default_sound)
-                            else -> stringResource(R.string.custom_sound_selected)
+                            else -> BundledAlertSounds.styleFor(currentUri, LocalContext.current.packageName)
+                                ?: stringResource(R.string.custom_sound_selected)
                         },
                         style = MaterialTheme.typography.bodyLarge
                    )
@@ -1907,25 +2119,13 @@ internal fun ExpressiveToggleCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             // Icon with tinted background
-            Surface(
-                shape = RoundedCornerShape(12.dp),
-                color = iconTint.copy(alpha = if (checked) 0.2f else 0.1f),
-                modifier = Modifier.size(44.dp)
-            ) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    Icon(
-                        icon,
-                        contentDescription = null,
-                        tint = if (checked) iconTint else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-            }
-            
-            Spacer(Modifier.width(16.dp))
+            IconTile(
+                icon = icon,
+                tint = if (checked) iconTint else MaterialTheme.colorScheme.onSurfaceVariant,
+                containerColor = IconTileDefaults.toggleContainerColor(iconTint, checked),
+            )
+
+            Spacer(Modifier.width(IconTileDefaults.Gap))
             
             // Text content
             Column(modifier = Modifier.weight(1f)) {
@@ -1961,7 +2161,7 @@ internal fun ExpressiveToggleCard(
  */
 @Composable
 internal fun ExpressiveExpandableHeader(
-    icon: ImageVector,
+    icon: ImageVector? = null,
     title: String,
     subtitle: String? = null,
     enabled: Boolean,
@@ -1977,15 +2177,17 @@ internal fun ExpressiveExpandableHeader(
             .padding(horizontal = 16.dp, vertical = 8.dp),  // Touch reaches edges, content padded
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Simple icon with tint
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = if (enabled) iconTint else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(24.dp)
-        )
-        
-        Spacer(Modifier.width(16.dp))
+        // Inside a card body the rows carry no icon, so their text starts where
+        // the slider labels do; a caller that wants one still gets it.
+        if (icon != null) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (enabled) iconTint else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(Modifier.width(16.dp))
+        }
         
         // Text content
         Column(modifier = Modifier.weight(1f)) {
@@ -2019,7 +2221,7 @@ internal fun ExpressiveExpandableHeader(
  */
 @Composable
 internal fun ClickableToggleRow(
-    icon: ImageVector,
+    icon: ImageVector? = null,
     title: String,
     subtitle: String? = null,
     checked: Boolean,
@@ -2035,15 +2237,15 @@ internal fun ClickableToggleRow(
             .padding(horizontal = 16.dp, vertical = 8.dp),  // Touch reaches edges, content padded
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Simple icon with tint
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = if (checked) iconTint else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(24.dp)
-        )
-        
-        Spacer(Modifier.width(16.dp))
+        if (icon != null) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (checked) iconTint else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(Modifier.width(16.dp))
+        }
         
         // Text content
         Column(modifier = Modifier.weight(1f)) {

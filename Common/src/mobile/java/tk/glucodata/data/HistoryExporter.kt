@@ -5,6 +5,7 @@ import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import tk.glucodata.GlucoseReadingSource
 import tk.glucodata.ui.GlucosePoint
 import tk.glucodata.ui.util.GlucoseFormatter
 import java.io.BufferedReader
@@ -45,31 +46,6 @@ object HistoryExporter {
             ?.takeIf { it.isNotEmpty() }
             ?: serialByTimestamp[point.timestamp]
             ?: fallback
-    }
-
-    private fun parseCsvLine(line: String): List<String> {
-        val cells = ArrayList<String>()
-        val current = StringBuilder()
-        var inQuotes = false
-        var index = 0
-        while (index < line.length) {
-            val char = line[index]
-            when {
-                char == '"' && inQuotes && index + 1 < line.length && line[index + 1] == '"' -> {
-                    current.append('"')
-                    index++
-                }
-                char == '"' -> inQuotes = !inQuotes
-                char == ',' && !inQuotes -> {
-                    cells.add(current.toString())
-                    current.setLength(0)
-                }
-                else -> current.append(char)
-            }
-            index++
-        }
-        cells.add(current.toString())
-        return cells
     }
 
     private suspend fun loadExportJournalEntries(
@@ -117,18 +93,23 @@ object HistoryExporter {
                 val journalEntries = loadExportJournalEntries(journalDao, data, startMillis, endMillis)
                 val insulinPresets = journalDao.getInsulinPresets()
 
+                // Non-destructive software calibration for the CalibratedValue column
+                // (issue #130): mirrors the on-screen/Nightscout projection. Empty when
+                // no calibration applies, so the raw Value/RawValue archive is untouched.
+                val viewModeOf = ExportCalibration.viewModeResolver()
                 context.contentResolver.openOutputStream(uri)?.use { outputStream ->
                     outputStream.bufferedWriter().use { writer ->
-                        // Header — new format with SensorSerial
+                        // Header — CalibratedValue sits in the glucose block, after RawValue.
                         writer.write(
-                            "Timestamp,Date,Value,RawValue,Unit,SensorSerial,RecordType," +
+                            "Timestamp,Date,Value,RawValue,CalibratedValue,Unit,SensorSerial,RecordType," +
                                 "JournalId,JournalType,JournalTitle,JournalNote,JournalAmount,JournalGlucoseMgDl," +
-                                "JournalDurationMinutes,JournalIntensity,JournalInsulinPresetId,JournalSource," +
+                                "JournalDurationMinutes,JournalIntensity,JournalInsulinPresetId,JournalSource,JournalOriginSource," +
                                 "JournalSourceRecordId,JournalCreatedAt,JournalUpdatedAt," +
                                 "PresetId,PresetName,PresetOnsetMinutes,PresetDurationMinutes,PresetAccentColor," +
-                                "PresetCurveJson,PresetBuiltIn,PresetArchived,PresetCountsTowardIob,PresetSortOrder\n"
+                                "PresetCurveJson,PresetBuiltIn,PresetArchived,PresetCountsTowardIob," +
+                                "PresetUseForCalculation,PresetSortOrder\n"
                         )
-                        
+
                         // Data
                         for (point in data) {
                             val dateStr = CSV_DATE_FORMAT.format(Date(point.timestamp))
@@ -136,8 +117,20 @@ object HistoryExporter {
                             val valueStr = tk.glucodata.ui.util.GlucoseFormatter.formatCsv(point.value, unit)
                             val rawStr = tk.glucodata.ui.util.GlucoseFormatter.formatCsv(point.rawValue, unit)
                             val serial = resolveExportSensorSerial(point, serialByTimestamp)
-                            
-                            writer.write("${point.timestamp},$dateStr,$valueStr,$rawStr,$unit,$serial,$RECORD_TYPE_GLUCOSE\n")
+                            val calibrated = ExportCalibration.calibratedDisplayValue(
+                                autoDisplayValue = point.value,
+                                rawDisplayValue = point.rawValue,
+                                timestamp = point.timestamp,
+                                sensorId = point.sensorSerial,
+                                viewMode = viewModeOf(point.sensorSerial),
+                                sealedDisplayValue = point.sealedDisplayValue,
+                                sealedDisplayViewMode = point.sealedDisplayViewMode
+                            )
+                            val calibratedStr = calibrated
+                                ?.let { tk.glucodata.ui.util.GlucoseFormatter.formatCsv(it, unit) }
+                                .orEmpty()
+
+                            writer.write("${point.timestamp},$dateStr,$valueStr,$rawStr,$calibratedStr,$unit,$serial,$RECORD_TYPE_GLUCOSE\n")
                         }
                         for (entry in journalEntries) {
                             val dateStr = CSV_DATE_FORMAT.format(Date(entry.timestamp))
@@ -145,6 +138,7 @@ object HistoryExporter {
                                 listOf(
                                     entry.timestamp,
                                     dateStr,
+                                    "",
                                     "",
                                     "",
                                     "",
@@ -160,6 +154,7 @@ object HistoryExporter {
                                     entry.intensity.orEmpty(),
                                     entry.insulinPresetId ?: "",
                                     entry.source,
+                                    entry.originSource.orEmpty(),
                                     entry.sourceRecordId.orEmpty(),
                                     entry.createdAt,
                                     entry.updatedAt
@@ -170,6 +165,7 @@ object HistoryExporter {
                             writer.write(
                                 listOf(
                                     0,
+                                    "",
                                     "",
                                     "",
                                     "",
@@ -198,6 +194,7 @@ object HistoryExporter {
                                     preset.isBuiltIn,
                                     preset.isArchived,
                                     preset.countsTowardIob,
+                                    preset.useForCalculation,
                                     preset.sortOrder
                                 ).joinToString(",") { csvCell(it) } + "\n"
                             )
@@ -283,15 +280,27 @@ object HistoryExporter {
         writer.write("Generated on: ${READABLE_DATE_FORMAT.format(Date())}\n")
         writer.write("Total Readings: ${data.size}\n\n")
 
+        val isMmol = GlucoseFormatter.isMmol(unit)
+        // Non-destructive software calibration for the readable report (issue #130).
+        val viewModeOf = ExportCalibration.viewModeResolver()
         for (point in data) {
             val dateStr = READABLE_DATE_FORMAT.format(Date(point.timestamp))
-            val isMmol = GlucoseFormatter.isMmol(unit)
             val valueStr = GlucoseFormatter.format(point.value, isMmol)
             val rawStr = GlucoseFormatter.format(point.rawValue, isMmol)
             val serial = resolveExportSensorSerial(point, serialByTimestamp, fallback = "")
+            val calibrated = ExportCalibration.calibratedDisplayValue(
+                autoDisplayValue = point.value,
+                rawDisplayValue = point.rawValue,
+                timestamp = point.timestamp,
+                sensorId = point.sensorSerial,
+                viewMode = viewModeOf(point.sensorSerial),
+                sealedDisplayValue = point.sealedDisplayValue,
+                sealedDisplayViewMode = point.sealedDisplayViewMode
+            )
+            val calibratedTag = calibrated?.let { " (Calibrated: ${GlucoseFormatter.format(it, isMmol)})" }.orEmpty()
 
             val sensorTag = if (serial.isNotEmpty() && serial != "unknown") " [$serial]" else ""
-            val line = "$dateStr: $valueStr $unit (Raw: $rawStr)$sensorTag\n"
+            val line = "$dateStr: $valueStr $unit (Raw: $rawStr)$calibratedTag$sensorTag\n"
             writer.write(line)
         }
         if (journalEntries.isNotEmpty()) {
@@ -312,90 +321,62 @@ object HistoryExporter {
             for (preset in insulinPresets) {
                 val archived = if (preset.isArchived) "archived" else "enabled"
                 val iob = if (preset.countsTowardIob) "IOB" else "no IOB"
+                val calculation = if (preset.useForCalculation) "calculation" else "no calculation"
                 writer.write(
                     "${preset.displayName}: ${preset.onsetMinutes}-${preset.durationMinutes} min · " +
-                        "$archived · $iob · color ${preset.accentColor}\n"
+                        "$archived · $iob · $calculation · color ${preset.accentColor}\n"
                 )
             }
         }
     }
 
     /**
-     * Import data from a CSV file.
-     * Handles both old format (5 columns: Timestamp,Date,Value,RawValue,Unit)
-     * and new format (6 columns: Timestamp,Date,Value,RawValue,Unit,SensorSerial).
+     * Import glucose data from a delimited history file.
+     *
+     * Accepts JugglucoNG's own CSV export in every generation (the legacy 5 and
+     * 6 column files, and the current one carrying CalibratedValue) as well as
+     * Juggluco's tab separated export, so migrating from Juggluco needs no hand
+     * conversion. [HistoryImportParser] does the format detection.
+     *
      * Imported readings are stored under a stable import namespace, not a real
      * sensor serial, so native resync/sensor replacement cannot wipe them.
+     * Re-importing the same file is idempotent: the unique (timestamp,
+     * sensorSerial) index replaces the earlier rows instead of duplicating them.
      *
      * Internal storage is ALWAYS mg/dL.
      */
     suspend fun importFromCsv(context: Context, uri: Uri): ImportResult {
         return withContext(Dispatchers.IO) {
-            var successCount = 0
-            var failCount = 0
-            val readings = mutableListOf<HistoryReading>()
             val importSerial = HistoryRepository.IMPORTED_SENSOR_SERIAL
 
             try {
-                context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                val parsed = context.contentResolver.openInputStream(uri)?.use { inputStream ->
                     BufferedReader(InputStreamReader(inputStream)).use { reader ->
-                        // Read Header
-                        val header = reader.readLine()
-                        val normalizedHeader = header?.removePrefix("\uFEFF")
-                        if (normalizedHeader == null || !normalizedHeader.startsWith("Timestamp")) {
-                            return@withContext ImportResult(0, 0, false, "Invalid CSV format")
-                        }
-                        val headerColumns = parseCsvLine(normalizedHeader).map { it.trim() }
-                        val recordTypeIndex = headerColumns.indexOf("RecordType")
-
-                        reader.forEachLine { line ->
-                            if (line.isBlank()) return@forEachLine
-                            try {
-                                val parts = parseCsvLine(line)
-                                if (parts.size >= 5) {
-                                    val recordType = if (recordTypeIndex >= 0 && parts.size > recordTypeIndex) {
-                                        parts[recordTypeIndex].trim().ifBlank { RECORD_TYPE_GLUCOSE }
-                                    } else {
-                                        RECORD_TYPE_GLUCOSE
-                                    }
-                                    if (!recordType.equals(RECORD_TYPE_GLUCOSE, ignoreCase = true)) {
-                                        return@forEachLine
-                                    }
-                                    val timestamp = parts[0].trim().toLong()
-                                    // parts[1] is Date string, skip
-                                    var value = parts[2].trim().toFloat()
-                                    var rawValue = parts[3].trim().toFloat()
-                                    val unit = parts[4].trim()
-
-                                    // Convert back to mg/dL if needed
-                                    if (GlucoseFormatter.isMmol(unit)) {
-                                        value = GlucoseFormatter.mmolToMg(value)
-                                        rawValue = GlucoseFormatter.mmolToMg(rawValue)
-                                    }
-
-                                    readings.add(HistoryReading(
-                                        timestamp = timestamp,
-                                        sensorSerial = importSerial,
-                                        value = value,
-                                        rawValue = rawValue,
-                                        rate = 0f
-                                    ))
-                                    successCount++
-                                }
-                            } catch (e: Exception) {
-                                failCount++
-                            }
-                        }
+                        HistoryImportParser.parse(reader)
                     }
+                } ?: return@withContext ImportResult(0, 0, false, "Could not open the selected file.")
+
+                parsed.errorMessage?.let { message ->
+                    return@withContext ImportResult(0, 0, false, message)
                 }
 
+                val readings = parsed.readings.map { reading ->
+                    HistoryReading(
+                        timestamp = reading.timestamp,
+                        sensorSerial = importSerial,
+                        value = reading.valueMgDl,
+                        rawValue = reading.rawValueMgDl,
+                        rate = 0f,
+                        source = GlucoseReadingSource.IMPORT,
+                    )
+                }
                 if (readings.isNotEmpty()) {
                     HistoryRepository(context).storeReadings(readings)
                 }
-                
-                ImportResult(successCount, failCount, true, null)
+
+                ImportResult(readings.size, parsed.failedRows, true, null)
             } catch (e: Exception) {
-                Log.e(TAG, "Error importing CSV", e)
+                Log.e(TAG, "Error importing history file", e)
                 ImportResult(0, 0, false, e.message)
             }
         }

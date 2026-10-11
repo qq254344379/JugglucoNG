@@ -1,171 +1,119 @@
-@file:OptIn(ExperimentalMaterial3Api::class)
-
 package tk.glucodata.ui
 
 import android.widget.Toast
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
+import tk.glucodata.Applic
+import tk.glucodata.CloneIceNetworkConfigStore
+import tk.glucodata.CloneSensorRegistry
 import tk.glucodata.Natives
 import tk.glucodata.R
-import tk.glucodata.ui.components.*
 
+private fun readTurnEndpoint(): TurnEndpoint? = if (Natives.TurnServerNR() == 0) null else TurnEndpoint(
+    Natives.getTurnHost(0).orEmpty(), Natives.getTurnPort(0),
+    Natives.getTurnUser(0).orEmpty(), Natives.getTurnPassword(0).orEmpty(),
+)
+
+private fun writeTurnEndpoint(endpoint: TurnEndpoint?) {
+    if (endpoint == null) Natives.deleteTurnServer(0)
+    else Natives.setTurnServer(0, endpoint.host, endpoint.port, endpoint.username, endpoint.password)
+}
+
+/**
+ * Saves itself. Switches are written as they are flipped; they only matter on the next
+ * connection attempt. A server is written when the screen is left, and used from the
+ * next connection on -- a live connection is never rebuilt behind the user's back. The
+ * one thing the user asks for explicitly is that rebuild, through the Apply button a
+ * changed server shows while a route is up.
+ */
 @Composable
 fun TurnServerSettingsScreen(navController: NavController) {
     val context = LocalContext.current
-    val isAbsent = Natives.TurnServerNR() == 0
+    var config by remember { mutableStateOf(CloneIceNetworkConfigStore.load(context)) }
+    var saved by remember { mutableStateOf(HybridDraft.of(config, readTurnEndpoint())) }
+    var draft by remember { mutableStateOf(saved) }
+    val liveConnection = remember { CloneSensorRegistry.hasLiveCloneConnection() }
 
-    var host by remember { mutableStateOf(if (isAbsent) "" else Natives.getTurnHost(0) ?: "") }
-    var user by remember { mutableStateOf(if (isAbsent) "" else Natives.getTurnUser(0) ?: "") }
-    var password by remember { mutableStateOf(if (isAbsent) "" else Natives.getTurnPassword(0) ?: "") }
-    var port by remember { mutableStateOf(if (isAbsent) "3478" else Natives.getTurnPort(0).toString()) }
-    var passwordVisible by remember { mutableStateOf(false) }
-    var showHelp by remember { mutableStateOf(isAbsent) }
+    fun reportFailure() {
+        Toast.makeText(context, R.string.savefailed, Toast.LENGTH_LONG).show()
+    }
 
-    Scaffold(
-        contentWindowInsets = WindowInsets(0.dp),
-        topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.turnserver)) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
-                    }
-                }
-            )
+    /**
+     * Writes what [next] says about the servers, skipping a server whose draft does not
+     * parse; a half-typed hostname is not a hostname. Returns what is now saved.
+     */
+    fun persistServers(next: HybridDraft, reconnect: Boolean): HybridDraft {
+        val applyTurn = next.turnValid && next.turnChanged(saved)
+        val applyRendezvous = next.rendezvousValid && next.rendezvousChanged(saved)
+        if (!applyTurn && !applyRendezvous) return saved
+        val effective = if (applyTurn && applyRendezvous) next else if (applyTurn) {
+            saved.copy(customTurn = next.customTurn, turnHost = next.turnHost, turnPort = next.turnPort,
+                turnUser = next.turnUser, turnPassword = next.turnPassword, useTurnForStun = next.useTurnForStun)
+        } else {
+            saved.copy(customRendezvous = next.customRendezvous, rendezvousHost = next.rendezvousHost,
+                rendezvousPort = next.rendezvousPort, verifyRendezvousCertificate = next.verifyRendezvousCertificate)
         }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
-        ) {
-            // Help toggle
-            SettingsItem(
-                title = "What is TURN?",
-                subtitle = if (showHelp) "Tap to hide" else "Tap to learn more",
-                icon = Icons.Filled.HelpOutline,
-                iconTint = MaterialTheme.colorScheme.tertiary,
-                position = CardPosition.SINGLE,
-                onClick = { showHelp = !showHelp }
-            )
+        val previousTurn = saved.turnEndpoint
+        val nextTurn = effective.turnEndpoint
+        val nextConfig = effective.toConfig(config)
+        writeTurnEndpoint(nextTurn)
+        if (readTurnEndpoint() != nextTurn || !CloneIceNetworkConfigStore.save(context, nextConfig)) {
+            writeTurnEndpoint(previousTurn)
+            reportFailure()
+            return saved
+        }
+        config = nextConfig
+        if (reconnect) Natives.resetnetwork()
+        Applic.wakemirrors()
+        return HybridDraft.of(nextConfig, nextTurn)
+    }
 
-            AnimatedVisibility(visible = showHelp, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
-                Surface(
-                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
-                    shape = cardShape(CardPosition.SINGLE),
-                    color = MaterialTheme.colorScheme.secondaryContainer
-                ) {
-                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        HelpBlock("How it works", "When two devices connect using ICE, they try direct peer-to-peer first. If firewalls block this, a TURN server relays data between them.")
-                        HelpBlock("Setup options",
-                            "Self-hosted: Install coturn on a VPS. Port 3478, UDP.\n" +
-                            "Free tier: metered.ca offers free TURN.\n" +
-                            "Both devices must share the same TURN config."
-                        )
-                    }
-                }
-            }
-
-            // Server
-            SectionLabel("Server")
-            OutlinedTextField(
-                value = host, onValueChange = { host = it },
-                label = { Text(stringResource(R.string.hostname)) },
-                supportingText = { Text("e.g. turn.myserver.com or 203.0.113.5") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true
+    fun persistSwitches(next: HybridDraft) {
+        val nextConfig = config.copy(
+            useLocalDiscovery = next.useLocalDiscovery,
+            useTurnForStun = next.useTurnForStun && saved.turnEndpoint != null,
+            preferIPv4 = next.preferIPv4,
+        )
+        if (CloneIceNetworkConfigStore.save(context, nextConfig)) {
+            config = nextConfig
+            saved = saved.copy(
+                useLocalDiscovery = nextConfig.useLocalDiscovery,
+                useTurnForStun = nextConfig.useTurnForStun,
+                preferIPv4 = nextConfig.preferIPv4,
             )
-            OutlinedTextField(
-                value = port, onValueChange = { port = it },
-                label = { Text(stringResource(R.string.port)) },
-                supportingText = { Text("Standard: 3478 (UDP), 5349 (TLS)") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-            )
-
-            // Credentials
-            SectionLabel("Credentials")
-            OutlinedTextField(
-                value = user, onValueChange = { user = it },
-                label = { Text(stringResource(R.string.username)) },
-                modifier = Modifier.fillMaxWidth(), singleLine = true
-            )
-            OutlinedTextField(
-                value = password, onValueChange = { password = it },
-                label = { Text(stringResource(R.string.password)) },
-                modifier = Modifier.fillMaxWidth(), singleLine = true,
-                visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                trailingIcon = {
-                    IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                        Icon(if (passwordVisible) Icons.Filled.Visibility else Icons.Filled.VisibilityOff, contentDescription = null)
-                    }
-                }
-            )
-
-            // Actions
-            Spacer(Modifier.height(24.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (!isAbsent) {
-                    OutlinedButton(
-                        onClick = {
-                            Natives.deleteTurnServer(0)
-                            Natives.resetnetwork()
-                            tk.glucodata.Applic.wakemirrors()
-                            navController.popBackStack()
-                        },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                    ) { Text(stringResource(R.string.delete)) }
-                }
-                Button(
-                    onClick = {
-                        val portNum = port.toIntOrNull()
-                        if (portNum == null || portNum > 65535) {
-                            Toast.makeText(context, context.getString(R.string.portrange), Toast.LENGTH_LONG).show()
-                            return@Button
-                        }
-                        Natives.setTurnPort(0, portNum)
-                        Natives.setTurnHost(0, host)
-                        Natives.setTurnUser(0, user)
-                        Natives.setTurnPassword(0, password)
-                        Natives.resetnetwork()
-                        tk.glucodata.Applic.wakemirrors()
-                        navController.popBackStack()
-                    },
-                    modifier = Modifier.weight(1f)
-                ) { Text(stringResource(R.string.save)) }
-            }
+        } else {
+            reportFailure()
         }
     }
-}
 
-@Composable
-private fun HelpBlock(title: String, body: String) {
-    Column {
-        Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
-        Text(body, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f))
+    // Leaving the screen is the save. Whatever parses is written; a route that is up
+    // keeps its current server until it next reconnects, which is the whole point.
+    DisposableEffect(Unit) {
+        onDispose { persistServers(draft, reconnect = false) }
     }
+
+    HybridSettingsContent(
+        draft = draft,
+        saved = saved,
+        liveConnection = liveConnection,
+        onDraftChange = { next ->
+            draft = next
+            if (next.switchesChanged(saved)) persistSwitches(next)
+        },
+        onApplyTurn = {
+            saved = persistServers(draft.copy(
+                customRendezvous = saved.customRendezvous, rendezvousHost = saved.rendezvousHost,
+                rendezvousPort = saved.rendezvousPort, verifyRendezvousCertificate = saved.verifyRendezvousCertificate,
+            ), reconnect = true)
+            draft = draft.copy(useTurnForStun = saved.useTurnForStun)
+        },
+        onApplyRendezvous = {
+            saved = persistServers(draft.copy(
+                customTurn = saved.customTurn, turnHost = saved.turnHost, turnPort = saved.turnPort,
+                turnUser = saved.turnUser, turnPassword = saved.turnPassword,
+            ), reconnect = true)
+        },
+        onBack = { navController.popBackStack() },
+    )
 }
