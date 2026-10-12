@@ -25,8 +25,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.os.Handler;
-import android.os.Looper;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -51,50 +49,13 @@ public class Aapsv2Broadcast {
     private static final int MAX_INTERVAL_MINUTES = 10;
     private static final String PREFS_FILE = "tk.glucodata_preferences";
     private static final String LOG_ID = "Aapsv2Broadcast";
+
+    // Lazy minute gate: the timestamp of the last successfully sent reading
+    // (payload time, not wall clock). Mirrors GlucoDataHandler's TransferTask
+    // model - the next reading compares its own timestamp against this gate
+    // and is sent once the interval has elapsed, so no timer is needed and a
+    // missed minute simply rolls into the following reading.
     private static volatile long lastSendTime = 0L;
-
-    // Pending (throttled) payload plus a one-shot retry that fires exactly when
-    // the interval expires, so a broadcast still lands on schedule even if the
-    // minute-gated trigger drifts or a minute carries no reading at all.
-    private static final Handler throttleHandler = new Handler(Looper.getMainLooper());
-    private static volatile ExchangeGlucosePayload pendingPayload = null;
-    private static volatile long pendingSensorStartmsec = 0L;
-    private static volatile String pendingSerialNumber = null;
-    private static volatile int pendingAlarm = 0;
-    private static volatile long pendingDueAt = 0L;
-
-    private static final Runnable flushPending = new Runnable() {
-        @Override
-        public void run() {
-            final Context context = Applic.app;
-            if (context == null)
-                return;
-            final ExchangeGlucosePayload payload = pendingPayload;
-            if (payload == null)
-                return;
-            final long now = System.currentTimeMillis();
-            final int intervalMinutes = getIntervalMinutes(context);
-            if (intervalMinutes > 0) {
-                final long intervalMs = intervalMinutes * 60_000L;
-                final long elapsed = now - lastSendTime;
-                if (elapsed < intervalMs) {
-                    // The interval was increased while waiting: re-arm for the
-                    // new due time instead of sending early.
-                    final long dueAt = lastSendTime + intervalMs;
-                    if (pendingDueAt != dueAt) {
-                        pendingDueAt = dueAt;
-                        throttleHandler.postDelayed(this, Math.max(0L, dueAt - now));
-                    }
-                    return;
-                }
-            }
-            // Due: send the newest pending reading now.
-            pendingPayload = null;
-            pendingDueAt = 0L;
-            lastSendTime = now;
-            doSend(context, payload, pendingSensorStartmsec, pendingSerialNumber, pendingAlarm);
-        }
-    };
 
     private Aapsv2Broadcast() {}
 
@@ -159,57 +120,53 @@ public class Aapsv2Broadcast {
      * style broadcast is built with SourceInfo forced to "G6"; the Glucodata
      * broadcast uses the regular glucodata.Minute intent.
      *
-     * When the configured interval is greater than 0 the send is throttled to
-     * at most one broadcast per interval; 0 keeps the real-time behaviour.
-     * A reading that arrives inside the throttle window is kept as the newest
-     * pending payload and a one-shot retry is armed for the exact end of the
-     * interval, so the broadcast keeps the configured cadence even if the
-     * minute-gated trigger drifts or a minute carries no reading at all.
+     * When the configured interval is greater than 0 the send is gated lazily
+     * on the reading timestamps (GlucoDataHandler TransferTask model): the
+     * reading is only broadcast once at least one interval has elapsed since
+     * the last successfully sent reading. No timer/pending buffer is involved
+     * - if a minute carries no reading the elapsed time simply accumulates
+     * and the next reading crosses the gate. 0 keeps the real-time behaviour.
      */
     public static void send(ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
         final Context context = Applic.app;
         if (context == null)
             return;
-        final long now = System.currentTimeMillis();
         final int intervalMinutes = getIntervalMinutes(context);
         if (intervalMinutes > 0) {
-            final long intervalMs = intervalMinutes * 60_000L;
-            if (now - lastSendTime < intervalMs) {
-                // Not due yet: remember the newest reading and make sure a retry
-                // fires exactly when the interval expires.
-                pendingPayload = payload;
-                pendingSensorStartmsec = sensorStartmsec;
-                pendingSerialNumber = serialNumber;
-                pendingAlarm = alarm;
-                final long dueAt = lastSendTime + intervalMs;
-                if (pendingDueAt != dueAt) {
-                    pendingDueAt = dueAt;
-                    throttleHandler.removeCallbacks(flushPending);
-                    throttleHandler.postDelayed(flushPending, Math.max(0L, dueAt - now));
-                }
-                {if(doLog) {Log.i(LOG_ID, "throttled by " + intervalMinutes + " min interval, retry in " + Math.max(0L, dueAt - now) + " ms");};};
+            final long readingTime = payload.getTimeMillis();
+            if (readingTime <= 0L || lastSendTime >= readingTime) {
+                // Not newer than the last reading sent (or unusable time):
+                // nothing to do, wait for the next reading.
                 return;
             }
+            if (readingTime - lastSendTime < intervalMinutes * 60_000L) {
+                // Interval not reached yet: keep this reading as the candidate
+                // for the next trigger; no timer needed, the next reading
+                // re-enters this check.
+                return;
+            }
+            // Due: send the current reading below and advance the gate on success.
         }
-        // Due (or real-time): clear any pending retry and send immediately.
-        pendingPayload = null;
-        pendingDueAt = 0L;
-        throttleHandler.removeCallbacks(flushPending);
-        lastSendTime = now;
-        doSend(context, payload, sensorStartmsec, serialNumber, alarm);
+        if (doSend(context, payload, sensorStartmsec, serialNumber, alarm)) {
+            lastSendTime = payload.getTimeMillis();
+        }
     }
 
-    private static void doSend(Context context, ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
+    private static boolean doSend(Context context, ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
+        boolean sent = false;
         final SharedPreferences prefs = prefs(context);
         final Set<String> xdripReceivers = prefs.getStringSet(PREF_XDRIP_RECEIVERS, null);
         if (xdripReceivers != null && !xdripReceivers.isEmpty()) {
             SendLikexDrip.sendTo(SendLikexDrip.buildG6Intent(payload, sensorStartmsec), xdripReceivers);
             {if(doLog) {Log.i(LOG_ID, "xdrip send to " + xdripReceivers.size() + " receivers");};};
+            sent = true;
         }
         final Set<String> glucodataReceivers = prefs.getStringSet(PREF_GLUCODATA_RECEIVERS, null);
         if (glucodataReceivers != null && !glucodataReceivers.isEmpty()) {
             JugglucoSend.sendTo(JugglucoSend.buildIntent(serialNumber, payload, alarm), glucodataReceivers);
             {if(doLog) {Log.i(LOG_ID, "glucodata send to " + glucodataReceivers.size() + " receivers");};};
+            sent = true;
         }
+        return sent;
     }
 }
