@@ -50,11 +50,11 @@ public class Aapsv2Broadcast {
     private static final String PREFS_FILE = "tk.glucodata_preferences";
     private static final String LOG_ID = "Aapsv2Broadcast";
 
-    // Lazy minute gate: the timestamp of the last successfully sent reading
-    // (payload time, not wall clock). Mirrors GlucoDataHandler's TransferTask
-    // model - the next reading compares its own timestamp against this gate
-    // and is sent once the interval has elapsed, so no timer is needed and a
-    // missed minute simply rolls into the following reading.
+    // Wall-clock throttle: the wall-clock time of the last successfully sent
+    // reading. The next send is allowed once at least intervalMinutes have
+    // elapsed since then; interval <= 0 keeps real-time behaviour. Counting
+    // wall clock instead of reading timestamps keeps the broadcast cadence
+    // stable even when sensor readings arrive late or in bursts.
     private static volatile long lastSendTime = 0L;
 
     private Aapsv2Broadcast() {}
@@ -120,12 +120,12 @@ public class Aapsv2Broadcast {
      * style broadcast is built with SourceInfo forced to "G6"; the Glucodata
      * broadcast uses the regular glucodata.Minute intent.
      *
-     * When the configured interval is greater than 0 the send is gated lazily
-     * on the reading timestamps (GlucoDataHandler TransferTask model): the
-     * reading is only broadcast once at least one interval has elapsed since
-     * the last successfully sent reading. No timer/pending buffer is involved
-     * - if a minute carries no reading the elapsed time simply accumulates
-     * and the next reading crosses the gate. 0 keeps the real-time behaviour.
+     * When the configured interval is greater than 0 the send is gated on the
+     * wall clock: at least one interval must have elapsed since the last
+     * successfully sent reading. Counting wall time (not the reading's own
+     * timestamp) means a late or missing sensor reading cannot push the next
+     * broadcast past its due time - the cadence stays at interval minutes.
+     * 0 keeps the real-time behaviour.
      */
     public static void send(ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
         final Context context = Applic.app;
@@ -133,22 +133,16 @@ public class Aapsv2Broadcast {
             return;
         final int intervalMinutes = getIntervalMinutes(context);
         if (intervalMinutes > 0) {
-            final long readingTime = payload.getTimeMillis();
-            if (readingTime <= 0L || lastSendTime >= readingTime) {
-                // Not newer than the last reading sent (or unusable time):
-                // nothing to do, wait for the next reading.
-                return;
-            }
-            if (readingTime - lastSendTime < intervalMinutes * 60_000L) {
-                // Interval not reached yet: keep this reading as the candidate
-                // for the next trigger; no timer needed, the next reading
-                // re-enters this check.
+            final long now = System.currentTimeMillis();
+            if (now - lastSendTime < intervalMinutes * 60_000L) {
+                // Wall-clock interval not reached yet since the last successful
+                // send: wait for the next trigger.
                 return;
             }
             // Due: send the current reading below and advance the gate on success.
         }
         if (doSend(context, payload, sensorStartmsec, serialNumber, alarm)) {
-            lastSendTime = payload.getTimeMillis();
+            lastSendTime = System.currentTimeMillis();
         }
     }
 
@@ -157,15 +151,23 @@ public class Aapsv2Broadcast {
         final SharedPreferences prefs = prefs(context);
         final Set<String> xdripReceivers = prefs.getStringSet(PREF_XDRIP_RECEIVERS, null);
         if (xdripReceivers != null && !xdripReceivers.isEmpty()) {
-            SendLikexDrip.sendTo(SendLikexDrip.buildG6Intent(payload, sensorStartmsec), xdripReceivers);
-            {if(doLog) {Log.i(LOG_ID, "xdrip send to " + xdripReceivers.size() + " receivers");};};
-            sent = true;
+            try {
+                SendLikexDrip.sendTo(SendLikexDrip.buildG6Intent(payload, sensorStartmsec), xdripReceivers);
+                {if(doLog) {Log.i(LOG_ID, "xdrip send to " + xdripReceivers.size() + " receivers");};};
+                sent = true;
+            } catch (Throwable th) {
+                Log.stack(LOG_ID, "xdrip send failed", th);
+            }
         }
         final Set<String> glucodataReceivers = prefs.getStringSet(PREF_GLUCODATA_RECEIVERS, null);
         if (glucodataReceivers != null && !glucodataReceivers.isEmpty()) {
-            JugglucoSend.sendTo(JugglucoSend.buildIntent(serialNumber, payload, alarm), glucodataReceivers);
-            {if(doLog) {Log.i(LOG_ID, "glucodata send to " + glucodataReceivers.size() + " receivers");};};
-            sent = true;
+            try {
+                JugglucoSend.sendTo(JugglucoSend.buildIntent(serialNumber, payload, alarm), glucodataReceivers);
+                {if(doLog) {Log.i(LOG_ID, "glucodata send to " + glucodataReceivers.size() + " receivers");};};
+                sent = true;
+            } catch (Throwable th) {
+                Log.stack(LOG_ID, "glucodata send failed", th);
+            }
         }
         return sent;
     }
