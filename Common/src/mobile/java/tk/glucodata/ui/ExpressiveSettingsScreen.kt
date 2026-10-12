@@ -58,6 +58,7 @@ import tk.glucodata.ui.util.fullRestart
 import tk.glucodata.ui.util.hardRestart
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import androidx.core.app.ActivityCompat
 import androidx.core.os.LocaleListCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -451,6 +452,9 @@ fun ExpressiveSettingsScreen(
             val glucodataBroadcastEnabled by viewModel.glucodataBroadcastEnabled.collectAsStateWithLifecycle()
             val aapsv2BroadcastEnabled by viewModel.aapsv2BroadcastEnabled.collectAsStateWithLifecycle()
             val aapsv2IntervalMinutes by viewModel.aapsv2IntervalMinutes.collectAsStateWithLifecycle()
+            // Pending value while the interval slider is being dragged; only written to disk
+            // when the Apply button is pressed. Re-synced whenever the saved value changes.
+            var pendingAapsv2Interval by remember(aapsv2IntervalMinutes) { mutableStateOf(aapsv2IntervalMinutes) }
             val broadcastComputedTrend by viewModel.broadcastComputedTrend.collectAsStateWithLifecycle()
             val xdripReportAsLibre2 by viewModel.xdripReportAsLibre2.collectAsStateWithLifecycle()
 
@@ -525,17 +529,17 @@ fun ExpressiveSettingsScreen(
                                 modifier = Modifier.weight(1f)
                             )
                             Text(
-                                text = if (aapsv2IntervalMinutes <= 0)
+                                text = if (pendingAapsv2Interval <= 0)
                                     stringResource(R.string.aapsv2_interval_realtime)
                                 else
-                                    stringResource(R.string.aapsv2_interval_every, aapsv2IntervalMinutes),
+                                    stringResource(R.string.aapsv2_interval_every, pendingAapsv2Interval),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Slider(
-                            value = aapsv2IntervalMinutes.toFloat().coerceIn(0f, 10f),
-                            onValueChange = { viewModel.setAapsv2IntervalMinutes(it.roundToInt()) },
+                            value = pendingAapsv2Interval.toFloat().coerceIn(0f, 10f),
+                            onValueChange = { pendingAapsv2Interval = it.roundToInt() },
                             valueRange = 0f..10f,
                             enabled = aapsv2BroadcastEnabled
                         )
@@ -544,6 +548,19 @@ fun ExpressiveSettingsScreen(
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        // Apply button: highlighted only while the slider value differs from
+                        // the saved interval; pressing it persists the change.
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            Button(
+                                enabled = pendingAapsv2Interval != aapsv2IntervalMinutes,
+                                onClick = { viewModel.setAapsv2IntervalMinutes(pendingAapsv2Interval) }
+                            ) {
+                                Text(stringResource(R.string.aapsv2_interval_apply))
+                            }
+                        }
                     }
                 }
                 // The computed trend only ever reaches an ExchangeGlucosePayload consumer, so the

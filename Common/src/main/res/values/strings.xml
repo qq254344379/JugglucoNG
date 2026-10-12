@@ -223,6 +223,7 @@
     <string name="aapsv2_interval_realtime">实时（不延迟）</string>
     <string name="aapsv2_interval_every">每 %1$d 分钟</string>
     <string name="aapsv2_interval_desc">控制广播发送频率：0 表示实时发送，10 表示最多每 10 分钟发送一次</string>
+    <string name="aapsv2_interval_apply">应用</string>
     <string name="broadcast_computed_trend_title">Broadcast app trend</string>
     <string name="broadcast_computed_trend_desc">Use the app’s trend instead of the sensor’s</string>
     <string name="xdrip_compatible_title">xDrip broadcast</string>
