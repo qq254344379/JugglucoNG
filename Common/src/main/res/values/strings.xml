@@ -217,6 +217,8 @@
     <string name="xdripbroadcast">Libre (patched App)</string>
     <string name="aaps_broadcast">Glucodata</string>
     <string name="glucodata_subtitle">GlucoDataHandler (GDH)</string>
+    <string name="aapsv2_broadcast_title">AAPSv2在线编译</string>
+    <string name="aapsv2_broadcast_desc">多端广播到 AAPS（识别为 Dexcom G6）</string>
     <string name="broadcast_computed_trend_title">Broadcast app trend</string>
     <string name="broadcast_computed_trend_desc">Use the app’s trend instead of the sensor’s</string>
     <string name="xdrip_compatible_title">xDrip broadcast</string>

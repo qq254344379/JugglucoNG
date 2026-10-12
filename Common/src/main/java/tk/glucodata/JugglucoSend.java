@@ -85,6 +85,32 @@ public static void rebroadcastIob() {
 		return;
 	broadcastglucose(lastSerial,payload,lastAlarm);
 	}
+
+/** Builds the regular glucodata.Minute intent for one reading, including the
+ *  current IOB/COB extras, exactly as broadcastglucose used to build it. */
+public static Intent buildIntent(String SerialNumber, ExchangeGlucosePayload payload, int alarm) {
+	final long iobComputedAt=System.currentTimeMillis();
+	Intent intent = new Intent(ACTION);
+	intent.putExtras(mkGlucosebundle(SerialNumber, payload, alarm, JournalIobAccess.snapshot(iobComputedAt), iobComputedAt));
+	intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+	return intent;
+	}
+
+/** Sends an already-built intent to every package in {@code receivers}, using
+ *  the same per-package setPackage + sendBroadcast pattern as broadcastglucose. */
+public static void sendTo(Intent intent, java.util.Collection<String> receivers) {
+	final Context context=Applic.app;
+	if (context == null)
+		return;
+	for(var name:receivers) {
+		if(name!=null) {
+		      {if(doLog) {Log.i(LOG_ID,name);};};
+	      	      intent.setPackage(name);
+		      context.sendBroadcast(intent);
+		      }
+	   	}
+	}
+
 static void broadcastglucose(String SerialNumber, ExchangeGlucosePayload payload, int alarm) {
 	if(names==null)
 		return;
@@ -92,18 +118,7 @@ static void broadcastglucose(String SerialNumber, ExchangeGlucosePayload payload
 	lastPayload=payload;
 	lastAlarm=alarm;
 	{if(doLog) {Log.i(LOG_ID,"broadcastglucose "+payload.primaryDisplayValue+" rate="+payload.rate);};};
-        final Context context=Applic.app;
-        Intent intent = new Intent(ACTION);
-	final long iobComputedAt=System.currentTimeMillis();
-	intent.putExtras(mkGlucosebundle(SerialNumber, payload, alarm, JournalIobAccess.snapshot(iobComputedAt), iobComputedAt));
-	intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-	for(var name:names) {
-		if(name!=null) {
-		      {if(doLog) {Log.i(LOG_ID,name);};};
-	      	      intent.setPackage(name);
-		      context.sendBroadcast(intent);
-		      }
-	   	}
+	sendTo(buildIntent(SerialNumber, payload, alarm), java.util.Arrays.asList(names));
 	}
 	/*
 static void broadcastglucose(String SerialNumber, int mgdl, float gl, float rate, int alarm, long timmsec) {

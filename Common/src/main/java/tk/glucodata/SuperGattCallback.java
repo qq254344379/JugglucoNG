@@ -887,7 +887,7 @@ public abstract class SuperGattCallback extends BluetoothGattCallback {
             return;
         final boolean shouldBroadcastMinuteUpdate = tim > nexttime;
         final boolean outboundApiEnabled = OutboundApiSettings.isEnabled(app);
-        final boolean loopFeedEnabled = Natives.getxbroadcast() || (!isWearable && Natives.getlibrelinkused());
+        final boolean loopFeedEnabled = Natives.getxbroadcast() || (!isWearable && Natives.getlibrelinkused()) || Aapsv2Broadcast.isEnabled(app);
         final boolean shouldResolveExchangePayload =
                 Natives.getJugglucobroadcast()
                 || outboundApiEnabled
@@ -964,6 +964,8 @@ public abstract class SuperGattCallback extends BluetoothGattCallback {
                             + " payloadAgeMs=" + (System.currentTimeMillis() - loopFeedPayload.getTimeMillis()));
                 SendLikexDrip.broadcastglucose(loopFeedPayload, sensorstartmsec);
             }
+            if (Aapsv2Broadcast.isEnabled(app) && loopFeedPayload != null)
+                Aapsv2Broadcast.send(loopFeedPayload, sensorstartmsec, SerialNumber, alarm);
             if (!isWearable) {
                 if (exchangeOutputDecision.getSendWearInt())
                     tk.glucodata.WearInt.sendglucose(exchangePayload, alarm);

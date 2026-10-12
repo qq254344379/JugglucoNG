@@ -449,6 +449,7 @@ fun ExpressiveSettingsScreen(
             val exchangeColor = MaterialTheme.colorScheme.tertiary
             val xdripEnabled by viewModel.xDripBroadcastEnabled.collectAsStateWithLifecycle()
             val glucodataBroadcastEnabled by viewModel.glucodataBroadcastEnabled.collectAsStateWithLifecycle()
+            val aapsv2BroadcastEnabled by viewModel.aapsv2BroadcastEnabled.collectAsStateWithLifecycle()
             val broadcastComputedTrend by viewModel.broadcastComputedTrend.collectAsStateWithLifecycle()
             val xdripReportAsLibre2 by viewModel.xdripReportAsLibre2.collectAsStateWithLifecycle()
 
@@ -492,6 +493,15 @@ fun ExpressiveSettingsScreen(
                     iconTint = exchangeColor,
                     position = CardPosition.MIDDLE,
                     onCheckedChange = { viewModel.toggleGlucodataBroadcast(it) }
+                )
+                SettingsSwitchItem(
+                    title = stringResource(R.string.aapsv2_broadcast_title),
+                    subtitle = stringResource(R.string.aapsv2_broadcast_desc),
+                    checked = aapsv2BroadcastEnabled,
+                    icon = Icons.Default.Share,
+                    iconTint = exchangeColor,
+                    position = CardPosition.MIDDLE,
+                    onCheckedChange = { viewModel.toggleAapsv2Broadcast(it) }
                 )
                 // The computed trend only ever reaches an ExchangeGlucosePayload consumer, so the
                 // row is noise until one of them is on. Stay visible while the setting itself is

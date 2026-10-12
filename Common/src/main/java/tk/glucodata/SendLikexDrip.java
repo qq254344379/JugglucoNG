@@ -60,6 +60,10 @@ private static int getBatteryLevel() {
             }   
     } */
 private static Bundle mkGlucosebundle(ExchangeGlucosePayload payload,long sensorStartmsec) {
+    return mkGlucosebundle(payload, sensorStartmsec, SensorSourceResolver.resolveXdripSourceInfo(payload.sensorId, payload.sensorGen));
+}
+
+private static Bundle mkGlucosebundle(ExchangeGlucosePayload payload,long sensorStartmsec, String sourceInfo) {
     Bundle extras = new Bundle();
     extras.putDouble(EXTRA_BG_ESTIMATE,payload.primaryMgdl);
     extras.putString(EXTRA_BG_SLOPE_NAME,payload.trendName);
@@ -67,10 +71,34 @@ private static Bundle mkGlucosebundle(ExchangeGlucosePayload payload,long sensor
     extras.putDouble(EXTRA_BG_SLOPE,(double)payload.trendRate/60000.0);
     extras.putLong(EXTRA_TIMESTAMP,payload.timeMillis);
     extras.putLong(EXTRA_SENSOR_STARTED_AT,sensorStartmsec);
-    extras.putString(EXTRA_DATA_SOURCE_INFO, SensorSourceResolver.resolveXdripSourceInfo(payload.sensorId, payload.sensorGen));
+    extras.putString(EXTRA_DATA_SOURCE_INFO, sourceInfo);
 //        extras.putInt(EXTRA_SENSOR_BATTERY,100);
     return extras;
       }
+
+/** Builds an xDrip-style broadcast whose SourceInfo is forced to "G6", so AAPS
+ *  sees the reading as coming from a Dexcom G6 sensor. */
+public static Intent buildG6Intent(ExchangeGlucosePayload payload, long sensorStartmsec) {
+    Intent intent = new Intent(ACTION);
+    intent.putExtras(mkGlucosebundle(payload, sensorStartmsec, Aapsv2Broadcast.SOURCE_INFO_G6));
+    intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+    return intent;
+}
+
+/** Sends an already-built intent to every package in {@code receivers}, using
+ *  the same per-package setPackage + sendBroadcast pattern as broadcastglucose. */
+public static void sendTo(Intent intent, java.util.Collection<String> receivers) {
+    final Context context = Applic.app;
+    if (context == null)
+        return;
+    for (var name : receivers) {
+        if (name != null) {
+            intent.setPackage(name);
+            context.sendBroadcast(intent);
+            {if(doLog) {Log.i(LOG_ID,name);};};
+            }
+       }
+    }
 
 private static String[] names=null;
 public static  void setreceivers() {
@@ -81,17 +109,10 @@ static void broadcastglucose(ExchangeGlucosePayload payload,long sensorStartmsec
         return;
     {
     if(doLog) {Log.i(LOG_ID,"broadcastglucose "+payload.primaryMgdl+" sensor="+payload.sensorId);};};
-    final Context context=Applic.app;
     Intent intent = new Intent(ACTION);
     intent.putExtras(mkGlucosebundle(payload, sensorStartmsec));
     intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-    for(var name:names) {
-        if(name!=null) {
-            intent.setPackage(name);
-            context.sendBroadcast(intent);
-            {if(doLog) {Log.i(LOG_ID,name);};};
-            }
-       }
+    sendTo(intent, java.util.Arrays.asList(names));
     }
     
 }

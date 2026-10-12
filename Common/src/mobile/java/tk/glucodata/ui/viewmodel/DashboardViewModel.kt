@@ -25,6 +25,7 @@ import kotlinx.coroutines.withContext
 import tk.glucodata.Natives
 import tk.glucodata.UiRefreshBus
 import tk.glucodata.Applic
+import tk.glucodata.Aapsv2Broadcast
 import tk.glucodata.BatteryTrace
 import tk.glucodata.CurrentDisplaySource
 import tk.glucodata.DataSmoothing
@@ -276,6 +277,9 @@ class DashboardViewModel(
 
     private val _glucodataBroadcastEnabled = MutableStateFlow(false)
     val glucodataBroadcastEnabled = _glucodataBroadcastEnabled.asStateFlow()
+
+    private val _aapsv2BroadcastEnabled = MutableStateFlow(false)
+    val aapsv2BroadcastEnabled = _aapsv2BroadcastEnabled.asStateFlow()
 
     private val _broadcastComputedTrend = MutableStateFlow(false)
     val broadcastComputedTrend = _broadcastComputedTrend.asStateFlow()
@@ -912,6 +916,7 @@ class DashboardViewModel(
         _xDripBroadcastEnabled.value = Natives.getxbroadcast()
         _patchedLibreBroadcastEnabled.value = Natives.getlibrelinkused()
         _glucodataBroadcastEnabled.value = Natives.getJugglucobroadcast()
+        _aapsv2BroadcastEnabled.value = Aapsv2Broadcast.isEnabled(context)
         _broadcastComputedTrend.value = prefs.getBoolean(tk.glucodata.BroadcastTrendRate.PREF_KEY, false)
         _xdripReportAsLibre2.value = prefs.getBoolean(tk.glucodata.XdripReportAsLibre2.PREF_KEY, false)
 
@@ -1719,6 +1724,11 @@ class DashboardViewModel(
              tk.glucodata.JugglucoSend.setreceivers()
         }
         _glucodataBroadcastEnabled.value = Natives.getJugglucobroadcast()
+    }
+
+    fun toggleAapsv2Broadcast(enabled: Boolean) {
+        Aapsv2Broadcast.setEnabled(tk.glucodata.Applic.app, enabled)
+        _aapsv2BroadcastEnabled.value = enabled
     }
 
     fun toggleNotificationChart(enabled: Boolean) {
