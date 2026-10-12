@@ -25,6 +25,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.os.Handler;
+import android.os.Looper;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -50,6 +52,49 @@ public class Aapsv2Broadcast {
     private static final String PREFS_FILE = "tk.glucodata_preferences";
     private static final String LOG_ID = "Aapsv2Broadcast";
     private static volatile long lastSendTime = 0L;
+
+    // Pending (throttled) payload plus a one-shot retry that fires exactly when
+    // the interval expires, so a broadcast still lands on schedule even if the
+    // minute-gated trigger drifts or a minute carries no reading at all.
+    private static final Handler throttleHandler = new Handler(Looper.getMainLooper());
+    private static volatile ExchangeGlucosePayload pendingPayload = null;
+    private static volatile long pendingSensorStartmsec = 0L;
+    private static volatile String pendingSerialNumber = null;
+    private static volatile int pendingAlarm = 0;
+    private static volatile long pendingDueAt = 0L;
+
+    private static final Runnable flushPending = new Runnable() {
+        @Override
+        public void run() {
+            final Context context = Applic.app;
+            if (context == null)
+                return;
+            final ExchangeGlucosePayload payload = pendingPayload;
+            if (payload == null)
+                return;
+            final long now = System.currentTimeMillis();
+            final int intervalMinutes = getIntervalMinutes(context);
+            if (intervalMinutes > 0) {
+                final long intervalMs = intervalMinutes * 60_000L;
+                final long elapsed = now - lastSendTime;
+                if (elapsed < intervalMs) {
+                    // The interval was increased while waiting: re-arm for the
+                    // new due time instead of sending early.
+                    final long dueAt = lastSendTime + intervalMs;
+                    if (pendingDueAt != dueAt) {
+                        pendingDueAt = dueAt;
+                        throttleHandler.postDelayed(this, Math.max(0L, dueAt - now));
+                    }
+                    return;
+                }
+            }
+            // Due: send the newest pending reading now.
+            pendingPayload = null;
+            pendingDueAt = 0L;
+            lastSendTime = now;
+            doSend(context, payload, pendingSensorStartmsec, pendingSerialNumber, pendingAlarm);
+        }
+    };
 
     private Aapsv2Broadcast() {}
 
@@ -116,6 +161,10 @@ public class Aapsv2Broadcast {
      *
      * When the configured interval is greater than 0 the send is throttled to
      * at most one broadcast per interval; 0 keeps the real-time behaviour.
+     * A reading that arrives inside the throttle window is kept as the newest
+     * pending payload and a one-shot retry is armed for the exact end of the
+     * interval, so the broadcast keeps the configured cadence even if the
+     * minute-gated trigger drifts or a minute carries no reading at all.
      */
     public static void send(ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
         final Context context = Applic.app;
@@ -126,11 +175,31 @@ public class Aapsv2Broadcast {
         if (intervalMinutes > 0) {
             final long intervalMs = intervalMinutes * 60_000L;
             if (now - lastSendTime < intervalMs) {
-                {if(doLog) {Log.i(LOG_ID, "throttled by " + intervalMinutes + " min interval (" + (now - lastSendTime) + " ms since last)");};};
+                // Not due yet: remember the newest reading and make sure a retry
+                // fires exactly when the interval expires.
+                pendingPayload = payload;
+                pendingSensorStartmsec = sensorStartmsec;
+                pendingSerialNumber = serialNumber;
+                pendingAlarm = alarm;
+                final long dueAt = lastSendTime + intervalMs;
+                if (pendingDueAt != dueAt) {
+                    pendingDueAt = dueAt;
+                    throttleHandler.removeCallbacks(flushPending);
+                    throttleHandler.postDelayed(flushPending, Math.max(0L, dueAt - now));
+                }
+                {if(doLog) {Log.i(LOG_ID, "throttled by " + intervalMinutes + " min interval, retry in " + Math.max(0L, dueAt - now) + " ms");};};
                 return;
             }
         }
+        // Due (or real-time): clear any pending retry and send immediately.
+        pendingPayload = null;
+        pendingDueAt = 0L;
+        throttleHandler.removeCallbacks(flushPending);
         lastSendTime = now;
+        doSend(context, payload, sensorStartmsec, serialNumber, alarm);
+    }
+
+    private static void doSend(Context context, ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
         final SharedPreferences prefs = prefs(context);
         final Set<String> xdripReceivers = prefs.getStringSet(PREF_XDRIP_RECEIVERS, null);
         if (xdripReceivers != null && !xdripReceivers.isEmpty()) {
