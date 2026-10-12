@@ -44,7 +44,7 @@ public class Aapsv2Broadcast {
     public static final String PREF_XDRIP_RECEIVERS = "aapsv2_broadcast_xdrip_receivers";
     public static final String PREF_GLUCODATA_RECEIVERS = "aapsv2_broadcast_glucodata_receivers";
     public static final String PREF_INTERVAL_KEY = "aapsv2_broadcast_interval_minutes";
-    public static final String SOURCE_INFO_G6 = "G6";
+    public static final String SOURCE_INFO_G6 = "G6 Native";
     private static final int DEFAULT_INTERVAL_MINUTES = 0;
     private static final int MAX_INTERVAL_MINUTES = 10;
     private static final String PREFS_FILE = "tk.glucodata_preferences";
