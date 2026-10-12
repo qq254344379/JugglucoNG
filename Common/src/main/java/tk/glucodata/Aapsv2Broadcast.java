@@ -43,9 +43,13 @@ public class Aapsv2Broadcast {
     public static final String PREF_KEY = "aapsv2_broadcast_enabled";
     public static final String PREF_XDRIP_RECEIVERS = "aapsv2_broadcast_xdrip_receivers";
     public static final String PREF_GLUCODATA_RECEIVERS = "aapsv2_broadcast_glucodata_receivers";
+    public static final String PREF_INTERVAL_KEY = "aapsv2_broadcast_interval_minutes";
     public static final String SOURCE_INFO_G6 = "G6";
+    private static final int DEFAULT_INTERVAL_MINUTES = 0;
+    private static final int MAX_INTERVAL_MINUTES = 10;
     private static final String PREFS_FILE = "tk.glucodata_preferences";
     private static final String LOG_ID = "Aapsv2Broadcast";
+    private static volatile long lastSendTime = 0L;
 
     private Aapsv2Broadcast() {}
 
@@ -93,14 +97,40 @@ public class Aapsv2Broadcast {
     }
 
     /**
+     * Sync interval in minutes (0..10): 0 means send every reading in real
+     * time, 10 means at most one broadcast per 10 minutes.
+     */
+    public static int getIntervalMinutes(Context context) {
+        return prefs(context).getInt(PREF_INTERVAL_KEY, DEFAULT_INTERVAL_MINUTES);
+    }
+
+    public static void setIntervalMinutes(Context context, int minutes) {
+        final int clamped = Math.max(0, Math.min(MAX_INTERVAL_MINUTES, minutes));
+        prefs(context).edit().putInt(PREF_INTERVAL_KEY, clamped).apply();
+    }
+
+    /**
      * Sends one reading to every stored receiver of each format. The xDrip
      * style broadcast is built with SourceInfo forced to "G6"; the Glucodata
      * broadcast uses the regular glucodata.Minute intent.
+     *
+     * When the configured interval is greater than 0 the send is throttled to
+     * at most one broadcast per interval; 0 keeps the real-time behaviour.
      */
     public static void send(ExchangeGlucosePayload payload, long sensorStartmsec, String serialNumber, int alarm) {
         final Context context = Applic.app;
         if (context == null)
             return;
+        final long now = System.currentTimeMillis();
+        final int intervalMinutes = getIntervalMinutes(context);
+        if (intervalMinutes > 0) {
+            final long intervalMs = intervalMinutes * 60_000L;
+            if (now - lastSendTime < intervalMs) {
+                {if(doLog) {Log.i(LOG_ID, "throttled by " + intervalMinutes + " min interval (" + (now - lastSendTime) + " ms since last)");};};
+                return;
+            }
+        }
+        lastSendTime = now;
         final SharedPreferences prefs = prefs(context);
         final Set<String> xdripReceivers = prefs.getStringSet(PREF_XDRIP_RECEIVERS, null);
         if (xdripReceivers != null && !xdripReceivers.isEmpty()) {

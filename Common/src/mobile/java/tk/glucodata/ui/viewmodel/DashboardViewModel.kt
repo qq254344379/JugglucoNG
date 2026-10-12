@@ -280,6 +280,8 @@ class DashboardViewModel(
 
     private val _aapsv2BroadcastEnabled = MutableStateFlow(false)
     val aapsv2BroadcastEnabled = _aapsv2BroadcastEnabled.asStateFlow()
+    private val _aapsv2IntervalMinutes = MutableStateFlow(0)
+    val aapsv2IntervalMinutes = _aapsv2IntervalMinutes.asStateFlow()
 
     private val _broadcastComputedTrend = MutableStateFlow(false)
     val broadcastComputedTrend = _broadcastComputedTrend.asStateFlow()
@@ -917,6 +919,7 @@ class DashboardViewModel(
         _patchedLibreBroadcastEnabled.value = Natives.getlibrelinkused()
         _glucodataBroadcastEnabled.value = Natives.getJugglucobroadcast()
         _aapsv2BroadcastEnabled.value = Aapsv2Broadcast.isEnabled(context)
+        _aapsv2IntervalMinutes.value = Aapsv2Broadcast.getIntervalMinutes(context)
         _broadcastComputedTrend.value = prefs.getBoolean(tk.glucodata.BroadcastTrendRate.PREF_KEY, false)
         _xdripReportAsLibre2.value = prefs.getBoolean(tk.glucodata.XdripReportAsLibre2.PREF_KEY, false)
 
@@ -1729,6 +1732,11 @@ class DashboardViewModel(
     fun toggleAapsv2Broadcast(enabled: Boolean) {
         Aapsv2Broadcast.setEnabled(tk.glucodata.Applic.app, enabled)
         _aapsv2BroadcastEnabled.value = enabled
+    }
+
+    fun setAapsv2IntervalMinutes(minutes: Int) {
+        Aapsv2Broadcast.setIntervalMinutes(tk.glucodata.Applic.app, minutes)
+        _aapsv2IntervalMinutes.value = Aapsv2Broadcast.getIntervalMinutes(tk.glucodata.Applic.app)
     }
 
     fun toggleNotificationChart(enabled: Boolean) {

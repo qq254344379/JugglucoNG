@@ -450,6 +450,7 @@ fun ExpressiveSettingsScreen(
             val xdripEnabled by viewModel.xDripBroadcastEnabled.collectAsStateWithLifecycle()
             val glucodataBroadcastEnabled by viewModel.glucodataBroadcastEnabled.collectAsStateWithLifecycle()
             val aapsv2BroadcastEnabled by viewModel.aapsv2BroadcastEnabled.collectAsStateWithLifecycle()
+            val aapsv2IntervalMinutes by viewModel.aapsv2IntervalMinutes.collectAsStateWithLifecycle()
             val broadcastComputedTrend by viewModel.broadcastComputedTrend.collectAsStateWithLifecycle()
             val xdripReportAsLibre2 by viewModel.xdripReportAsLibre2.collectAsStateWithLifecycle()
 
@@ -503,6 +504,48 @@ fun ExpressiveSettingsScreen(
                     position = CardPosition.MIDDLE,
                     onCheckedChange = { viewModel.toggleAapsv2Broadcast(it) }
                 )
+                // Sync interval for the AAPSv2 broadcast: 0 = real time, up to
+                // 10 = at most one broadcast every 10 minutes. Disabled (dimmed)
+                // while the broadcast itself is off, but stays reachable.
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .alpha(if (aapsv2BroadcastEnabled) 1f else 0.5f),
+                    shape = cardShape(CardPosition.MIDDLE),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = stringResource(R.string.aapsv2_interval_title),
+                                style = MaterialTheme.typography.titleSmall,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (aapsv2IntervalMinutes <= 0)
+                                    stringResource(R.string.aapsv2_interval_realtime)
+                                else
+                                    stringResource(R.string.aapsv2_interval_every, aapsv2IntervalMinutes),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Slider(
+                            value = aapsv2IntervalMinutes.toFloat().coerceIn(0f, 10f),
+                            onValueChange = { viewModel.setAapsv2IntervalMinutes(it.roundToInt()) },
+                            valueRange = 0f..10f,
+                            enabled = aapsv2BroadcastEnabled
+                        )
+                        Text(
+                            text = stringResource(R.string.aapsv2_interval_desc),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
                 // The computed trend only ever reaches an ExchangeGlucosePayload consumer, so the
                 // row is noise until one of them is on. Stay visible while the setting itself is
                 // enabled, otherwise turning the last consumer off would strand it out of reach.
